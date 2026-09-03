@@ -2,10 +2,12 @@
 
 ## Current milestone
 
-AtlasFS currently contains one dependency-free library, `AtlasFS::protocol`. It
-defines the message envelope shared by future clients, the metadata coordinator,
-and storage nodes. No network listener, persistence, replication, or coordinator
-is present yet.
+AtlasFS currently contains a dependency-free protocol library and a Linux/POSIX
+TCP transport library. `TcpClient` encodes requests, sends complete frames, and
+uses `StreamParser` to receive responses. `TcpServer` listens only on loopback,
+accepts connections sequentially, parses arbitrary receive chunks, invokes a
+request handler, and reliably sends encoded responses. There is no persistence,
+replication, or coordinator yet.
 
 The parser consumes arbitrary byte fragments because TCP preserves byte order but
 not application message boundaries. It may emit zero, one, or many messages per
@@ -35,11 +37,29 @@ bounded chunks rather than increasing frame sizes without limit.
 
 `StreamParser` has no internal locking. One connection handler owns one parser.
 This keeps synchronization outside a low-level value parser and makes ownership
-clear. Concurrency belongs in the future server layer.
+clear.
+
+### Blocking sequential transport
+
+The server uses blocking POSIX sockets and handles one connection at a time. This
+is the smallest execution model that proves real TCP framing and lifecycle
+correctness. `recv()` output is passed directly to `StreamParser`; the transport
+does not duplicate framing logic. `send_all()` retries interrupted calls and
+continues after short writes. A move-only `Socket` closes its descriptor exactly
+once.
+
+The listening socket binds to `127.0.0.1`; port zero is supported and the chosen
+port is obtained with `getsockname()`. `stop()` shuts down the listener and any
+active connection so a test or owner can deterministically unblock the server.
+Malformed, oversized, and incomplete frames close only their connection. The
+server continues accepting later connections.
+
+The default handler is deliberately storage-free. For request message types it
+returns a `response` with the same request ID, flags, and payload. Receiving a
+response-type message where a request is expected produces an `error_response`.
 
 ## Intended evolution
 
-The next layer is a single-node Linux TCP server and client using POSIX sockets,
-reliable short-read/short-write loops, filesystem-backed object storage, and real
-integrity hashes. Distributed placement and replication follow only after that
-single-node path is correct and tested.
+The next layer is single-node filesystem-backed PUT, GET, and DELETE behavior with
+real integrity hashes, while retaining the current transport/handler boundary.
+Production concurrency, distributed placement, and replication remain deferred.

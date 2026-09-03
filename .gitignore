@@ -1,4 +1,15 @@
 /build/
 /cmake-build-*/
+/.cmake/
+/CMakeFiles/
+/Testing/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile
+*.a
+*.o
+*.so
+core
+core.*
 /.cache/
 compile_commands.json

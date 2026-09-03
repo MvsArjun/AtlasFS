@@ -1,8 +1,9 @@
 # AtlasFS
 
-AtlasFS is a C++20/Linux distributed object-storage project. The current milestone
-provides the foundation: a documented binary wire format and an incremental TCP
-stream parser. It intentionally does not yet implement a storage server.
+AtlasFS is a C++20/Linux object-storage systems project. The current milestone
+provides a documented binary wire format, incremental stream parser, and a
+blocking POSIX TCP client/server transport over loopback. The server currently
+returns deterministic echo responses; it does not store objects yet.
 
 ## Build and test
 
@@ -24,6 +25,6 @@ The project enables `-Wall -Wextra -Wpedantic` on GCC and Clang. See
 ```text
 include/atlasfs/  Public C++ interfaces
 src/              Implementations
-tests/            Unit tests
+tests/            Unit and loopback socket integration tests
 docs/             Engineering decisions and protocol specification
 ```

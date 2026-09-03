@@ -39,6 +39,14 @@ advance.
 - Request IDs are correlation values, not deduplication guarantees. Retry and
   idempotency semantics will be defined with storage operations.
 
+## Current transport behavior
+
+The current loopback TCP server accepts request types 1 through 4 and returns type
+100 with the same request ID, flags, and opaque payload. This echo behavior is a
+transport milestone, not object-storage semantics. A client-sent response or error
+response produces type 101. Malformed, oversized, or truncated input causes the
+server to close that connection without attempting stream resynchronization.
+
 ## Compatibility
 
 Changing the fixed header or existing field meaning requires a new protocol

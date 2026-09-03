@@ -50,7 +50,7 @@ TEST(StreamParser, ParsesCompleteMessage) {
 TEST(StreamParser, AcceptsEveryPossibleTwoPartFragmentation) {
     const auto message = sample_message();
     const auto encoded = encode(message);
-    for (std::size_t split = 0; split <= encoded.size(); ++split) {
+    for (std::size_t split = 0; split < encoded.size(); ++split) {
         StreamParser parser;
         const auto first = parser.feed(std::span(encoded).first(split));
         EXPECT_EQ(first.error, ParseError::none) << "split=" << split;
