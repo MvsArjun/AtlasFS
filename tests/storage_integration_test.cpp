@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <memory>
 #include <string>
@@ -223,6 +224,66 @@ TEST(StorageIntegration, RejectsMalformedOperationPayload) {
               object_protocol::Status::malformed_request);
     client.close();
     server.stop_and_rethrow();
+}
+
+TEST(StorageIntegration, TransfersLargeChunkedObjectOverTcp) {
+    TemporaryDirectory directory;
+    RunningStorageServer server(directory.path());
+    net::TcpClient client(server.port());
+    std::vector<std::byte> input(2U * 1024U * 1024U + 1U);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = static_cast<std::byte>(index & 0xffU);
+    }
+    ASSERT_EQ(put(client, 50, "large", input), object_protocol::Status::success);
+    const auto result = get(client, 51, "large");
+    EXPECT_EQ(result.status, object_protocol::Status::success);
+    EXPECT_EQ(result.data, input);
+    client.close();
+    server.stop_and_rethrow();
+}
+
+TEST(StorageIntegration, KeepsIndependentObjectsOnOneConnection) {
+    TemporaryDirectory directory;
+    RunningStorageServer server(directory.path());
+    net::TcpClient client(server.port());
+    const auto first = bytes({1, 2, 3});
+    const auto second = bytes({9, 8, 7, 6});
+    ASSERT_EQ(put(client, 60, "a", first), object_protocol::Status::success);
+    ASSERT_EQ(put(client, 61, "b", second), object_protocol::Status::success);
+    EXPECT_EQ(get(client, 62, "a").data, first);
+    EXPECT_EQ(get(client, 63, "b").data, second);
+    EXPECT_EQ(remove(client, 64, "a"), object_protocol::Status::success);
+    EXPECT_EQ(get(client, 65, "b").data, second);
+    client.close();
+    server.stop_and_rethrow();
+}
+
+TEST(StorageIntegration, ReportsChunkCorruptionOverTcp) {
+    TemporaryDirectory directory;
+    {
+        RunningStorageServer server(directory.path());
+        net::TcpClient client(server.port());
+        ASSERT_EQ(put(client, 70, "object", bytes({1, 2, 3, 4})),
+                  object_protocol::Status::success);
+        client.close();
+        server.stop_and_rethrow();
+    }
+    const auto chunks_root = directory.path() / "objects" / "chunks";
+    const auto generation = std::filesystem::directory_iterator(chunks_root)->path();
+    const auto chunk = generation / "chunk_000000";
+    std::fstream output(chunk, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(output);
+    output.put('x');
+    output.close();
+    {
+        RunningStorageServer server(directory.path());
+        net::TcpClient client(server.port());
+        const auto result = get(client, 71, "object");
+        EXPECT_EQ(result.status, object_protocol::Status::corrupt_object);
+        EXPECT_TRUE(result.data.empty());
+        client.close();
+        server.stop_and_rethrow();
+    }
 }
 
 }  // namespace

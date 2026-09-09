@@ -61,40 +61,74 @@ returns a `response` with the same request ID, flags, and payload. Receiving a
 response-type message where a request is expected produces an `error_response`.
 Storage servers instead install `StorageRequestHandler`.
 
-### Persistent object store
+### Persistent chunked object store
 
-The configured root contains an `objects/` directory and one file per object ID.
+The configured root uses separate committed-manifest, immutable-generation, and
+transaction namespaces:
+
+```text
+objects/
+├── committed/<object-id>                 # authoritative manifest
+├── chunks/<generation-id>/
+│   ├── manifest                          # identical protected manifest
+│   ├── chunk_000000
+│   ├── chunk_000001
+│   └── ...
+└── transactions/<generation-id>/         # never visible as an object
+```
+
+Every object, including empty and small objects, uses this representation. The
+chunk size is configurable and defaults to 1 MiB. Generation IDs are independent
+of logical object IDs so later placement and replication work need not rename the
+physical chunk namespace.
+
 Identifiers use a strict ASCII allowlist and cannot contain path separators,
 absolute-path syntax, traversal components, or the internal temporary-file prefix.
 GET opens files with `O_NOFOLLOW` and accepts only regular files.
 
-Each file is:
+The explicit big-endian manifest is:
 
 ```text
-4 bytes  magic "AOBJ"
+4 bytes  magic "AMNF"
 2 bytes  format version (1)
 2 bytes  reserved zero
 8 bytes  object length, big endian
-4 bytes  CRC-32C, big endian
-N bytes  object data
+4 bytes  configured chunk size
+4 bytes  chunk count
+4 bytes  whole-object CRC-32C
+2 bytes  generation-ID length
+N bytes  generation ID
+for each chunk: 4-byte index, 4-byte length, 4-byte CRC-32C
+4 bytes  CRC-32C of every preceding manifest byte
 ```
 
-PUT first verifies the client checksum. It then creates a private, exclusive
-temporary file in `objects/`, writes the complete header and data, calls
-`fdatasync()`, closes the file, atomically renames it over the destination, and
-calls `fsync()` on the directory. The temporary path is removed on pre-rename
-failure. Thus readers never observe a partially written final object. A directory
-sync failure can be reported after the rename has become visible because the
-system cannot safely roll that operation back.
+PUT verifies the client checksum, creates a private transaction directory, writes
+and syncs every chunk, writes and syncs the manifest, syncs the transaction
+directory, renames it into the immutable generation namespace, and syncs that
+parent. It then writes and syncs a temporary committed manifest, atomically
+renames that file over the object ID, and syncs the committed directory. The final
+manifest rename is the visibility boundary, so a failed overwrite leaves the old
+manifest and generation reachable. Old generations are garbage-collected only
+after the new manifest commits.
 
-GET validates file type, magic, version, reserved bits, declared length, exact
-file length, configured bounds, and CRC-32C before returning bytes. DELETE uses
-`unlink()` and directory sync. DELETE is idempotent with respect to final state,
+On construction, the store removes transaction contents, temporary committed
+manifests, and generation directories not referenced by a valid committed
+manifest. It never promotes incomplete work. This establishes atomic namespace
+visibility and best-effort durability using Linux filesystem primitives; it does
+not claim protection from filesystems or hardware that violate `fsync()`/rename
+guarantees.
+
+GET validates manifest integrity and mathematical consistency, rejects unexpected
+generation entries, reads chunks by numeric index, validates exact chunk lengths
+and CRC-32C values, reassembles the object, and finally validates its whole-object
+CRC-32C. DELETE unlinks the committed manifest first, syncs it, then removes its
+immutable generation. DELETE is idempotent with respect to final state,
 while its result distinguishes the first successful removal from later
 `not_found` attempts.
 
 ## Intended evolution
 
-The next dependency is large-object chunking with per-chunk integrity and partial
-transfer handling. Production concurrency, distributed placement, and replication
-remain deferred.
+The next dependency is a metadata-coordinator and storage-node membership
+foundation that can assign these generation-independent chunks to nodes. Actual
+replication, production concurrency, and recovery remain deferred until placement
+and membership semantics are explicit.

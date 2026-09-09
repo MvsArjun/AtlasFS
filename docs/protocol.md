@@ -94,6 +94,11 @@ CRC-32C uses the Castagnoli polynomial and is stored as four big-endian bytes. I
 detects accidental corruption but is not an authentication mechanism and no
 cryptographic security is claimed.
 
+Filesystem chunking does not change this wire protocol. PUT and GET continue to
+represent one bounded logical object; manifests, generation IDs, chunk indices,
+and per-chunk checksums are internal storage metadata. A future streaming protocol
+will be required before objects can exceed the current single-frame bound.
+
 ## Compatibility
 
 Changing the fixed header or existing field meaning requires a new protocol

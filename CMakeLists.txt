@@ -17,6 +17,7 @@ add_library(AtlasFS::protocol ALIAS atlasfs_protocol)
 
 add_library(atlasfs_storage
     src/checksum.cpp
+    src/manifest.cpp
     src/object_protocol.cpp
     src/object_store.cpp
     src/storage_handler.cpp
@@ -86,6 +87,7 @@ if(BUILD_TESTING)
 
     add_executable(atlasfs_storage_tests
         tests/checksum_test.cpp
+        tests/manifest_test.cpp
         tests/object_protocol_test.cpp
         tests/object_store_test.cpp
     )
