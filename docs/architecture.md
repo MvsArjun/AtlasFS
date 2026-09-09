@@ -3,11 +3,13 @@
 ## Current milestone
 
 AtlasFS currently contains a dependency-free protocol library and a Linux/POSIX
-TCP transport library. `TcpClient` encodes requests, sends complete frames, and
-uses `StreamParser` to receive responses. `TcpServer` listens only on loopback,
+TCP transport library, plus a persistent `ObjectStore`. `TcpClient` encodes
+requests, sends complete frames, and uses `StreamParser` to receive responses.
+`TcpServer` listens only on loopback,
 accepts connections sequentially, parses arbitrary receive chunks, invokes a
-request handler, and reliably sends encoded responses. There is no persistence,
-replication, or coordinator yet.
+request handler, and reliably sends encoded responses. `StorageRequestHandler`
+decodes operation payloads and delegates filesystem work to `ObjectStore`. There
+is no replication or coordinator yet.
 
 The parser consumes arbitrary byte fragments because TCP preserves byte order but
 not application message boundaries. It may emit zero, one, or many messages per
@@ -54,12 +56,45 @@ active connection so a test or owner can deterministically unblock the server.
 Malformed, oversized, and incomplete frames close only their connection. The
 server continues accepting later connections.
 
-The default handler is deliberately storage-free. For request message types it
+The default transport handler remains storage-free. For request message types it
 returns a `response` with the same request ID, flags, and payload. Receiving a
 response-type message where a request is expected produces an `error_response`.
+Storage servers instead install `StorageRequestHandler`.
+
+### Persistent object store
+
+The configured root contains an `objects/` directory and one file per object ID.
+Identifiers use a strict ASCII allowlist and cannot contain path separators,
+absolute-path syntax, traversal components, or the internal temporary-file prefix.
+GET opens files with `O_NOFOLLOW` and accepts only regular files.
+
+Each file is:
+
+```text
+4 bytes  magic "AOBJ"
+2 bytes  format version (1)
+2 bytes  reserved zero
+8 bytes  object length, big endian
+4 bytes  CRC-32C, big endian
+N bytes  object data
+```
+
+PUT first verifies the client checksum. It then creates a private, exclusive
+temporary file in `objects/`, writes the complete header and data, calls
+`fdatasync()`, closes the file, atomically renames it over the destination, and
+calls `fsync()` on the directory. The temporary path is removed on pre-rename
+failure. Thus readers never observe a partially written final object. A directory
+sync failure can be reported after the rename has become visible because the
+system cannot safely roll that operation back.
+
+GET validates file type, magic, version, reserved bits, declared length, exact
+file length, configured bounds, and CRC-32C before returning bytes. DELETE uses
+`unlink()` and directory sync. DELETE is idempotent with respect to final state,
+while its result distinguishes the first successful removal from later
+`not_found` attempts.
 
 ## Intended evolution
 
-The next layer is single-node filesystem-backed PUT, GET, and DELETE behavior with
-real integrity hashes, while retaining the current transport/handler boundary.
-Production concurrency, distributed placement, and replication remain deferred.
+The next dependency is large-object chunking with per-chunk integrity and partial
+transfer handling. Production concurrency, distributed placement, and replication
+remain deferred.

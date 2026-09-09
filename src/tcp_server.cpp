@@ -35,6 +35,9 @@ protocol::Message echo_response(const protocol::Message& request) {
                     request.payload};
         case protocol::MessageType::response:
         case protocol::MessageType::error_response:
+        case protocol::MessageType::put_response:
+        case protocol::MessageType::get_response:
+        case protocol::MessageType::delete_response:
             return {protocol::MessageType::error_response, 0, request.request_id,
                     to_bytes("unexpected response message")};
     }

@@ -1,9 +1,10 @@
 # AtlasFS
 
 AtlasFS is a C++20/Linux object-storage systems project. The current milestone
-provides a documented binary wire format, incremental stream parser, and a
-blocking POSIX TCP client/server transport over loopback. The server currently
-returns deterministic echo responses; it does not store objects yet.
+provides a documented binary wire format, incremental stream parser, blocking
+POSIX TCP transport, and persistent single-node PUT, GET, and DELETE operations.
+Objects survive server restarts and are verified with CRC-32C before being
+returned.
 
 ## Build and test
 
@@ -28,3 +29,12 @@ src/              Implementations
 tests/            Unit and loopback socket integration tests
 docs/             Engineering decisions and protocol specification
 ```
+
+## Current scope
+
+Object identifiers contain only ASCII letters, digits, `.`, `_`, and `-`, are at
+most 255 bytes, and cannot be `.` or `..`. Objects are limited to slightly below
+16 MiB so complete requests and responses remain inside the framing limit. The
+internal `.atlasfs-tmp-` prefix is reserved. This milestone is single-node and
+sequential: it does not implement chunking,
+replication, a coordinator, or production concurrency.

@@ -17,6 +17,9 @@ enum class MessageType : std::uint16_t {
     get_request = 2,
     delete_request = 3,
     metadata_request = 4,
+    put_response = 10,
+    get_response = 11,
+    delete_response = 12,
     response = 100,
     error_response = 101,
 };

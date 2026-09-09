@@ -15,6 +15,14 @@ add_library(atlasfs_protocol
 )
 add_library(AtlasFS::protocol ALIAS atlasfs_protocol)
 
+add_library(atlasfs_storage
+    src/checksum.cpp
+    src/object_protocol.cpp
+    src/object_store.cpp
+    src/storage_handler.cpp
+)
+add_library(AtlasFS::storage ALIAS atlasfs_storage)
+
 add_library(atlasfs_net
     src/socket.cpp
     src/tcp_client.cpp
@@ -33,6 +41,12 @@ target_include_directories(atlasfs_net
 )
 target_link_libraries(atlasfs_net PUBLIC AtlasFS::protocol)
 
+target_include_directories(atlasfs_storage
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(atlasfs_storage PUBLIC AtlasFS::protocol)
+
 if(MSVC)
     target_compile_options(atlasfs_protocol PRIVATE /W4 /permissive-)
 else()
@@ -43,6 +57,12 @@ if(MSVC)
     target_compile_options(atlasfs_net PRIVATE /W4 /permissive-)
 else()
     target_compile_options(atlasfs_net PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(MSVC)
+    target_compile_options(atlasfs_storage PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(atlasfs_storage PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 include(CTest)
 if(BUILD_TESTING)
@@ -63,14 +83,30 @@ if(BUILD_TESTING)
     add_executable(atlasfs_tcp_transport_tests tests/tcp_transport_test.cpp)
     target_link_libraries(atlasfs_tcp_transport_tests
         PRIVATE AtlasFS::net GTest::gtest_main Threads::Threads)
+
+    add_executable(atlasfs_storage_tests
+        tests/checksum_test.cpp
+        tests/object_protocol_test.cpp
+        tests/object_store_test.cpp
+    )
+    target_link_libraries(atlasfs_storage_tests PRIVATE AtlasFS::storage GTest::gtest_main)
+
+    add_executable(atlasfs_storage_integration_tests tests/storage_integration_test.cpp)
+    target_link_libraries(atlasfs_storage_integration_tests
+        PRIVATE AtlasFS::net AtlasFS::storage GTest::gtest_main Threads::Threads)
     if(MSVC)
         target_compile_options(atlasfs_protocol_tests PRIVATE /W4 /permissive-)
     else()
         target_compile_options(atlasfs_protocol_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(atlasfs_tcp_transport_tests PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(atlasfs_storage_tests PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(atlasfs_storage_integration_tests
+            PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
     include(GoogleTest)
     gtest_discover_tests(atlasfs_protocol_tests)
     gtest_discover_tests(atlasfs_tcp_transport_tests)
+    gtest_discover_tests(atlasfs_storage_tests)
+    gtest_discover_tests(atlasfs_storage_integration_tests)
 endif()

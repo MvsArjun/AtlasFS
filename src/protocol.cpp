@@ -34,6 +34,9 @@ bool is_known_type(std::uint16_t raw_type) {
         case MessageType::get_request:
         case MessageType::delete_request:
         case MessageType::metadata_request:
+        case MessageType::put_response:
+        case MessageType::get_response:
+        case MessageType::delete_response:
         case MessageType::response:
         case MessageType::error_response:
             return true;
