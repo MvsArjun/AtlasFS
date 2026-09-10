@@ -50,6 +50,23 @@ bool valid_status(std::uint16_t raw) {
 
 }  // namespace
 
+bool valid_object_id(std::string_view object_id) noexcept {
+    if (object_id.empty() || object_id.size() > kMaxObjectIdSize || object_id == "." ||
+        object_id == ".." || object_id.starts_with(".atlasfs-tmp-")) {
+        return false;
+    }
+    for (const unsigned char character : object_id) {
+        const bool allowed = (character >= 'a' && character <= 'z') ||
+                             (character >= 'A' && character <= 'Z') ||
+                             (character >= '0' && character <= '9') || character == '-' ||
+                             character == '_' || character == '.';
+        if (!allowed) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::vector<std::byte> encode_put_request(const PutRequest& request) {
     if (request.object_id.size() > kMaxObjectIdSize ||
         request.object_id.size() > std::numeric_limits<std::uint16_t>::max()) {

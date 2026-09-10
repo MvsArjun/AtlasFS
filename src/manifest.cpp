@@ -61,6 +61,9 @@ bool consistent(const ObjectManifest& manifest, std::size_t max_object_size,
         manifest.chunks.size() > max_chunk_count) {
         return false;
     }
+    if (manifest.object_size == 0 && manifest.object_checksum != integrity::crc32c({})) {
+        return false;
+    }
     const auto expected_count = manifest.object_size == 0
                                     ? 0U
                                     : 1U + (manifest.object_size - 1U) / manifest.chunk_size;

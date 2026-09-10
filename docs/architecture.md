@@ -9,7 +9,25 @@ requests, sends complete frames, and uses `StreamParser` to receive responses.
 accepts connections sequentially, parses arbitrary receive chunks, invokes a
 request handler, and reliably sends encoded responses. `StorageRequestHandler`
 decodes operation payloads and delegates filesystem work to `ObjectStore`. There
-is no replication or coordinator yet.
+is no replication or networked coordinator yet.
+
+AtlasFS also has an in-process control-plane foundation:
+
+```text
+                 MetadataCoordinator
+                         |
+              +----------+----------+
+              |                     |
+         NodeRegistry       RendezvousPlacement
+              |                     |
+              +----------+----------+
+                         |
+                  PlacementPlan
+```
+
+The existing TCP, handler, and `ObjectStore` path is the data plane. The metadata
+coordinator, registry, and placement policy form the control plane. They do not
+perform filesystem or network I/O, and the data plane does not yet consult them.
 
 The parser consumes arbitrary byte fragments because TCP preserves byte order but
 not application message boundaries. It may emit zero, one, or many messages per
@@ -126,9 +144,37 @@ immutable generation. DELETE is idempotent with respect to final state,
 while its result distinguishes the first successful removal from later
 `not_found` attempts.
 
+### Membership and placement
+
+A storage node has a stable validated node ID, host, port, and coordinator-owned
+state. ACTIVE nodes are eligible for new placement. DRAINING nodes remain known
+but receive no new chunks, while UNAVAILABLE nodes are likewise excluded. No
+health detector changes these states yet.
+
+`NodeRegistry` uses node-ID ordering, so listing and placement input never depend
+on unordered-container iteration. Every successful add, remove, or actual state
+change increments an in-process 64-bit membership version. Rejected mutations and
+no-op state assignments do not. Placement plans record the version used.
+
+Chunk identity is the length-delimited tuple `(object ID, generation ID, chunk
+index)`. Placement uses rendezvous hashing: AtlasFS computes explicitly defined
+64-bit FNV-1a scores for each eligible node and selects the greatest score, with
+node ID as a deterministic tie-breaker. FNV-1a is used for stable placement, not
+security. This is reproducible across insertion orders and processes. Adding a
+node only keeps an existing primary or moves it to the new node; removal affects
+only chunks assigned to the removed node. No migration is performed.
+
+`ObjectMetadata` reuses the durable manifest's size and integrity fields without
+putting placement into that manifest. `PlacementPlan` separately attaches one
+primary node to each generation-aware chunk and preserves the manifest metadata.
+Its single-primary field can later evolve into a replica list without changing
+chunk identity or the local manifest format.
+
+Membership, states, and placement plans are intentionally in-memory and assume
+single-threaded access. Object data and manifests remain durable.
+
 ## Intended evolution
 
-The next dependency is a metadata-coordinator and storage-node membership
-foundation that can assign these generation-independent chunks to nodes. Actual
-replication, production concurrency, and recovery remain deferred until placement
-and membership semantics are explicit.
+The next dependency is replicated chunk writes using an explicit fixed membership
+snapshot and failure semantics. Coordinator networking, persistent membership,
+production concurrency, and automatic recovery remain deferred.

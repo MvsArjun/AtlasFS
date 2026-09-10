@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace atlasfs::object_protocol {
@@ -14,6 +15,8 @@ namespace atlasfs::object_protocol {
 inline constexpr std::size_t kMaxObjectIdSize = 255;
 inline constexpr std::size_t kMaxObjectDataSize =
     protocol::kDefaultMaxPayloadSize - 512U;
+
+[[nodiscard]] bool valid_object_id(std::string_view object_id) noexcept;
 
 enum class Status : std::uint16_t {
     success = 0,

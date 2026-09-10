@@ -24,6 +24,12 @@ add_library(atlasfs_storage
 )
 add_library(AtlasFS::storage ALIAS atlasfs_storage)
 
+add_library(atlasfs_metadata
+    src/coordinator.cpp
+    src/node_registry.cpp
+)
+add_library(AtlasFS::metadata ALIAS atlasfs_metadata)
+
 add_library(atlasfs_net
     src/socket.cpp
     src/tcp_client.cpp
@@ -48,6 +54,12 @@ target_include_directories(atlasfs_storage
 )
 target_link_libraries(atlasfs_storage PUBLIC AtlasFS::protocol)
 
+target_include_directories(atlasfs_metadata
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(atlasfs_metadata PUBLIC AtlasFS::storage)
+
 if(MSVC)
     target_compile_options(atlasfs_protocol PRIVATE /W4 /permissive-)
 else()
@@ -64,6 +76,12 @@ if(MSVC)
     target_compile_options(atlasfs_storage PRIVATE /W4 /permissive-)
 else()
     target_compile_options(atlasfs_storage PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(MSVC)
+    target_compile_options(atlasfs_metadata PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(atlasfs_metadata PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 include(CTest)
 if(BUILD_TESTING)
@@ -96,6 +114,12 @@ if(BUILD_TESTING)
     add_executable(atlasfs_storage_integration_tests tests/storage_integration_test.cpp)
     target_link_libraries(atlasfs_storage_integration_tests
         PRIVATE AtlasFS::net AtlasFS::storage GTest::gtest_main Threads::Threads)
+
+    add_executable(atlasfs_metadata_tests
+        tests/coordinator_test.cpp
+        tests/node_registry_test.cpp
+    )
+    target_link_libraries(atlasfs_metadata_tests PRIVATE AtlasFS::metadata GTest::gtest_main)
     if(MSVC)
         target_compile_options(atlasfs_protocol_tests PRIVATE /W4 /permissive-)
     else()
@@ -104,6 +128,7 @@ if(BUILD_TESTING)
         target_compile_options(atlasfs_storage_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(atlasfs_storage_integration_tests
             PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(atlasfs_metadata_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
     include(GoogleTest)
@@ -111,4 +136,5 @@ if(BUILD_TESTING)
     gtest_discover_tests(atlasfs_tcp_transport_tests)
     gtest_discover_tests(atlasfs_storage_tests)
     gtest_discover_tests(atlasfs_storage_integration_tests)
+    gtest_discover_tests(atlasfs_metadata_tests)
 endif()

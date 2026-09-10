@@ -282,18 +282,7 @@ const std::filesystem::path& ObjectStore::transactions_directory() const noexcep
 std::uint32_t ObjectStore::chunk_size() const noexcept { return chunk_size_; }
 
 bool ObjectStore::valid_object_id(std::string_view object_id) noexcept {
-    if (object_id.empty() || object_id.size() > object_protocol::kMaxObjectIdSize ||
-        object_id == "." || object_id == ".." || object_id.starts_with(".atlasfs-tmp-")) {
-        return false;
-    }
-    for (const unsigned char character : object_id) {
-        const bool allowed = (character >= 'a' && character <= 'z') ||
-                             (character >= 'A' && character <= 'Z') ||
-                             (character >= '0' && character <= '9') || character == '-' ||
-                             character == '_' || character == '.';
-        if (!allowed) { return false; }
-    }
-    return true;
+    return object_protocol::valid_object_id(object_id);
 }
 
 std::filesystem::path ObjectStore::object_path(std::string_view object_id) const {

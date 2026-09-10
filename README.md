@@ -8,6 +8,11 @@ returned. Storage splits every logical object into configurable chunks (1 MiB by
 default), protects each chunk and the whole object, and commits through a durable
 binary manifest.
 
+An in-process metadata control plane now models stable storage-node identities,
+runtime membership state, monotonically versioned membership snapshots, and
+deterministic single-primary chunk placement. This produces plans only; the
+operational storage path remains single-node and no replication occurs.
+
 ## Build and test
 
 Prerequisites: CMake 3.20+, a C++20 compiler, Git, and network access on the first
@@ -41,3 +46,6 @@ internal `.atlasfs-tmp-` prefix is reserved. This milestone is single-node and
 sequential: it does not implement replication, a coordinator, or production
 concurrency. Chunking is a filesystem detail; the network API still transfers one
 bounded logical object per PUT or GET.
+
+Node membership and placement plans are currently in-memory and single-threaded.
+Object bytes and manifests remain durable on disk.
