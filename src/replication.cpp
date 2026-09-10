@@ -1,6 +1,7 @@
 #include "atlasfs/replication.hpp"
 
 #include "atlasfs/checksum.hpp"
+#include "atlasfs/storage_node_protocol.hpp"
 
 #include <algorithm>
 #include <set>
@@ -74,29 +75,29 @@ LocalStorageNode::LocalStorageNode(std::string node_id, std::filesystem::path ro
 std::string_view LocalStorageNode::id() const noexcept { return node_id_; }
 
 storage::StoreError LocalStorageNode::prepare(
-    std::string_view object_id, const storage::ObjectManifest& manifest,
+    std::string_view, std::string_view object_id, const storage::ObjectManifest& manifest,
     std::span<const std::uint32_t> chunk_indices,
     std::span<const std::byte> object_data) {
     return store_.prepare_replica(object_id, manifest, chunk_indices, object_data);
 }
 
 storage::StoreError LocalStorageNode::verify_prepared(
-    std::string_view object_id, std::string_view generation_id,
+    std::string_view, std::string_view object_id, std::string_view generation_id,
     std::span<const std::uint32_t> chunk_indices) const {
     return store_.verify_prepared_replica(object_id, generation_id, chunk_indices);
 }
 
-storage::StoreError LocalStorageNode::commit(std::string_view object_id,
+storage::StoreError LocalStorageNode::commit(std::string_view, std::string_view object_id,
                                              std::string_view generation_id) {
     return store_.commit_replica(object_id, generation_id);
 }
 
-storage::StoreError LocalStorageNode::abort(std::string_view object_id,
+storage::StoreError LocalStorageNode::abort(std::string_view, std::string_view object_id,
                                             std::string_view generation_id) {
     return store_.abort_replica(object_id, generation_id);
 }
 
-storage::StoreError LocalStorageNode::finalize(std::string_view object_id,
+storage::StoreError LocalStorageNode::finalize(std::string_view, std::string_view object_id,
                                                std::string_view generation_id) {
     return store_.finalize_replica(object_id, generation_id);
 }
@@ -107,8 +108,9 @@ storage::ChunkResult LocalStorageNode::get_chunk(
     return store_.get_replica_chunk(object_id, generation_id, chunk_index);
 }
 
-storage::StoreError LocalStorageNode::remove(std::string_view object_id) {
-    return store_.remove(object_id);
+storage::StoreError LocalStorageNode::remove(std::string_view object_id,
+                                             std::string_view generation_id) {
+    return store_.remove_generation(object_id, generation_id);
 }
 
 const storage::ObjectStore& LocalStorageNode::store() const noexcept { return store_; }
@@ -124,8 +126,18 @@ ReplicaManager::ReplicaManager(std::vector<std::shared_ptr<StorageNode>> nodes) 
 
 ReplicatedPutResult ReplicaManager::put(const metadata::PlacementPlan& plan,
                                         std::span<const std::byte> object_data) {
+    return put(plan, object_data, "op-" + plan.generation_id);
+}
+
+ReplicatedPutResult ReplicaManager::put(const metadata::PlacementPlan& plan,
+                                        std::span<const std::byte> object_data,
+                                        std::string_view operation_id) {
     ReplicatedPutResult result;
     result.requested_replicas = plan.replication_factor;
+    if (!storage_node_protocol::valid_operation_id(operation_id)) {
+        result.status = ReplicationStatus::invalid_plan;
+        return result;
+    }
     const auto manifest = manifest_from_plan(plan);
     if (!manifest || object_data.size() != plan.object_size ||
         integrity::crc32c(object_data) != plan.object_checksum) {
@@ -157,11 +169,12 @@ ReplicatedPutResult ReplicaManager::put(const metadata::PlacementPlan& plan,
         const auto found = nodes_.find(node_id);
         storage::StoreError error = storage::StoreError::not_found;
         if (found != nodes_.end()) {
-            error = found->second->prepare(plan.object_id, *manifest, chunk_indices, object_data);
+            error = found->second->prepare(operation_id, plan.object_id, *manifest,
+                                           chunk_indices, object_data);
             if (error == storage::StoreError::none) {
                 prepared.push_back(node_id);
                 error = found->second->verify_prepared(
-                    plan.object_id, plan.generation_id, chunk_indices);
+                    operation_id, plan.object_id, plan.generation_id, chunk_indices);
             }
         }
         if (error == storage::StoreError::none) {
@@ -172,7 +185,8 @@ ReplicatedPutResult ReplicaManager::put(const metadata::PlacementPlan& plan,
     }
     auto rollback = [&] {
         for (const auto& node_id : prepared) {
-            if (nodes_.at(node_id)->abort(plan.object_id, plan.generation_id) !=
+            if (nodes_.at(node_id)->abort(operation_id, plan.object_id,
+                                          plan.generation_id) !=
                 storage::StoreError::none) {
                 result.rollback_failed_nodes.push_back(node_id);
             }
@@ -185,8 +199,14 @@ ReplicatedPutResult ReplicaManager::put(const metadata::PlacementPlan& plan,
         return result;
     }
     for (const auto& node_id : prepared) {
-        if (nodes_.at(node_id)->commit(plan.object_id, plan.generation_id) !=
-            storage::StoreError::none) {
+        const auto commit_error = nodes_.at(node_id)->commit(
+            operation_id, plan.object_id, plan.generation_id);
+        if (commit_error == storage::StoreError::result_unknown) {
+            result.failed_nodes.push_back(node_id);
+            result.status = ReplicationStatus::commit_result_unknown;
+            return result;
+        }
+        if (commit_error != storage::StoreError::none) {
             result.failed_nodes.push_back(node_id);
             rollback();
             result.status = result.rollback_failed_nodes.empty()
@@ -195,7 +215,8 @@ ReplicatedPutResult ReplicaManager::put(const metadata::PlacementPlan& plan,
         }
     }
     for (const auto& node_id : prepared) {
-        if (nodes_.at(node_id)->finalize(plan.object_id, plan.generation_id) !=
+        if (nodes_.at(node_id)->finalize(operation_id, plan.object_id,
+                                         plan.generation_id) !=
             storage::StoreError::none) {
             result.failed_nodes.push_back(node_id);
         }
@@ -276,7 +297,8 @@ ReplicatedDeleteResult ReplicaManager::remove(const metadata::PlacementPlan& pla
         static_cast<void>(unused);
         const auto found = nodes_.find(node_id);
         const auto error = found == nodes_.end() ? storage::StoreError::filesystem_error
-                                                 : found->second->remove(plan.object_id);
+                                                 : found->second->remove(plan.object_id,
+                                                                         plan.generation_id);
         if (error == storage::StoreError::none || error == storage::StoreError::not_found) {
             result.deleted_or_missing_nodes.push_back(node_id);
         } else {

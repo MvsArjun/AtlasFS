@@ -22,6 +22,18 @@ enum class MessageType : std::uint16_t {
     delete_response = 12,
     response = 100,
     error_response = 101,
+    storage_prepare_request = 200,
+    storage_prepare_response = 201,
+    storage_commit_request = 202,
+    storage_commit_response = 203,
+    storage_abort_request = 204,
+    storage_abort_response = 205,
+    storage_get_chunk_request = 206,
+    storage_get_chunk_response = 207,
+    storage_delete_request = 208,
+    storage_delete_response = 209,
+    storage_query_request = 210,
+    storage_query_response = 211,
 };
 
 struct Message {

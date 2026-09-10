@@ -32,6 +32,8 @@ add_library(AtlasFS::metadata ALIAS atlasfs_metadata)
 
 add_library(atlasfs_replication
     src/replication.cpp
+    src/remote_storage_node.cpp
+    src/storage_node_protocol.cpp
 )
 add_library(AtlasFS::replication ALIAS atlasfs_replication)
 
@@ -69,7 +71,8 @@ target_include_directories(atlasfs_replication
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(atlasfs_replication PUBLIC AtlasFS::metadata AtlasFS::storage)
+target_link_libraries(atlasfs_replication
+    PUBLIC AtlasFS::metadata AtlasFS::storage AtlasFS::net)
 
 if(MSVC)
     target_compile_options(atlasfs_protocol PRIVATE /W4 /permissive-)
@@ -137,9 +140,12 @@ if(BUILD_TESTING)
         tests/node_registry_test.cpp
     )
     target_link_libraries(atlasfs_metadata_tests PRIVATE AtlasFS::metadata GTest::gtest_main)
-    add_executable(atlasfs_replication_tests tests/replication_test.cpp)
+    add_executable(atlasfs_replication_tests
+        tests/replication_test.cpp
+        tests/storage_node_protocol_test.cpp
+    )
     target_link_libraries(atlasfs_replication_tests
-        PRIVATE AtlasFS::replication GTest::gtest_main)
+        PRIVATE AtlasFS::replication GTest::gtest_main Threads::Threads)
     if(MSVC)
         target_compile_options(atlasfs_protocol_tests PRIVATE /W4 /permissive-)
     else()

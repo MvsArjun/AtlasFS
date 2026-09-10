@@ -14,6 +14,13 @@ versioned membership, and deterministic top-R rendezvous placement. A separate
 roots. Replicated PUT uses prepare/verify/commit with rollback, GET falls back
 across missing or corrupt chunk replicas, and DELETE reports partial failure.
 
+The storage-node boundary also has a versioned lower-level RPC protocol.
+`RemoteStorageNodeClient` implements the same `StorageNode` interface over the
+existing framed TCP transport, while `StorageNodeServer` delegates to a local
+node and `ObjectStore`. PREPARE, COMMIT, and ABORT use bounded operation IDs,
+reject conflicting reuse, and retain terminal state on disk. Connections are
+persistent and synchronous; no automatic retry occurs.
+
 ## Build and test
 
 Prerequisites: CMake 3.20+, a C++20 compiler, Git, and network access on the first

@@ -39,6 +39,18 @@ bool is_known_type(std::uint16_t raw_type) {
         case MessageType::delete_response:
         case MessageType::response:
         case MessageType::error_response:
+        case MessageType::storage_prepare_request:
+        case MessageType::storage_prepare_response:
+        case MessageType::storage_commit_request:
+        case MessageType::storage_commit_response:
+        case MessageType::storage_abort_request:
+        case MessageType::storage_abort_response:
+        case MessageType::storage_get_chunk_request:
+        case MessageType::storage_get_chunk_response:
+        case MessageType::storage_delete_request:
+        case MessageType::storage_delete_response:
+        case MessageType::storage_query_request:
+        case MessageType::storage_query_response:
             return true;
     }
     return false;

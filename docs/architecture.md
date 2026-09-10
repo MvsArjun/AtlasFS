@@ -37,6 +37,26 @@ touch storage. `ReplicaManager` is the replication layer. `LocalStorageNode` is
 the storage boundary and owns one independent `ObjectStore` root. The existing
 TCP path remains a separate transport integration.
 
+```text
+                   ReplicaManager
+                         |
+              +----------+----------+
+              |                     |
+       LocalStorageNode     RemoteStorageNodeClient
+              |                     |
+          ObjectStore         StorageNodeServer
+                                    |
+                                ObjectStore
+```
+
+The remote path reuses the 24-byte frame and incremental parser. Its storage
+protocol is separate from logical-object PUT/GET/DELETE. A durable operation
+journal fingerprints PREPARE and records PREPARED, COMMITTED, or ABORTED. Exact
+duplicates are deterministic; conflicting ID reuse and invalid transitions are
+rejected. On restart unfinished PREPARE is conservatively recovered as ABORTED.
+If a COMMIT response is lost, the client reports an unknown result and the
+manager does not blindly roll it back; QUERY_OPERATION resolves durable state.
+
 The parser consumes arbitrary byte fragments because TCP preserves byte order but
 not application message boundaries. It may emit zero, one, or many messages per
 call. Incomplete frames remain buffered. A malformed header is a connection-level
@@ -199,7 +219,6 @@ single-threaded access. Object data and manifests remain durable.
 
 ## Intended evolution
 
-The next dependency is a network-neutral remote storage-node client/protocol with
-idempotent operation identity. Coordinator networking, persistent membership,
-heartbeats, failure detection, consensus, production concurrency, retries, and
-automatic recovery remain deferred.
+The next dependency is explicit recovery orchestration for ambiguous operations.
+Coordinator networking, persistent membership, heartbeats, failure detection,
+consensus, production concurrency, retries, and automatic recovery remain deferred.

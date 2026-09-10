@@ -104,3 +104,26 @@ will be required before objects can exceed the current single-frame bound.
 Changing the fixed header or existing field meaning requires a new protocol
 version. New message types may be added within version 1 when old peers can reject
 them cleanly. Reserved flag bits must be zero until their semantics are specified.
+
+## Storage-node protocol
+
+Replica traffic uses the same frame with distinct message types 200–211. Each
+payload begins with a two-byte big-endian storage protocol version; the current
+version is 1. Unknown versions, malformed lengths, unsafe identifiers, and
+out-of-bound chunk counts are rejected.
+
+PREPARE carries a bounded operation ID, object ID, protected manifest, chunk
+indexes, and object bytes. The server fingerprints the canonical request. An
+exact repeated PREPARE succeeds while PREPARED; different contents under the same
+ID return `operation_conflict`. COMMIT and ABORT carry operation, object, and
+generation IDs. Repeated COMMIT after COMMITTED and ABORT after ABORTED succeed;
+cross-terminal transitions return `invalid_operation_state`.
+
+GET_CHUNK carries object ID, generation ID, and chunk index and returns manifest,
+chunk metadata, and bytes. DELETE is idempotent. QUERY_OPERATION reports UNKNOWN,
+PREPARED, COMMITTED, or ABORTED. Frame request IDs correlate responses and
+mutating responses echo the operation ID.
+
+There are no automatic retries. Loss of a COMMIT response is `result_unknown`
+because the server may already have committed. The caller must not blindly abort;
+QUERY_OPERATION on a new connection can resolve the durable state.

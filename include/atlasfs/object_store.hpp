@@ -24,6 +24,9 @@ enum class StoreError {
     corrupt_object,
     filesystem_error,
     payload_too_large,
+    operation_conflict,
+    invalid_operation_state,
+    result_unknown,
 };
 
 enum class PutFaultPoint {
@@ -71,6 +74,8 @@ public:
                                  std::uint32_t supplied_checksum);
     [[nodiscard]] GetResult get(std::string_view object_id) const;
     [[nodiscard]] StoreError remove(std::string_view object_id);
+    [[nodiscard]] StoreError remove_generation(std::string_view object_id,
+                                               std::string_view generation_id);
 
     // Single-threaded two-phase primitives used by in-process replication. A
     // prepared generation is durable but invisible until commit_replica().

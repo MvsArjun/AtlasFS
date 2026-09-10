@@ -24,6 +24,10 @@ object_protocol::Status to_status(StoreError error) {
             return object_protocol::Status::filesystem_error;
         case StoreError::payload_too_large:
             return object_protocol::Status::payload_too_large;
+        case StoreError::operation_conflict:
+        case StoreError::invalid_operation_state:
+        case StoreError::result_unknown:
+            return object_protocol::Status::filesystem_error;
     }
     return object_protocol::Status::filesystem_error;
 }
@@ -82,6 +86,18 @@ protocol::Message StorageRequestHandler::operator()(const protocol::Message& req
         case protocol::MessageType::delete_response:
         case protocol::MessageType::response:
         case protocol::MessageType::error_response:
+        case protocol::MessageType::storage_prepare_request:
+        case protocol::MessageType::storage_prepare_response:
+        case protocol::MessageType::storage_commit_request:
+        case protocol::MessageType::storage_commit_response:
+        case protocol::MessageType::storage_abort_request:
+        case protocol::MessageType::storage_abort_response:
+        case protocol::MessageType::storage_get_chunk_request:
+        case protocol::MessageType::storage_get_chunk_response:
+        case protocol::MessageType::storage_delete_request:
+        case protocol::MessageType::storage_delete_response:
+        case protocol::MessageType::storage_query_request:
+        case protocol::MessageType::storage_query_response:
             return status_response(protocol::MessageType::error_response, request.request_id,
                                    object_protocol::Status::invalid_request);
     }

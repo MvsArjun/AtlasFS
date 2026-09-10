@@ -497,6 +497,19 @@ StoreError ObjectStore::remove(std::string_view object_id) {
     return StoreError::none;
 }
 
+StoreError ObjectStore::remove_generation(std::string_view object_id,
+                                          std::string_view generation_id) {
+    const auto manifest_bytes = read_regular_file(object_path(object_id), kMaximumManifestSize);
+    if (!manifest_bytes) {
+        return std::filesystem::exists(object_path(object_id)) ? StoreError::corrupt_object
+                                                               : StoreError::not_found;
+    }
+    const auto manifest = decode_manifest(*manifest_bytes, max_object_size_);
+    if (!manifest) return StoreError::corrupt_object;
+    if (manifest->generation_id != generation_id) return StoreError::not_found;
+    return remove(object_id);
+}
+
 const std::filesystem::path& ObjectStore::objects_directory() const noexcept { return objects_directory_; }
 const std::filesystem::path& ObjectStore::chunks_directory() const noexcept { return chunks_directory_; }
 const std::filesystem::path& ObjectStore::transactions_directory() const noexcept { return transactions_directory_; }

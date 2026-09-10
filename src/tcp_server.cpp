@@ -38,6 +38,18 @@ protocol::Message echo_response(const protocol::Message& request) {
         case protocol::MessageType::put_response:
         case protocol::MessageType::get_response:
         case protocol::MessageType::delete_response:
+        case protocol::MessageType::storage_prepare_request:
+        case protocol::MessageType::storage_prepare_response:
+        case protocol::MessageType::storage_commit_request:
+        case protocol::MessageType::storage_commit_response:
+        case protocol::MessageType::storage_abort_request:
+        case protocol::MessageType::storage_abort_response:
+        case protocol::MessageType::storage_get_chunk_request:
+        case protocol::MessageType::storage_get_chunk_response:
+        case protocol::MessageType::storage_delete_request:
+        case protocol::MessageType::storage_delete_response:
+        case protocol::MessageType::storage_query_request:
+        case protocol::MessageType::storage_query_response:
             return {protocol::MessageType::error_response, 0, request.request_id,
                     to_bytes("unexpected response message")};
     }
