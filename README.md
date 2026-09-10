@@ -38,6 +38,13 @@ the persisted observations with authoritative storage-node journal state.
 PREPARING are durable before participant work and the resulting terminal or
 UNRESOLVED state is durable before the result is returned.
 
+Membership is also persisted under `coordinator/membership/registry` with a
+monotonic version, validated endpoints, administrative state, and last-known
+health observations. Synchronous heartbeat clients verify the responding node's
+identity and use a configurable consecutive-failure threshold. Restart marks
+persisted health as stale until a fresh check; no heartbeat triggers repair,
+operation recovery, data movement, or retry.
+
 ## Build and test
 
 Prerequisites: CMake 3.20+, a C++20 compiler, Git, and network access on the first

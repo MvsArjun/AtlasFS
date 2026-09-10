@@ -26,6 +26,7 @@ add_library(AtlasFS::storage ALIAS atlasfs_storage)
 
 add_library(atlasfs_metadata
     src/coordinator.cpp
+    src/membership.cpp
     src/node_registry.cpp
 )
 add_library(AtlasFS::metadata ALIAS atlasfs_metadata)
@@ -139,6 +140,7 @@ if(BUILD_TESTING)
 
     add_executable(atlasfs_metadata_tests
         tests/coordinator_test.cpp
+        tests/membership_test.cpp
         tests/node_registry_test.cpp
     )
     target_link_libraries(atlasfs_metadata_tests PRIVATE AtlasFS::metadata GTest::gtest_main)

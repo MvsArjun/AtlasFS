@@ -20,6 +20,8 @@ enum class NodeState {
     unavailable,
 };
 
+enum class NodeHealthState { healthy, suspect, unavailable };
+
 struct NodeEndpoint {
     std::string host;
     std::uint16_t port{};
@@ -31,6 +33,9 @@ struct StorageNode {
     std::string node_id;
     NodeEndpoint endpoint;
     NodeState state{NodeState::active};
+    NodeHealthState health{NodeHealthState::healthy};
+    std::uint32_t consecutive_failures{};
+    bool health_current{true};
 
     bool operator==(const StorageNode&) const = default;
 };
@@ -47,6 +52,11 @@ public:
     [[nodiscard]] RegistryError add(StorageNode node);
     [[nodiscard]] RegistryError remove(std::string_view node_id);
     [[nodiscard]] RegistryError set_state(std::string_view node_id, NodeState state);
+    [[nodiscard]] RegistryError set_health(std::string_view node_id, NodeHealthState health,
+                                           std::uint32_t consecutive_failures,
+                                           bool health_current = true);
+    [[nodiscard]] RegistryError restore(std::vector<StorageNode> nodes,
+                                        std::uint64_t version);
     [[nodiscard]] std::optional<StorageNode> get(std::string_view node_id) const;
     [[nodiscard]] std::vector<StorageNode> list() const;
     [[nodiscard]] std::vector<StorageNode> eligible_nodes() const;

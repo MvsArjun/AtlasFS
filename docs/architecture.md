@@ -211,6 +211,26 @@ while its result distinguishes the first successful removal from later
 
 ### Membership and placement
 
+Membership is durably published as a strict, CRC-protected `AMBR` record at
+`coordinator/membership/registry`. Mutations are applied to a candidate registry,
+advance its monotonic version, and become visible only after temporary-file
+write, file synchronization, atomic rename, and directory synchronization.
+Malformed published state stops startup without deletion.
+
+Administrative state and health are independent inputs to eligibility. An ACTIVE
+node is eligible only when its health is freshly verified as HEALTHY; DRAINING
+remains an operator decision even if heartbeats fail. Each synchronous heartbeat
+verifies the returned node identity. A bounded consecutive-failure threshold
+moves health through SUSPECT to UNAVAILABLE, while a later successful check only
+restores health and performs no repair or data movement. Persisted health is a
+last-known observation and is marked stale after coordinator restart.
+
+Current membership versions affect only new placement. Durable operation records
+retain their historical membership version and original participant-to-chunk
+mapping, so failure detection, removal, addition, or recovery of a node cannot
+rewrite old recovery participants. No health transition automatically
+commits, aborts, retries, or repairs a distributed operation.
+
 A storage node has a stable validated node ID, host, port, and coordinator-owned
 state. ACTIVE nodes are eligible for new placement. DRAINING nodes remain known
 but receive no new chunks, while UNAVAILABLE nodes are likewise excluded. No
@@ -251,11 +271,12 @@ copy, and verify the reassembled object's CRC-32C. Deletes visit every known nod
 `not_found` is idempotent success and other failures produce `partial_delete`.
 Degraded reads and membership changes never trigger automatic repair.
 
-Membership, states, and placement plans are intentionally in-memory and assume
-single-threaded access. Object data and manifests remain durable.
+Membership and health observations are durable and assume single-threaded access.
+Placement plans remain in-memory except for identity and participants captured by
+durable operation records. Object data and manifests remain durable.
 
 ## Intended evolution
 
-The next dependency is explicit recovery orchestration for ambiguous operations.
-Coordinator networking, persistent membership, heartbeats, failure detection,
-consensus, production concurrency, retries, and automatic recovery remain deferred.
+The next dependency is operator-directed replica repair using explicit membership
+and recovery evidence. Coordinator networking, consensus, production concurrency,
+automatic retries, and automatic operation recovery remain deferred.
