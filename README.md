@@ -28,6 +28,16 @@ Completion or rollback occurs only through an explicit operator call; committed
 participants are never converted to aborted, and unavailable participants remain
 unknown rather than being guessed.
 
+Coordinator operation identity and recovery context are durable under
+`coordinator/operations/`. Each strict, checksummed record retains the original
+membership version, placement mapping, participant set, lifecycle, and latest
+observations. Restart loads these records but performs no automatic query,
+completion, rollback, retry, or repair; a fresh explicit inspection supersedes
+the persisted observations with authoritative storage-node journal state.
+`DurableReplicaManager` wraps the existing replication algorithm so STARTED and
+PREPARING are durable before participant work and the resulting terminal or
+UNRESOLVED state is durable before the result is returned.
+
 ## Build and test
 
 Prerequisites: CMake 3.20+, a C++20 compiler, Git, and network access on the first

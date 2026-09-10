@@ -31,6 +31,7 @@ add_library(atlasfs_metadata
 add_library(AtlasFS::metadata ALIAS atlasfs_metadata)
 
 add_library(atlasfs_replication
+    src/coordinator_operation.cpp
     src/recovery.cpp
     src/replication.cpp
     src/remote_storage_node.cpp
@@ -142,6 +143,7 @@ if(BUILD_TESTING)
     )
     target_link_libraries(atlasfs_metadata_tests PRIVATE AtlasFS::metadata GTest::gtest_main)
     add_executable(atlasfs_replication_tests
+        tests/coordinator_operation_test.cpp
         tests/replication_test.cpp
         tests/recovery_test.cpp
         tests/storage_node_protocol_test.cpp

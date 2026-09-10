@@ -73,6 +73,27 @@ nodes only when no participant is committed or unavailable. Partial actions are
 reported and never retried automatically. In particular, unavailable is not
 equivalent to aborted, and durable COMMITTED state is never "uncommitted."
 
+### Durable coordinator operation records
+
+The coordinator stores one control-plane record per tracked operation in
+`coordinator/operations/<operation-id>`. The versioned big-endian `ACOP` format
+contains the operation ID and type, fingerprint, object and generation IDs,
+placement-plan identity, historical membership version, replication factor,
+immutable participant-to-chunk mapping, lifecycle, and latest participant
+observations. A CRC-32C protects the complete record body. Publication uses a
+fully written and synchronized temporary file, atomic rename, and parent-directory
+synchronization, so startup sees an old valid record or a new valid record rather
+than a partial update. Invalid published records stop startup and are not deleted.
+
+These records preserve coordinator knowledge and observations; they are not a
+consensus log and never override participant journals. Construction captures the
+original placement rather than consulting current membership after restart, so a
+removed or unavailable historical node is retained and is never substituted.
+Startup only reconstructs the index. An explicit inspection queries that exact
+participant set through `RecoveryCoordinator`, replaces stale observations, and
+persists the resulting classification. Completion and rollback remain explicit
+operator actions; restart performs no automatic decision, retry, or repair.
+
 The parser consumes arbitrary byte fragments because TCP preserves byte order but
 not application message boundaries. It may emit zero, one, or many messages per
 call. Incomplete frames remain buffered. A malformed header is a connection-level
