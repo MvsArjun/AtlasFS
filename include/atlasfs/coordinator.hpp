@@ -31,7 +31,7 @@ struct ObjectMetadata {
 struct ChunkPlacement {
     ChunkIdentity identity;
     storage::ChunkMetadata chunk;
-    std::string primary_node_id;
+    std::vector<std::string> replica_node_ids;
 
     bool operator==(const ChunkPlacement&) const = default;
 };
@@ -43,6 +43,8 @@ struct PlacementPlan {
     std::uint32_t chunk_size{};
     std::uint32_t object_checksum{};
     std::uint64_t membership_version{};
+    std::uint32_t replication_factor{1};
+    bool under_replicated{};
     std::vector<ChunkPlacement> chunks;
 
     bool operator==(const PlacementPlan&) const = default;
@@ -65,6 +67,12 @@ struct PlacementResult {
     std::optional<std::string> node_id;
 };
 
+struct ReplicaPlacementResult {
+    CoordinatorError error{CoordinatorError::none};
+    std::vector<std::string> node_ids;
+    bool under_replicated{};
+};
+
 struct PlanResult {
     CoordinatorError error{CoordinatorError::none};
     std::optional<PlacementPlan> plan;
@@ -73,23 +81,28 @@ struct PlanResult {
 class PlacementPolicy {
 public:
     virtual ~PlacementPolicy() = default;
-    [[nodiscard]] virtual std::optional<std::string> select(
+    [[nodiscard]] virtual std::vector<std::string> rank(
         const ChunkIdentity& chunk, std::span<const StorageNode> eligible_nodes) const = 0;
+    [[nodiscard]] std::optional<std::string> select(
+        const ChunkIdentity& chunk, std::span<const StorageNode> eligible_nodes) const;
 };
 
 class RendezvousPlacement final : public PlacementPolicy {
 public:
-    [[nodiscard]] std::optional<std::string> select(
+    [[nodiscard]] std::vector<std::string> rank(
         const ChunkIdentity& chunk,
         std::span<const StorageNode> eligible_nodes) const override;
 };
+
+inline constexpr std::uint32_t kMaxReplicationFactor = 16;
 
 [[nodiscard]] std::uint64_t stable_chunk_hash(const ChunkIdentity& chunk) noexcept;
 
 class MetadataCoordinator {
 public:
     explicit MetadataCoordinator(
-        std::unique_ptr<PlacementPolicy> policy = std::make_unique<RendezvousPlacement>());
+        std::unique_ptr<PlacementPolicy> policy = std::make_unique<RendezvousPlacement>(),
+        std::uint32_t replication_factor = 1);
 
     [[nodiscard]] CoordinatorError register_node(StorageNode node);
     [[nodiscard]] CoordinatorError remove_node(std::string_view node_id);
@@ -99,11 +112,14 @@ public:
     [[nodiscard]] std::uint64_t membership_version() const noexcept;
 
     [[nodiscard]] PlacementResult place_chunk(const ChunkIdentity& chunk) const;
+    [[nodiscard]] ReplicaPlacementResult place_chunk_replicas(
+        const ChunkIdentity& chunk) const;
     [[nodiscard]] PlanResult place_object(const ObjectMetadata& object) const;
 
 private:
     NodeRegistry registry_;
     std::unique_ptr<PlacementPolicy> policy_;
+    std::uint32_t replication_factor_;
 };
 
 }  // namespace atlasfs::metadata

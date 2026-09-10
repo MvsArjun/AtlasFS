@@ -87,25 +87,39 @@ std::uint64_t stable_chunk_hash(const ChunkIdentity& chunk) noexcept {
     return hash;
 }
 
-std::optional<std::string> RendezvousPlacement::select(
+std::optional<std::string> PlacementPolicy::select(
     const ChunkIdentity& chunk, std::span<const StorageNode> eligible_nodes) const {
-    std::optional<std::string> selected;
-    std::uint64_t best_score = 0;
-    for (const auto& node : eligible_nodes) {
-        const auto candidate_score = score(chunk, node.node_id);
-        if (!selected || candidate_score > best_score ||
-            (candidate_score == best_score && node.node_id < *selected)) {
-            selected = node.node_id;
-            best_score = candidate_score;
-        }
-    }
-    return selected;
+    auto ranked = rank(chunk, eligible_nodes);
+    if (ranked.empty()) { return std::nullopt; }
+    return std::move(ranked.front());
 }
 
-MetadataCoordinator::MetadataCoordinator(std::unique_ptr<PlacementPolicy> policy)
-    : policy_(std::move(policy)) {
+std::vector<std::string> RendezvousPlacement::rank(
+    const ChunkIdentity& chunk, std::span<const StorageNode> eligible_nodes) const {
+    struct RankedNode { std::uint64_t score; std::string node_id; };
+    std::vector<RankedNode> ranked;
+    ranked.reserve(eligible_nodes.size());
+    for (const auto& node : eligible_nodes) {
+        ranked.push_back({score(chunk, node.node_id), node.node_id});
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {
+        return left.score > right.score ||
+               (left.score == right.score && left.node_id < right.node_id);
+    });
+    std::vector<std::string> result;
+    result.reserve(ranked.size());
+    for (auto& entry : ranked) { result.push_back(std::move(entry.node_id)); }
+    return result;
+}
+
+MetadataCoordinator::MetadataCoordinator(std::unique_ptr<PlacementPolicy> policy,
+                                         std::uint32_t replication_factor)
+    : policy_(std::move(policy)), replication_factor_(replication_factor) {
     if (!policy_) {
         throw std::invalid_argument("metadata coordinator requires a placement policy");
+    }
+    if (replication_factor == 0 || replication_factor > kMaxReplicationFactor) {
+        throw std::invalid_argument("invalid AtlasFS replication factor");
     }
 }
 
@@ -135,22 +149,43 @@ std::uint64_t MetadataCoordinator::membership_version() const noexcept {
 }
 
 PlacementResult MetadataCoordinator::place_chunk(const ChunkIdentity& chunk) const {
+    auto replicas = place_chunk_replicas(chunk);
+    if (replicas.error != CoordinatorError::none || replicas.node_ids.empty()) {
+        return {replicas.error, std::nullopt};
+    }
+    return {CoordinatorError::none, std::move(replicas.node_ids.front())};
+}
+
+ReplicaPlacementResult MetadataCoordinator::place_chunk_replicas(
+    const ChunkIdentity& chunk) const {
     if (!valid_generation_id(chunk.generation_id)) {
-        return {CoordinatorError::invalid_generation, std::nullopt};
+        return {CoordinatorError::invalid_generation, {}, false};
     }
     if (!valid_chunk(chunk)) {
-        return {CoordinatorError::invalid_chunk, std::nullopt};
+        return {CoordinatorError::invalid_chunk, {}, false};
     }
     const auto eligible = registry_.eligible_nodes();
     if (eligible.empty()) {
-        return {CoordinatorError::no_active_nodes, std::nullopt};
+        return {CoordinatorError::no_active_nodes, {}, false};
     }
-    auto selected = policy_->select(chunk, eligible);
-    if (selected && !contains_node(eligible, *selected)) {
-        return {CoordinatorError::invalid_membership, std::nullopt};
+    auto ranked = policy_->rank(chunk, eligible);
+    if (ranked.empty()) {
+        return {CoordinatorError::no_active_nodes, {}, false};
     }
-    return selected ? PlacementResult{CoordinatorError::none, std::move(selected)}
-                    : PlacementResult{CoordinatorError::no_active_nodes, std::nullopt};
+    std::vector<std::string> selected;
+    selected.reserve(std::min<std::size_t>(replication_factor_, eligible.size()));
+    for (auto& node_id : ranked) {
+        if (!contains_node(eligible, node_id) ||
+            std::find(selected.begin(), selected.end(), node_id) != selected.end()) {
+            return {CoordinatorError::invalid_membership, {}, false};
+        }
+        if (selected.size() < replication_factor_) { selected.push_back(std::move(node_id)); }
+    }
+    if (ranked.size() != eligible.size()) {
+        return {CoordinatorError::invalid_membership, {}, false};
+    }
+    return {CoordinatorError::none, std::move(selected),
+            eligible.size() < replication_factor_};
 }
 
 PlanResult MetadataCoordinator::place_object(const ObjectMetadata& object) const {
@@ -172,18 +207,17 @@ PlanResult MetadataCoordinator::place_object(const ObjectMetadata& object) const
 
     PlacementPlan plan{object.object_id, object.manifest.generation_id,
                        object.manifest.object_size, object.manifest.chunk_size,
-                       object.manifest.object_checksum, registry_.version(), {}};
+                       object.manifest.object_checksum, registry_.version(),
+                       replication_factor_, false, {}};
     plan.chunks.reserve(object.manifest.chunks.size());
     for (const auto& chunk : object.manifest.chunks) {
         ChunkIdentity identity{object.object_id, object.manifest.generation_id, chunk.index};
-        auto node_id = policy_->select(identity, eligible);
-        if (!node_id) {
-            return {CoordinatorError::no_active_nodes, std::nullopt};
+        auto replicas = place_chunk_replicas(identity);
+        if (replicas.error != CoordinatorError::none) {
+            return {replicas.error, std::nullopt};
         }
-        if (!contains_node(eligible, *node_id)) {
-            return {CoordinatorError::invalid_membership, std::nullopt};
-        }
-        plan.chunks.push_back({std::move(identity), chunk, std::move(*node_id)});
+        plan.under_replicated = plan.under_replicated || replicas.under_replicated;
+        plan.chunks.push_back({std::move(identity), chunk, std::move(replicas.node_ids)});
     }
     return {CoordinatorError::none, std::move(plan)};
 }

@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -12,9 +13,9 @@ namespace {
 
 class InvalidPolicy final : public PlacementPolicy {
 public:
-    std::optional<std::string> select(
+    std::vector<std::string> rank(
         const ChunkIdentity&, std::span<const StorageNode>) const override {
-        return "not-a-member";
+        return {"not-a-member"};
     }
 };
 
@@ -167,8 +168,48 @@ TEST(MetadataCoordinator, PlacementPlanPreservesAllManifestMetadata) {
     for (std::size_t index = 0; index < result.plan->chunks.size(); ++index) {
         EXPECT_EQ(result.plan->chunks[index].chunk, object.manifest.chunks[index]);
         EXPECT_EQ(result.plan->chunks[index].identity.chunk_index, index);
-        EXPECT_FALSE(result.plan->chunks[index].primary_node_id.empty());
+        EXPECT_FALSE(result.plan->chunks[index].replica_node_ids.empty());
     }
+}
+
+TEST(MetadataCoordinator, SelectsTopDistinctReplicasAndReportsShortfall) {
+    MetadataCoordinator replicated(std::make_unique<RendezvousPlacement>(), 3);
+    add_nodes(replicated, {"node-a", "node-b"});
+    const auto chunk = replicated.place_chunk_replicas({"object", "generation-1", 0});
+    ASSERT_EQ(chunk.error, CoordinatorError::none);
+    EXPECT_TRUE(chunk.under_replicated);
+    ASSERT_EQ(chunk.node_ids.size(), 2U);
+    EXPECT_NE(chunk.node_ids[0], chunk.node_ids[1]);
+
+    const auto plan = replicated.place_object({"object", manifest()});
+    ASSERT_TRUE(plan.plan);
+    EXPECT_EQ(plan.plan->replication_factor, 3U);
+    EXPECT_TRUE(plan.plan->under_replicated);
+    for (const auto& placement : plan.plan->chunks) {
+        const std::set<std::string> unique(placement.replica_node_ids.begin(),
+                                           placement.replica_node_ids.end());
+        EXPECT_EQ(unique.size(), placement.replica_node_ids.size());
+    }
+}
+
+TEST(MetadataCoordinator, ReplicaRankingIsDeterministicAcrossInsertionOrders) {
+    MetadataCoordinator first(std::make_unique<RendezvousPlacement>(), 3);
+    MetadataCoordinator second(std::make_unique<RendezvousPlacement>(), 3);
+    add_nodes(first, {"node-a", "node-b", "node-c"});
+    add_nodes(second, {"node-c", "node-a", "node-b"});
+    for (std::uint32_t index = 0; index < 100; ++index) {
+        const ChunkIdentity chunk{"object", "generation-1", index};
+        EXPECT_EQ(first.place_chunk_replicas(chunk).node_ids,
+                  second.place_chunk_replicas(chunk).node_ids);
+    }
+}
+
+TEST(MetadataCoordinator, ValidatesReplicationFactorBounds) {
+    EXPECT_THROW(MetadataCoordinator(std::make_unique<RendezvousPlacement>(), 0),
+                 std::invalid_argument);
+    EXPECT_THROW(MetadataCoordinator(std::make_unique<RendezvousPlacement>(),
+                                     kMaxReplicationFactor + 1U),
+                 std::invalid_argument);
 }
 
 TEST(MetadataCoordinator, ProducesDeterministicObjectPlan) {

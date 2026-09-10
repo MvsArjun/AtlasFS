@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -25,6 +27,7 @@ enum class StoreError {
 };
 
 enum class PutFaultPoint {
+    transaction_creation,
     checksum_calculation,
     chunk_creation,
     chunk_write,
@@ -34,6 +37,7 @@ enum class PutFaultPoint {
     manifest_sync,
     generation_rename,
     commit_rename,
+    rollback_deletion,
 };
 
 using PutFaultInjector = std::function<bool(PutFaultPoint)>;
@@ -42,6 +46,13 @@ struct GetResult {
     StoreError error{StoreError::none};
     std::vector<std::byte> data;
     std::uint32_t checksum{};
+};
+
+struct ChunkResult {
+    StoreError error{StoreError::none};
+    ObjectManifest manifest;
+    ChunkMetadata chunk;
+    std::vector<std::byte> data;
 };
 
 class ObjectStore {
@@ -61,6 +72,25 @@ public:
     [[nodiscard]] GetResult get(std::string_view object_id) const;
     [[nodiscard]] StoreError remove(std::string_view object_id);
 
+    // Single-threaded two-phase primitives used by in-process replication. A
+    // prepared generation is durable but invisible until commit_replica().
+    [[nodiscard]] StoreError prepare_replica(
+        std::string_view object_id, const ObjectManifest& manifest,
+        std::span<const std::uint32_t> chunk_indices,
+        std::span<const std::byte> object_data);
+    [[nodiscard]] StoreError commit_replica(std::string_view object_id,
+                                            std::string_view generation_id);
+    [[nodiscard]] StoreError verify_prepared_replica(
+        std::string_view object_id, std::string_view generation_id,
+        std::span<const std::uint32_t> chunk_indices) const;
+    [[nodiscard]] StoreError abort_replica(std::string_view object_id,
+                                           std::string_view generation_id);
+    [[nodiscard]] StoreError finalize_replica(std::string_view object_id,
+                                              std::string_view generation_id);
+    [[nodiscard]] ChunkResult get_replica_chunk(std::string_view object_id,
+                                                std::string_view generation_id,
+                                                std::uint32_t chunk_index) const;
+
     [[nodiscard]] const std::filesystem::path& objects_directory() const noexcept;
     [[nodiscard]] const std::filesystem::path& chunks_directory() const noexcept;
     [[nodiscard]] const std::filesystem::path& transactions_directory() const noexcept;
@@ -74,6 +104,14 @@ private:
     void clean_incomplete_state();
     [[nodiscard]] bool should_fail(PutFaultPoint point) const;
 
+    struct PendingReplica {
+        std::optional<std::vector<std::byte>> previous_manifest;
+        std::vector<std::byte> manifest;
+        bool committed{};
+    };
+    [[nodiscard]] static std::string pending_key(std::string_view object_id,
+                                                 std::string_view generation_id);
+
     std::filesystem::path objects_directory_;
     std::filesystem::path chunks_directory_;
     std::filesystem::path transactions_directory_;
@@ -81,6 +119,7 @@ private:
     std::uint32_t chunk_size_;
     PutFaultInjector fault_injector_;
     std::atomic_uint64_t temporary_counter_{0};
+    std::map<std::string, PendingReplica, std::less<>> pending_replicas_;
 };
 
 }  // namespace atlasfs::storage

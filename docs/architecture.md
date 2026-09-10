@@ -8,8 +8,8 @@ requests, sends complete frames, and uses `StreamParser` to receive responses.
 `TcpServer` listens only on loopback,
 accepts connections sequentially, parses arbitrary receive chunks, invokes a
 request handler, and reliably sends encoded responses. `StorageRequestHandler`
-decodes operation payloads and delegates filesystem work to `ObjectStore`. There
-is no replication or networked coordinator yet.
+decodes operation payloads and delegates filesystem work to `ObjectStore`. The
+wire-facing path remains single-node; replication is deliberately in-process.
 
 AtlasFS also has an in-process control-plane foundation:
 
@@ -23,11 +23,19 @@ AtlasFS also has an in-process control-plane foundation:
               +----------+----------+
                          |
                   PlacementPlan
+                         |
+                  ReplicaManager
+                  /      |      \
+                 v       v       v
+          StorageNode A  B       C
+                 |       |       |
+            ObjectStore ObjectStore ObjectStore
 ```
 
-The existing TCP, handler, and `ObjectStore` path is the data plane. The metadata
-coordinator, registry, and placement policy form the control plane. They do not
-perform filesystem or network I/O, and the data plane does not yet consult them.
+The coordinator, registry, and placement policy are the control plane and never
+touch storage. `ReplicaManager` is the replication layer. `LocalStorageNode` is
+the storage boundary and owns one independent `ObjectStore` root. The existing
+TCP path remains a separate transport integration.
 
 The parser consumes arbitrary byte fragments because TCP preserves byte order but
 not application message boundaries. It may emit zero, one, or many messages per
@@ -158,23 +166,40 @@ no-op state assignments do not. Placement plans record the version used.
 
 Chunk identity is the length-delimited tuple `(object ID, generation ID, chunk
 index)`. Placement uses rendezvous hashing: AtlasFS computes explicitly defined
-64-bit FNV-1a scores for each eligible node and selects the greatest score, with
-node ID as a deterministic tie-breaker. FNV-1a is used for stable placement, not
-security. This is reproducible across insertion orders and processes. Adding a
-node only keeps an existing primary or moves it to the new node; removal affects
-only chunks assigned to the removed node. No migration is performed.
+64-bit FNV-1a scores for each eligible node, sorts by descending score, and uses
+node ID as a deterministic tie-breaker. The top distinct R nodes form the ordered
+replica list. FNV-1a is used for stable placement, not security. Results are
+reproducible across insertion orders and processes. Membership changes may alter
+desired replicas, but perform no migration or repair.
 
 `ObjectMetadata` reuses the durable manifest's size and integrity fields without
-putting placement into that manifest. `PlacementPlan` separately attaches one
-primary node to each generation-aware chunk and preserves the manifest metadata.
-Its single-primary field can later evolve into a replica list without changing
-chunk identity or the local manifest format.
+putting placement into that manifest. `PlacementPlan` separately attaches ordered
+replica node IDs to every generation-aware chunk and preserves the manifest
+metadata, requested replication factor, membership version, and explicit
+under-replication flag.
+
+### In-process replicated storage
+
+`ReplicaManager` groups a plan by node and sends only the chunks assigned to that
+node. Every replica uses the plan's generation ID. `ObjectStore` stages selected
+chunks and the protected logical manifest in a private transaction, syncs and
+verifies them, and moves them into the immutable generation namespace. Only after
+all required nodes prepare does the manager commit each node's manifest.
+
+A prepare or commit failure aborts every participant. Already committed nodes
+atomically restore the previous manifest before removing the failed generation;
+rollback deletion failures are reported separately. Reads inspect replicas in
+deterministic order, recording missing or corrupt copies while using a later valid
+copy, and verify the reassembled object's CRC-32C. Deletes visit every known node;
+`not_found` is idempotent success and other failures produce `partial_delete`.
+Degraded reads and membership changes never trigger automatic repair.
 
 Membership, states, and placement plans are intentionally in-memory and assume
 single-threaded access. Object data and manifests remain durable.
 
 ## Intended evolution
 
-The next dependency is replicated chunk writes using an explicit fixed membership
-snapshot and failure semantics. Coordinator networking, persistent membership,
-production concurrency, and automatic recovery remain deferred.
+The next dependency is a network-neutral remote storage-node client/protocol with
+idempotent operation identity. Coordinator networking, persistent membership,
+heartbeats, failure detection, consensus, production concurrency, retries, and
+automatic recovery remain deferred.

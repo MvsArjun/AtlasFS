@@ -218,6 +218,192 @@ StoreError ObjectStore::put(std::string_view object_id, std::span<const std::byt
     return StoreError::none;
 }
 
+StoreError ObjectStore::prepare_replica(
+    std::string_view object_id, const ObjectManifest& manifest,
+    std::span<const std::uint32_t> chunk_indices,
+    std::span<const std::byte> object_data) {
+    if (!valid_object_id(object_id)) { return StoreError::invalid_object_id; }
+    if (object_data.size() > max_object_size_ || object_data.size() != manifest.object_size ||
+        manifest.chunk_size != chunk_size_) {
+        return StoreError::payload_too_large;
+    }
+    std::vector<std::byte> encoded;
+    try { encoded = encode_manifest(manifest); }
+    catch (const std::invalid_argument&) { return StoreError::corrupt_object; }
+    if (integrity::crc32c(object_data) != manifest.object_checksum) {
+        return StoreError::checksum_mismatch;
+    }
+    const auto key = pending_key(object_id, manifest.generation_id);
+    if (pending_replicas_.contains(key)) { return StoreError::filesystem_error; }
+
+    std::set<std::uint32_t> selected;
+    for (const auto index : chunk_indices) {
+        if (!selected.insert(index).second || index >= manifest.chunks.size() ||
+            manifest.chunks[index].index != index) {
+            return StoreError::corrupt_object;
+        }
+    }
+    std::error_code error;
+    const auto generation_path = chunks_directory_ / manifest.generation_id;
+    if (std::filesystem::exists(generation_path, error) || error) {
+        return StoreError::filesystem_error;
+    }
+    if (should_fail(PutFaultPoint::transaction_creation)) {
+        return StoreError::filesystem_error;
+    }
+    const auto transaction_path = next_temporary_path();
+    if (!std::filesystem::create_directory(transaction_path, error) || error) {
+        return StoreError::filesystem_error;
+    }
+    RemoveOnFailure transaction_cleanup(transaction_path);
+    for (const auto index : chunk_indices) {
+        const auto& metadata = manifest.chunks[index];
+        const auto offset = static_cast<std::size_t>(index) * manifest.chunk_size;
+        if (offset > object_data.size() || metadata.length > object_data.size() - offset) {
+            return StoreError::corrupt_object;
+        }
+        const auto chunk = object_data.subspan(offset, metadata.length);
+        if (integrity::crc32c(chunk) != metadata.checksum ||
+            should_fail(PutFaultPoint::chunk_creation) ||
+            !write_synced_file(transaction_path / chunk_filename(index), chunk,
+                               should_fail(PutFaultPoint::chunk_write),
+                               should_fail(PutFaultPoint::chunk_sync))) {
+            return StoreError::filesystem_error;
+        }
+    }
+    if (should_fail(PutFaultPoint::manifest_creation) ||
+        !write_synced_file(transaction_path / "manifest", encoded,
+                           should_fail(PutFaultPoint::manifest_write),
+                           should_fail(PutFaultPoint::manifest_sync)) ||
+        sync_directory(transaction_path) != StoreError::none ||
+        should_fail(PutFaultPoint::generation_rename)) {
+        return StoreError::filesystem_error;
+    }
+    std::filesystem::rename(transaction_path, generation_path, error);
+    if (error) { return StoreError::filesystem_error; }
+    transaction_cleanup.release();
+    if (sync_directory(chunks_directory_) != StoreError::none) {
+        std::filesystem::remove_all(generation_path, error);
+        return StoreError::filesystem_error;
+    }
+    std::optional<std::vector<std::byte>> previous;
+    if (const auto bytes = read_regular_file(object_path(object_id), kMaximumManifestSize)) {
+        previous = *bytes;
+    }
+    pending_replicas_.emplace(key, PendingReplica{std::move(previous), std::move(encoded), false});
+    return StoreError::none;
+}
+
+StoreError ObjectStore::commit_replica(std::string_view object_id,
+                                       std::string_view generation_id) {
+    const auto key = pending_key(object_id, generation_id);
+    const auto pending = pending_replicas_.find(key);
+    if (pending == pending_replicas_.end()) { return StoreError::not_found; }
+    if (pending->second.committed) { return StoreError::none; }
+    const auto temporary = objects_directory_ / (".atlasfs-tmp-" + std::string(generation_id));
+    std::error_code error;
+    std::filesystem::remove(temporary, error);
+    error.clear();
+    RemoveOnFailure cleanup(temporary);
+    if (!write_synced_file(temporary, pending->second.manifest, false, false) ||
+        should_fail(PutFaultPoint::commit_rename)) {
+        return StoreError::filesystem_error;
+    }
+    std::filesystem::rename(temporary, object_path(object_id), error);
+    if (error) { return StoreError::filesystem_error; }
+    cleanup.release();
+    pending->second.committed = true;
+    if (sync_directory(objects_directory_) != StoreError::none) {
+        return StoreError::filesystem_error;
+    }
+    return StoreError::none;
+}
+
+StoreError ObjectStore::verify_prepared_replica(
+    std::string_view object_id, std::string_view generation_id,
+    std::span<const std::uint32_t> chunk_indices) const {
+    const auto pending = pending_replicas_.find(pending_key(object_id, generation_id));
+    if (pending == pending_replicas_.end()) { return StoreError::not_found; }
+    const auto manifest = decode_manifest(pending->second.manifest, max_object_size_);
+    if (!manifest || manifest->generation_id != generation_id) {
+        return StoreError::corrupt_object;
+    }
+    const auto generation_path = chunks_directory_ / std::string(generation_id);
+    const auto durable_manifest = read_regular_file(generation_path / "manifest", kMaximumManifestSize);
+    if (!durable_manifest || *durable_manifest != pending->second.manifest) {
+        return StoreError::corrupt_object;
+    }
+    for (const auto index : chunk_indices) {
+        if (index >= manifest->chunks.size() || manifest->chunks[index].index != index) {
+            return StoreError::corrupt_object;
+        }
+        const auto& metadata = manifest->chunks[index];
+        const auto chunk = read_regular_file(generation_path / chunk_filename(index), metadata.length);
+        if (!chunk || chunk->size() != metadata.length ||
+            integrity::crc32c(*chunk) != metadata.checksum) {
+            return StoreError::corrupt_object;
+        }
+    }
+    return StoreError::none;
+}
+
+StoreError ObjectStore::abort_replica(std::string_view object_id,
+                                      std::string_view generation_id) {
+    const auto key = pending_key(object_id, generation_id);
+    const auto pending = pending_replicas_.find(key);
+    if (pending == pending_replicas_.end()) { return StoreError::not_found; }
+    if (should_fail(PutFaultPoint::rollback_deletion)) {
+        return StoreError::filesystem_error;
+    }
+    std::error_code error;
+    if (pending->second.committed) {
+        if (pending->second.previous_manifest) {
+            const auto temporary = objects_directory_ /
+                (".atlasfs-tmp-rollback-" + std::string(generation_id));
+            std::filesystem::remove(temporary, error);
+            error.clear();
+            RemoveOnFailure cleanup(temporary);
+            if (!write_synced_file(temporary, *pending->second.previous_manifest, false, false)) {
+                return StoreError::filesystem_error;
+            }
+            std::filesystem::rename(temporary, object_path(object_id), error);
+            if (error) { return StoreError::filesystem_error; }
+            cleanup.release();
+        } else if (::unlink(object_path(object_id).c_str()) != 0 && errno != ENOENT) {
+            return StoreError::filesystem_error;
+        }
+        if (sync_directory(objects_directory_) != StoreError::none) {
+            return StoreError::filesystem_error;
+        }
+    }
+    std::filesystem::remove_all(chunks_directory_ / std::string(generation_id), error);
+    if (error || sync_directory(chunks_directory_) != StoreError::none) {
+        return StoreError::filesystem_error;
+    }
+    pending_replicas_.erase(pending);
+    return StoreError::none;
+}
+
+StoreError ObjectStore::finalize_replica(std::string_view object_id,
+                                         std::string_view generation_id) {
+    const auto pending = pending_replicas_.find(pending_key(object_id, generation_id));
+    if (pending == pending_replicas_.end() || !pending->second.committed) {
+        return StoreError::not_found;
+    }
+    if (pending->second.previous_manifest) {
+        const auto previous = decode_manifest(*pending->second.previous_manifest, max_object_size_);
+        if (previous && previous->generation_id != generation_id) {
+            std::error_code error;
+            std::filesystem::remove_all(chunks_directory_ / previous->generation_id, error);
+            if (error || sync_directory(chunks_directory_) != StoreError::none) {
+                return StoreError::filesystem_error;
+            }
+        }
+    }
+    pending_replicas_.erase(pending);
+    return StoreError::none;
+}
+
 GetResult ObjectStore::get(std::string_view object_id) const {
     if (!valid_object_id(object_id)) { return {StoreError::invalid_object_id, {}, 0}; }
     const auto manifest_bytes = read_regular_file(object_path(object_id), kMaximumManifestSize);
@@ -253,6 +439,41 @@ GetResult ObjectStore::get(std::string_view object_id) const {
         return {StoreError::corrupt_object, {}, 0};
     }
     return {StoreError::none, std::move(object), manifest->object_checksum};
+}
+
+ChunkResult ObjectStore::get_replica_chunk(std::string_view object_id,
+                                           std::string_view generation_id,
+                                           std::uint32_t chunk_index) const {
+    if (!valid_object_id(object_id)) {
+        return {StoreError::invalid_object_id, {}, {}, {}};
+    }
+    const auto manifest_bytes = read_regular_file(object_path(object_id), kMaximumManifestSize);
+    if (!manifest_bytes) {
+        return {std::filesystem::exists(object_path(object_id)) ? StoreError::corrupt_object
+                                                                : StoreError::not_found,
+                {}, {}, {}};
+    }
+    const auto manifest = decode_manifest(*manifest_bytes, max_object_size_);
+    if (!manifest || manifest->generation_id != generation_id ||
+        chunk_index >= manifest->chunks.size() || manifest->chunks[chunk_index].index != chunk_index) {
+        return {StoreError::corrupt_object, {}, {}, {}};
+    }
+    const auto generation_path = chunks_directory_ / manifest->generation_id;
+    const auto generation_manifest = read_regular_file(generation_path / "manifest", kMaximumManifestSize);
+    if (!generation_manifest || *generation_manifest != *manifest_bytes) {
+        return {StoreError::corrupt_object, {}, {}, {}};
+    }
+    const auto metadata = manifest->chunks[chunk_index];
+    auto chunk = read_regular_file(generation_path / chunk_filename(chunk_index), metadata.length);
+    if (!chunk) {
+        return {std::filesystem::exists(generation_path / chunk_filename(chunk_index))
+                    ? StoreError::corrupt_object : StoreError::not_found,
+                *manifest, metadata, {}};
+    }
+    if (chunk->size() != metadata.length || integrity::crc32c(*chunk) != metadata.checksum) {
+        return {StoreError::corrupt_object, *manifest, metadata, {}};
+    }
+    return {StoreError::none, *manifest, metadata, std::move(*chunk)};
 }
 
 StoreError ObjectStore::remove(std::string_view object_id) {
@@ -348,6 +569,14 @@ void ObjectStore::clean_incomplete_state() {
 
 bool ObjectStore::should_fail(PutFaultPoint point) const {
     return fault_injector_ && fault_injector_(point);
+}
+
+std::string ObjectStore::pending_key(std::string_view object_id,
+                                     std::string_view generation_id) {
+    std::string key(object_id);
+    key.push_back('\0');
+    key.append(generation_id);
+    return key;
 }
 
 }  // namespace atlasfs::storage

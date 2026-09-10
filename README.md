@@ -8,10 +8,11 @@ returned. Storage splits every logical object into configurable chunks (1 MiB by
 default), protects each chunk and the whole object, and commits through a durable
 binary manifest.
 
-An in-process metadata control plane now models stable storage-node identities,
-runtime membership state, monotonically versioned membership snapshots, and
-deterministic single-primary chunk placement. This produces plans only; the
-operational storage path remains single-node and no replication occurs.
+An in-process metadata control plane models stable storage-node identities,
+versioned membership, and deterministic top-R rendezvous placement. A separate
+`ReplicaManager` executes those plans against independent `LocalStorageNode`
+roots. Replicated PUT uses prepare/verify/commit with rollback, GET falls back
+across missing or corrupt chunk replicas, and DELETE reports partial failure.
 
 ## Build and test
 
@@ -42,10 +43,13 @@ docs/             Engineering decisions and protocol specification
 Object identifiers contain only ASCII letters, digits, `.`, `_`, and `-`, are at
 most 255 bytes, and cannot be `.` or `..`. Objects are limited to slightly below
 16 MiB so complete requests and responses remain inside the framing limit. The
-internal `.atlasfs-tmp-` prefix is reserved. This milestone is single-node and
-sequential: it does not implement replication, a coordinator, or production
-concurrency. Chunking is a filesystem detail; the network API still transfers one
-bounded logical object per PUT or GET.
+internal `.atlasfs-tmp-` prefix is reserved. Replication factors are bounded to
+1–16 and default to one. If fewer eligible nodes exist than requested, the plan
+is explicitly under-replicated and strict replicated PUT refuses to expose a
+partial generation. Chunking remains invisible to the wire protocol, which still
+transfers one bounded logical object per PUT or GET.
 
-Node membership and placement plans are currently in-memory and single-threaded.
-Object bytes and manifests remain durable on disk.
+Node membership, plans, and replication orchestration are in-process and
+single-threaded. Storage roots, chunks, and manifests are durable and independent.
+Networked storage nodes, repair, failure detection, consensus, and production
+concurrency remain deliberately out of scope.
