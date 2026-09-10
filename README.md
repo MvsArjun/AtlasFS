@@ -21,6 +21,13 @@ node and `ObjectStore`. PREPARE, COMMIT, and ABORT use bounded operation IDs,
 reject conflicting reuse, and retain terminal state on disk. Connections are
 persistent and synchronous; no automatic retry occurs.
 
+Ambiguous operations can be inspected through `RecoveryCoordinator`. It queries
+every named participant, validates operation IDs and fingerprints, and returns a
+deterministically ordered distributed-state report. Inspection is read-only.
+Completion or rollback occurs only through an explicit operator call; committed
+participants are never converted to aborted, and unavailable participants remain
+unknown rather than being guessed.
+
 ## Build and test
 
 Prerequisites: CMake 3.20+, a C++20 compiler, Git, and network access on the first

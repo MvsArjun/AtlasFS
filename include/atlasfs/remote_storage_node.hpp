@@ -32,6 +32,8 @@ public:
         std::uint32_t) const override;
     [[nodiscard]] storage::StoreError remove(std::string_view,
                                              std::string_view) override;
+    [[nodiscard]] OperationQueryResult query_operation(
+        std::string_view operation_id) const override;
     [[nodiscard]] storage_node_protocol::OperationState query(std::string_view operation_id);
 private:
     [[nodiscard]] storage_node_protocol::Response exchange(

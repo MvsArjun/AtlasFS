@@ -75,10 +75,30 @@ LocalStorageNode::LocalStorageNode(std::string node_id, std::filesystem::path ro
 std::string_view LocalStorageNode::id() const noexcept { return node_id_; }
 
 storage::StoreError LocalStorageNode::prepare(
-    std::string_view, std::string_view object_id, const storage::ObjectManifest& manifest,
+    std::string_view operation_id, std::string_view object_id,
+    const storage::ObjectManifest& manifest,
     std::span<const std::uint32_t> chunk_indices,
     std::span<const std::byte> object_data) {
-    return store_.prepare_replica(object_id, manifest, chunk_indices, object_data);
+    std::uint32_t fingerprint{};
+    try {
+        fingerprint = integrity::crc32c(storage_node_protocol::encode_prepare(
+            {std::string(operation_id), std::string(object_id), manifest,
+             {chunk_indices.begin(), chunk_indices.end()},
+             {object_data.begin(), object_data.end()}}));
+    } catch (const std::invalid_argument&) {
+        return storage::StoreError::operation_conflict;
+    }
+    if (const auto found = operations_.find(operation_id); found != operations_.end()) {
+        if (found->second.fingerprint != fingerprint)
+            return storage::StoreError::operation_conflict;
+        return found->second.state == OperationState::prepared
+            ? storage::StoreError::none : storage::StoreError::invalid_operation_state;
+    }
+    const auto error = store_.prepare_replica(object_id, manifest, chunk_indices, object_data);
+    if (error == storage::StoreError::none)
+        operations_.emplace(std::string(operation_id),
+                            LocalOperation{OperationState::prepared, fingerprint});
+    return error;
 }
 
 storage::StoreError LocalStorageNode::verify_prepared(
@@ -87,14 +107,30 @@ storage::StoreError LocalStorageNode::verify_prepared(
     return store_.verify_prepared_replica(object_id, generation_id, chunk_indices);
 }
 
-storage::StoreError LocalStorageNode::commit(std::string_view, std::string_view object_id,
+storage::StoreError LocalStorageNode::commit(std::string_view operation_id,
+                                             std::string_view object_id,
                                              std::string_view generation_id) {
-    return store_.commit_replica(object_id, generation_id);
+    const auto found = operations_.find(operation_id);
+    if (found == operations_.end()) return storage::StoreError::operation_conflict;
+    if (found->second.state == OperationState::committed) return storage::StoreError::none;
+    if (found->second.state != OperationState::prepared)
+        return storage::StoreError::invalid_operation_state;
+    const auto error = store_.commit_replica(object_id, generation_id);
+    if (error == storage::StoreError::none) found->second.state = OperationState::committed;
+    return error;
 }
 
-storage::StoreError LocalStorageNode::abort(std::string_view, std::string_view object_id,
+storage::StoreError LocalStorageNode::abort(std::string_view operation_id,
+                                            std::string_view object_id,
                                             std::string_view generation_id) {
-    return store_.abort_replica(object_id, generation_id);
+    const auto found = operations_.find(operation_id);
+    if (found == operations_.end()) return storage::StoreError::operation_conflict;
+    if (found->second.state == OperationState::aborted) return storage::StoreError::none;
+    if (found->second.state != OperationState::prepared)
+        return storage::StoreError::invalid_operation_state;
+    const auto error = store_.abort_replica(object_id, generation_id);
+    if (error == storage::StoreError::none) found->second.state = OperationState::aborted;
+    return error;
 }
 
 storage::StoreError LocalStorageNode::finalize(std::string_view, std::string_view object_id,
@@ -111,6 +147,16 @@ storage::ChunkResult LocalStorageNode::get_chunk(
 storage::StoreError LocalStorageNode::remove(std::string_view object_id,
                                              std::string_view generation_id) {
     return store_.remove_generation(object_id, generation_id);
+}
+
+OperationQueryResult LocalStorageNode::query_operation(
+    std::string_view operation_id) const {
+    const auto found = operations_.find(operation_id);
+    if (found == operations_.end())
+        return {storage::StoreError::none, std::string(operation_id),
+                OperationState::unknown, 0};
+    return {storage::StoreError::none, std::string(operation_id),
+            found->second.state, found->second.fingerprint};
 }
 
 const storage::ObjectStore& LocalStorageNode::store() const noexcept { return store_; }

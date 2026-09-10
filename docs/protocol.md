@@ -108,8 +108,8 @@ them cleanly. Reserved flag bits must be zero until their semantics are specifie
 ## Storage-node protocol
 
 Replica traffic uses the same frame with distinct message types 200–211. Each
-payload begins with a two-byte big-endian storage protocol version; the current
-version is 1. Unknown versions, malformed lengths, unsafe identifiers, and
+payload begins with a two-byte big-endian storage protocol version. Milestone 8
+uses version 2. Unknown versions, malformed lengths, unsafe identifiers, and
 out-of-bound chunk counts are rejected.
 
 PREPARE carries a bounded operation ID, object ID, protected manifest, chunk
@@ -127,3 +127,9 @@ mutating responses echo the operation ID.
 There are no automatic retries. Loss of a COMMIT response is `result_unknown`
 because the server may already have committed. The caller must not blindly abort;
 QUERY_OPERATION on a new connection can resolve the durable state.
+
+QUERY_OPERATION responses include the durable PREPARE fingerprint in addition to
+the echoed operation ID and state. Recovery clients must compare both values with
+the expected operation identity. UNKNOWN operations have no stored fingerprint.
+This version-2 field is required by Milestone 8 recovery clients. Version-1
+Milestone 7 payloads are rejected rather than being misinterpreted.

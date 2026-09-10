@@ -2,6 +2,7 @@
 
 #include "atlasfs/manifest.hpp"
 #include "atlasfs/object_store.hpp"
+#include "atlasfs/operation.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -12,10 +13,10 @@
 
 namespace atlasfs::storage_node_protocol {
 
-inline constexpr std::uint16_t kVersion = 1;
+inline constexpr std::uint16_t kVersion = 2;
 inline constexpr std::size_t kMaxOperationIdSize = 96;
 
-enum class OperationState : std::uint8_t { unknown, prepared, committed, aborted };
+using OperationState = replication::OperationState;
 
 struct PrepareRequest {
     std::string operation_id;
@@ -41,6 +42,7 @@ struct Response {
     storage::StoreError error{storage::StoreError::none};
     std::string operation_id;
     OperationState state{OperationState::unknown};
+    std::uint32_t fingerprint{};
     storage::ChunkResult chunk;
 };
 

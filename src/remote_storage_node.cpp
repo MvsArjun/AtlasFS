@@ -28,8 +28,8 @@ snp::Response RemoteStorageNodeClient::exchange(protocol::MessageType request_ty
         if (!decoded) throw std::runtime_error("malformed storage response");
         return *decoded;
     } catch (...) {
-        if (commit) return {storage::StoreError::result_unknown, "", snp::OperationState::unknown, {}};
-        return {storage::StoreError::filesystem_error, "", snp::OperationState::unknown, {}};
+        if (commit) return {storage::StoreError::result_unknown, "", snp::OperationState::unknown, 0, {}};
+        return {storage::StoreError::filesystem_error, "", snp::OperationState::unknown, 0, {}};
     }
 }
 
@@ -101,12 +101,21 @@ storage::StoreError RemoteStorageNodeClient::remove(std::string_view object_id,
 }
 
 snp::OperationState RemoteStorageNodeClient::query(std::string_view operation_id_value) {
+    return query_operation(operation_id_value).state;
+}
+
+OperationQueryResult RemoteStorageNodeClient::query_operation(
+    std::string_view operation_id_value) const {
     const auto response = exchange(protocol::MessageType::storage_query_request,
         protocol::MessageType::storage_query_response,
         snp::encode_identity({std::string(operation_id_value), "query", "generation"}));
-    return response.error == storage::StoreError::none &&
-           response.operation_id == operation_id_value ? response.state
-                                                       : snp::OperationState::unknown;
+    if (response.error != storage::StoreError::none)
+        return {response.error, std::string(operation_id_value), OperationState::unknown, 0};
+    if (response.operation_id != operation_id_value)
+        return {storage::StoreError::operation_conflict, response.operation_id,
+                OperationState::unknown, response.fingerprint};
+    return {storage::StoreError::none, response.operation_id, response.state,
+            response.fingerprint};
 }
 
 StorageNodeServer::StorageNodeServer(std::shared_ptr<StorageNode> node,
@@ -178,7 +187,7 @@ protocol::Message StorageNodeServer::handle(const protocol::Message& request) {
     if (request.type == protocol::MessageType::storage_prepare_request) {
         const auto decoded = snp::decode_prepare(request.payload);
         if (!decoded) return reply(protocol::MessageType::storage_prepare_response,
-            {storage::StoreError::corrupt_object, "-", snp::OperationState::unknown, {}});
+            {storage::StoreError::corrupt_object, "-", snp::OperationState::unknown, 0, {}});
         const auto fingerprint = integrity::crc32c(request.payload);
         auto found = records_.find(decoded->operation_id);
         if (found != records_.end()) {
@@ -189,7 +198,8 @@ protocol::Message StorageNodeServer::handle(const protocol::Message& request) {
                 found->second.state == snp::OperationState::prepared ? storage::StoreError::none :
                 storage::StoreError::invalid_operation_state;
             return reply(protocol::MessageType::storage_prepare_response,
-                {error, decoded->operation_id, found->second.state, {}});
+                {error, decoded->operation_id, found->second.state,
+                 found->second.fingerprint, {}});
         }
         auto error = node_->prepare(decoded->operation_id, decoded->object_id, decoded->manifest,
                                     decoded->chunk_indices, decoded->object_data);
@@ -207,30 +217,32 @@ protocol::Message StorageNodeServer::handle(const protocol::Message& request) {
         }
         return reply(protocol::MessageType::storage_prepare_response,
             {error, decoded->operation_id, error == storage::StoreError::none
-                ? snp::OperationState::prepared : snp::OperationState::unknown, {}});
+                ? snp::OperationState::prepared : snp::OperationState::unknown,
+             fingerprint, {}});
     }
     if (request.type == protocol::MessageType::storage_get_chunk_request) {
         const auto decoded = snp::decode_get_chunk(request.payload);
         if (!decoded) return reply(protocol::MessageType::storage_get_chunk_response,
-            {storage::StoreError::corrupt_object, "-", snp::OperationState::unknown, {}});
+            {storage::StoreError::corrupt_object, "-", snp::OperationState::unknown, 0, {}});
         auto chunk = node_->get_chunk(decoded->object_id, decoded->generation_id,
                                       decoded->chunk_index);
         return reply(protocol::MessageType::storage_get_chunk_response,
-            {chunk.error, "-", snp::OperationState::unknown, std::move(chunk)});
+            {chunk.error, "-", snp::OperationState::unknown, 0, std::move(chunk)});
     }
     const auto decoded = snp::decode_identity(request.payload);
     if (!decoded) return reply(protocol::MessageType::error_response,
-        {storage::StoreError::corrupt_object, "-", snp::OperationState::unknown, {}});
+        {storage::StoreError::corrupt_object, "-", snp::OperationState::unknown, 0, {}});
     auto found = records_.find(decoded->operation_id);
     if (request.type == protocol::MessageType::storage_query_request) {
         return reply(protocol::MessageType::storage_query_response,
             {storage::StoreError::none, decoded->operation_id,
-             found == records_.end() ? snp::OperationState::unknown : found->second.state, {}});
+             found == records_.end() ? snp::OperationState::unknown : found->second.state,
+             found == records_.end() ? 0U : found->second.fingerprint, {}});
     }
     if (request.type == protocol::MessageType::storage_delete_request) {
         return reply(protocol::MessageType::storage_delete_response,
             {node_->remove(decoded->object_id, decoded->generation_id), decoded->operation_id,
-             snp::OperationState::unknown, {}});
+             snp::OperationState::unknown, 0, {}});
     }
     const auto response_type = request.type == protocol::MessageType::storage_commit_request
         ? protocol::MessageType::storage_commit_response
@@ -238,7 +250,7 @@ protocol::Message StorageNodeServer::handle(const protocol::Message& request) {
     if (found == records_.end() || found->second.object_id != decoded->object_id ||
         found->second.generation_id != decoded->generation_id) {
         return reply(response_type, {storage::StoreError::operation_conflict,
-            decoded->operation_id, snp::OperationState::unknown, {}});
+            decoded->operation_id, snp::OperationState::unknown, 0, {}});
     }
     auto& record = found->second;
     storage::StoreError error = storage::StoreError::none;
@@ -274,7 +286,8 @@ protocol::Message StorageNodeServer::handle(const protocol::Message& request) {
         drop_commit_response_once_ = false;
         throw std::runtime_error("injected lost commit response");
     }
-    return reply(response_type, {error, decoded->operation_id, record.state, {}});
+    return reply(response_type, {error, decoded->operation_id, record.state,
+                                 record.fingerprint, {}});
 }
 
 }  // namespace atlasfs::replication

@@ -162,6 +162,7 @@ std::vector<std::byte> encode_response(const Response& response) {
     append(out, static_cast<std::uint16_t>(response.error));
     append_string(out, response.operation_id.empty() ? "-" : response.operation_id);
     append(out, static_cast<std::uint8_t>(response.state));
+    append(out, response.fingerprint);
     const bool has_chunk = response.error == storage::StoreError::none &&
                            !response.chunk.manifest.generation_id.empty();
     append(out, static_cast<std::uint8_t>(has_chunk));
@@ -182,6 +183,7 @@ std::optional<Response> decode_response(std::span<const std::byte> bytes) {
     if (!take_prefix(bytes, at) || !take(bytes, at, error) ||
         !take_string(bytes, at, kMaxOperationIdSize, value.operation_id) ||
         !take(bytes, at, state) || state > static_cast<std::uint8_t>(OperationState::aborted) ||
+        !take(bytes, at, value.fingerprint) ||
         !take(bytes, at, has) || has > 1) return std::nullopt;
     value.error = static_cast<storage::StoreError>(error);
     value.state = static_cast<OperationState>(state);

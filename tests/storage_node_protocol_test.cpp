@@ -61,7 +61,7 @@ TEST(StorageNodeProtocol, RoundTripsAllBoundedPayloadShapes) {
     const snp::GetChunkRequest get{"object", "generation-rpc", 1};
     EXPECT_EQ(snp::decode_get_chunk(snp::encode_get_chunk(get))->chunk_index, 1U);
     snp::Response response{storage::StoreError::none, "op-1",
-                           snp::OperationState::prepared, {}};
+                           snp::OperationState::prepared, 123, {}};
     EXPECT_EQ(snp::decode_response(snp::encode_response(response))->state,
               snp::OperationState::prepared);
 }
@@ -72,7 +72,7 @@ TEST(StorageNodeProtocol, RejectsTruncationUnknownVersionAndUnsafeIdentifiers) {
     encoded.pop_back();
     EXPECT_FALSE(snp::decode_identity(encoded));
     encoded = snp::encode_get_chunk({"object", "generation-rpc", 0});
-    encoded[1] = std::byte{2};
+    encoded[1] = std::byte{3};
     EXPECT_FALSE(snp::decode_get_chunk(encoded));
     EXPECT_FALSE(snp::valid_operation_id("../operation"));
     EXPECT_THROW(snp::encode_identity({"../operation", "object", "generation-rpc"}),

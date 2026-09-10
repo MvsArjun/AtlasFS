@@ -2,6 +2,7 @@
 
 #include "atlasfs/coordinator.hpp"
 #include "atlasfs/object_store.hpp"
+#include "atlasfs/operation.hpp"
 
 #include <filesystem>
 #include <map>
@@ -84,6 +85,8 @@ public:
         std::uint32_t chunk_index) const = 0;
     [[nodiscard]] virtual storage::StoreError remove(std::string_view object_id,
                                                      std::string_view generation_id) = 0;
+    [[nodiscard]] virtual OperationQueryResult query_operation(
+        std::string_view operation_id) const = 0;
 };
 
 class LocalStorageNode final : public StorageNode {
@@ -117,11 +120,18 @@ public:
         std::uint32_t chunk_index) const override;
     [[nodiscard]] storage::StoreError remove(std::string_view object_id,
                                              std::string_view generation_id) override;
+    [[nodiscard]] OperationQueryResult query_operation(
+        std::string_view operation_id) const override;
     [[nodiscard]] const storage::ObjectStore& store() const noexcept;
 
 private:
     std::string node_id_;
     storage::ObjectStore store_;
+    struct LocalOperation {
+        OperationState state{OperationState::unknown};
+        std::uint32_t fingerprint{};
+    };
+    std::map<std::string, LocalOperation, std::less<>> operations_;
 };
 
 class ReplicaManager {

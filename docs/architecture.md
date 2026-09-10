@@ -57,6 +57,22 @@ rejected. On restart unfinished PREPARE is conservatively recovered as ABORTED.
 If a COMMIT response is lost, the client reports an unknown result and the
 manager does not blindly roll it back; QUERY_OPERATION resolves durable state.
 
+### Distributed operation recovery
+
+`RecoveryCoordinator` consumes the same `StorageNode` interface as replication,
+so local and remote participants are queried uniformly. It always queries every
+named participant and sorts observations by node ID. Returned operation IDs and
+durable fingerprints are checked before classifying the snapshot as all committed,
+all aborted, all prepared, mixed prepared/committed, mixed prepared/aborted,
+mixed terminal, unavailable, unknown, or identity conflict.
+
+Inspection never mutates participant state. Explicit completion first takes a
+fresh snapshot and may commit only PREPARED nodes when no aborted, unavailable,
+unknown, or conflicting participant exists. Explicit rollback may abort PREPARED
+nodes only when no participant is committed or unavailable. Partial actions are
+reported and never retried automatically. In particular, unavailable is not
+equivalent to aborted, and durable COMMITTED state is never "uncommitted."
+
 The parser consumes arbitrary byte fragments because TCP preserves byte order but
 not application message boundaries. It may emit zero, one, or many messages per
 call. Incomplete frames remain buffered. A malformed header is a connection-level
