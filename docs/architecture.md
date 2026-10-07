@@ -231,6 +231,24 @@ mapping, so failure detection, removal, addition, or recovery of a node cannot
 rewrite old recovery participants. No health transition automatically
 commits, aborts, retries, or repairs a distributed operation.
 
+### Operator-directed repair planning
+
+`RepairPlanner` is a read-only control-plane component. For each committed plan
+chunk it compares the requested replication factor with replicas on ACTIVE,
+freshly HEALTHY nodes. Sources and targets are selected deterministically by node
+ID; a target must be eligible and must not already appear in the observed replica
+set. Missing healthy sources become UNRECOVERABLE plans, while target exhaustion
+is retained as an explicit no-eligible-target reason rather than silently ignored.
+
+Each `ARPL` repair record binds object, generation, chunk, observed replicas,
+membership version, and a checksum of the complete health evidence. Validation
+detects membership, health, generation, chunk, or placement changes as stale.
+Records are strictly parsed, CRC-32C protected, and atomically published beneath
+`coordinator/repairs/`. The store reconstructs records on restart and rejects
+corruption without deletion. There is deliberately no execution path: plans do
+not contact storage nodes, copy chunks, mutate manifests or membership, retry
+operations, or alter historical operation participants.
+
 A storage node has a stable validated node ID, host, port, and coordinator-owned
 state. ACTIVE nodes are eligible for new placement. DRAINING nodes remain known
 but receive no new chunks, while UNAVAILABLE nodes are likewise excluded. No

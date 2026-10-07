@@ -45,6 +45,13 @@ identity and use a configurable consecutive-failure threshold. Restart marks
 persisted health as stale until a fresh check; no heartbeat triggers repair,
 operation recovery, data movement, or retry.
 
+Replica repair is now operator-directed at the planning layer. `RepairPlanner`
+compares committed placement with current, freshly verified membership and emits
+deterministic source/target plans or explicit no-source/no-target outcomes. Plans
+are evidence-bound to membership, health, generation, chunk, and observed replica
+placement, and are durably stored under `coordinator/repairs/`. Planning never
+copies or deletes data and never rewrites historical operation records.
+
 ## Build and test
 
 Prerequisites: CMake 3.20+, a C++20 compiler, Git, and network access on the first
