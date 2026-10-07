@@ -9,6 +9,17 @@
 #include <type_traits>
 
 namespace atlasfs::storage {
+bool valid_generation_id(std::string_view value) noexcept {
+    if (value.empty() || value.size() > kMaxGenerationIdSize) {
+        return false;
+    }
+    return std::all_of(value.begin(), value.end(), [](unsigned char character) {
+        return (character >= 'a' && character <= 'z') ||
+               (character >= 'A' && character <= 'Z') ||
+               (character >= '0' && character <= '9') || character == '-';
+    });
+}
+
 namespace {
 
 constexpr std::array<std::byte, 4> kMagic{
@@ -41,17 +52,6 @@ std::optional<UInt> read_integer(std::span<const std::byte> input, std::size_t& 
     }
     offset += sizeof(UInt);
     return value;
-}
-
-bool valid_generation_id(std::string_view value) {
-    if (value.empty() || value.size() > kMaxGenerationIdSize) {
-        return false;
-    }
-    return std::all_of(value.begin(), value.end(), [](unsigned char character) {
-        return (character >= 'a' && character <= 'z') ||
-               (character >= 'A' && character <= 'Z') ||
-               (character >= '0' && character <= '9') || character == '-';
-    });
 }
 
 bool consistent(const ObjectManifest& manifest, std::size_t max_object_size,

@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace atlasfs::storage {
@@ -33,6 +34,7 @@ struct ObjectManifest {
     bool operator==(const ObjectManifest&) const = default;
 };
 
+[[nodiscard]] bool valid_generation_id(std::string_view generation_id) noexcept;
 [[nodiscard]] std::vector<std::byte> encode_manifest(const ObjectManifest& manifest);
 [[nodiscard]] std::optional<ObjectManifest> decode_manifest(
     std::span<const std::byte> encoded,

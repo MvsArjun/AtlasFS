@@ -231,6 +231,51 @@ mapping, so failure detection, removal, addition, or recovery of a node cannot
 rewrite old recovery participants. No health transition automatically
 commits, aborts, retries, or repairs a distributed operation.
 
+### Durable current-replica catalog
+
+The authoritative view of present replica placement is a single snapshot at
+`coordinator/replicas/catalog`. It is deliberately separate from historical
+`ACOP` operation records and `ARPL` repair records: those records explain what an
+operation attempted and what a repair observed, while the catalog answers which
+replicas are current now. Catalog publication never edits or reinterprets either
+historical journal.
+
+The version-1 `ARPC` format is deterministic, bounded, and big-endian. Its header
+contains the magic, format version, zero-valued reserved fields, global catalog
+version, and record count. Each identity-sorted record contains object ID,
+generation ID, chunk index, chunk length and CRC-32C, the catalog version of its
+last update, and a node-ID-sorted replica set. A replica entry records its node
+ID, typed state (`PRESENT`, `MISSING`, `CORRUPT`, or `UNAVAILABLE`), integrity
+checksum, and evidence version. Explicit lengths delimit every variable field,
+and a final CRC-32C covers the complete preceding snapshot.
+
+Decoding rejects unknown versions, nonzero reserved fields, truncation, trailing
+bytes, invalid or duplicate identities, unsorted or duplicate replicas, invalid
+states and identifiers, inconsistent chunk metadata, invalid state-specific
+integrity evidence, impossible counts or sizes, and checksum corruption. Startup
+reconstructs the in-memory index only from a complete valid snapshot. A corrupt
+published file stops construction and remains on disk for diagnosis; it is not
+deleted, repaired, or replaced automatically.
+
+Each actual upsert or erase advances the global 64-bit version exactly once;
+rejected requests and no-op upserts do not. A live record's version identifies
+its last published mutation, while the monotonically increasing snapshot version
+prevents a removed or superseded version from being reused. Mutations are first
+applied to a candidate snapshot, written and synchronized through a temporary
+file, atomically renamed, and followed by parent-directory synchronization. A
+failure before rename leaves the prior in-memory snapshot authoritative. A
+failure after rename makes crash durability unknowable, so the process exposes
+`DURABILITY_UNKNOWN` and rejects all later mutations rather than guessing which
+version survived.
+
+Milestone 13 intentionally provides unconditional single-process upsert and erase
+operations, not concurrent repair commit semantics. `RepairExecutor` continues to
+require its external current-placement callback. It will use catalog
+compare-and-swap only after that operation can atomically validate the exact old
+replica set and catalog version in the next milestone. The composition root must
+explicitly populate the catalog and enforce one active catalog owner; concurrent
+or cross-process writers are unsupported until later race hardening.
+
 ### Operator-directed repair planning
 
 `RepairPlanner` is a read-only control-plane component. For each committed plan
@@ -318,6 +363,7 @@ durable operation records. Object data and manifests remain durable.
 
 ## Intended evolution
 
-The next dependency is operator-directed replica repair using explicit membership
-and recovery evidence. Coordinator networking, consensus, production concurrency,
-automatic retries, and automatic operation recovery remain deferred.
+The next dependency is compare-and-swap mutation of the durable replica catalog,
+followed by wiring the repair executor's final metadata commit through that
+version-checked boundary. Coordinator networking, consensus, production
+concurrency, automatic retries, and automatic operation recovery remain deferred.

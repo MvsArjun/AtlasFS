@@ -60,6 +60,20 @@ publication. A required metadata-commit callback completes current placement;
 historical operation records remain immutable. There is no automatic approval,
 execution, retry, source/target reselection, or background repair.
 
+An authoritative current-replica catalog abstraction is now durable in the
+separate `coordinator/replicas/catalog` snapshot. Its strict, versioned `ARPC` format
+records generation-aware chunk identity and metadata together with sorted replica
+state and integrity evidence. Every real mutation advances a monotonic catalog
+version and is published by synchronized temporary-file write, atomic rename,
+and parent-directory synchronization. Corrupt published state stops startup
+without deletion. If the rename succeeds but directory synchronization cannot be
+confirmed, the catalog reports unknown durability and rejects later mutations in
+that process. This current-state catalog is distinct from immutable `ACOP`
+operation history and `ARPL` repair journals. `RepairExecutor` still uses its
+required external metadata callback; catalog compare-and-swap integration is the
+next milestone. One active coordinator/catalog owner and explicit catalog
+population are required; multi-writer coordination is deliberately deferred.
+
 ## Build and test
 
 Prerequisites: CMake 3.20+, a C++20 compiler, Git, and network access on the first
@@ -96,6 +110,6 @@ partial generation. Chunking remains invisible to the wire protocol, which still
 transfers one bounded logical object per PUT or GET.
 
 Node membership, plans, and replication orchestration are in-process and
-single-threaded. Storage roots, chunks, and manifests are durable and independent.
-Networked storage nodes, repair, failure detection, consensus, and production
-concurrency remain deliberately out of scope.
+single-threaded. Storage roots, chunks, manifests, and current replica metadata
+are durable and independent. Multiple catalog writers, automatic repair,
+consensus, and production concurrency remain deliberately out of scope.
