@@ -45,20 +45,23 @@ identity and use a configurable consecutive-failure threshold. Restart marks
 persisted health as stale until a fresh check; no heartbeat triggers repair,
 operation recovery, data movement, or retry.
 
-Replica repair is now operator-directed at the planning layer. `RepairPlanner`
-compares committed placement with current, freshly verified membership and emits
-deterministic source/target plans or explicit no-source/no-target outcomes. Plans
-are evidence-bound to membership, health, generation, chunk, and observed replica
-placement, and are durably stored under `coordinator/repairs/`. Planning never
-copies or deletes data and never rewrites historical operation records.
+Replica repair is operator-directed at the planning layer. `RepairPlanner`
+compares the authoritative replica catalog with current, freshly verified
+membership and emits deterministic source/target plans or explicit
+no-source/no-target outcomes. Plans are evidence-bound to membership, health,
+generation, chunk, and the exact global catalog version and replica state, and
+are durably stored under `coordinator/repairs/`. Planning never copies or deletes
+data and never rewrites historical operation records.
 
-Approved plans may now be executed explicitly through `RepairExecutor`. Execution
-is locally serialized, revalidates membership, health, generation, chunk, and
-replica evidence immediately before transfer, and journals progress in ARPL v2.
+Approved plans may be executed explicitly through `RepairExecutor`. Execution is
+locally serialized, revalidates membership, health, generation, chunk, and exact
+catalog evidence immediately before transfer, and journals progress in ARPL v3.
 Local targets stage, sync, reread, and verify repair bytes before atomic
-publication. A required metadata-commit callback completes current placement;
-historical operation records remain immutable. There is no automatic approval,
-execution, retry, source/target reselection, or background repair.
+publication. Completion requires a durable catalog compare-and-swap against the
+plan's evidence; a conflict makes the plan stale and unknown post-rename
+durability is a typed failure. Historical operation records remain immutable.
+There is no automatic approval, execution, retry, replan, source/target
+reselection, or background repair.
 
 An authoritative current-replica catalog abstraction is now durable in the
 separate `coordinator/replicas/catalog` snapshot. Its strict, versioned `ARPC` format
@@ -69,10 +72,12 @@ and parent-directory synchronization. Corrupt published state stops startup
 without deletion. If the rename succeeds but directory synchronization cannot be
 confirmed, the catalog reports unknown durability and rejects later mutations in
 that process. This current-state catalog is distinct from immutable `ACOP`
-operation history and `ARPL` repair journals. `RepairExecutor` still uses its
-required external metadata callback; catalog compare-and-swap integration is the
-next milestone. One active coordinator/catalog owner and explicit catalog
-population are required; multi-writer coordination is deliberately deferred.
+operation history and `ARPL` repair journals. Compare-and-swap validates the
+exact global catalog version and full expected replica state before atomically
+publishing one chunk's desired state. Successful mutations advance the global
+version and only the changed record's version. One active coordinator/catalog
+owner and explicit catalog population are required; cross-process writers are
+deliberately deferred.
 
 ## Build and test
 

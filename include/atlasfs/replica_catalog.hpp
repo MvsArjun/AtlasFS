@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -60,6 +61,30 @@ enum class ReplicaCatalogError {
     durability_unknown,
 };
 
+enum class ReplicaCatalogCasStatus {
+    committed,
+    no_change,
+    conflict,
+    not_found,
+    invalid_request,
+    persistence_error,
+    version_exhausted,
+    durability_unknown,
+};
+
+struct ReplicaCatalogCompareExchange {
+    ChunkIdentity identity;
+    std::uint64_t expected_catalog_version{};
+    std::vector<CatalogReplica> expected_replicas;
+    std::vector<CatalogReplica> desired_replicas;
+};
+
+struct ReplicaCatalogCasResult {
+    ReplicaCatalogCasStatus status{ReplicaCatalogCasStatus::invalid_request};
+    std::uint64_t catalog_version{};
+    std::optional<ReplicaCatalogRecord> current_record;
+};
+
 enum class ReplicaCatalogFaultPoint {
     record_creation,
     record_write,
@@ -85,12 +110,15 @@ public:
         storage::ChunkMetadata chunk,
         std::vector<CatalogReplica> replicas);
     [[nodiscard]] ReplicaCatalogError erase(const ChunkIdentity& identity);
+    [[nodiscard]] ReplicaCatalogCasResult compare_exchange(
+        ReplicaCatalogCompareExchange request);
 
     [[nodiscard]] std::optional<ReplicaCatalogRecord> get(
         const ChunkIdentity& identity) const;
     [[nodiscard]] std::vector<ReplicaCatalogRecord> list() const;
-    [[nodiscard]] std::uint64_t version() const noexcept;
-    [[nodiscard]] bool durability_unknown() const noexcept;
+    [[nodiscard]] ReplicaCatalogSnapshot snapshot() const;
+    [[nodiscard]] std::uint64_t version() const;
+    [[nodiscard]] bool durability_unknown() const;
     [[nodiscard]] const std::filesystem::path& record_path() const noexcept;
 
 private:
@@ -101,6 +129,7 @@ private:
     std::filesystem::path record_path_;
     ReplicaCatalogFaultInjector fault_injector_;
     bool durability_unknown_{};
+    mutable std::mutex mutex_;
 };
 
 }  // namespace atlasfs::metadata

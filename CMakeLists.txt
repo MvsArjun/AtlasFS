@@ -146,7 +146,8 @@ if(BUILD_TESTING)
         tests/node_registry_test.cpp
         tests/replica_catalog_test.cpp
     )
-    target_link_libraries(atlasfs_metadata_tests PRIVATE AtlasFS::metadata GTest::gtest_main)
+    target_link_libraries(atlasfs_metadata_tests
+        PRIVATE AtlasFS::metadata GTest::gtest_main Threads::Threads)
     add_executable(atlasfs_replication_tests
         tests/coordinator_operation_test.cpp
         tests/repair_test.cpp

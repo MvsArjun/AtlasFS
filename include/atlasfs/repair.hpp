@@ -2,6 +2,7 @@
 
 #include "atlasfs/coordinator.hpp"
 #include "atlasfs/membership.hpp"
+#include "atlasfs/replica_catalog.hpp"
 #include "atlasfs/replication.hpp"
 
 #include <filesystem>
@@ -23,7 +24,7 @@ enum class RepairExecutionError : std::uint16_t {
     generation_mismatch, chunk_identity_mismatch, integrity_failure,
     target_already_contains_chunk, transfer_failure, verification_failure,
     target_publication_failure, metadata_commit_failure, conflicting_repair,
-    persistence_failure
+    persistence_failure, catalog_durability_unknown
 };
 
 enum class RepairPlanState : std::uint8_t {
@@ -54,23 +55,29 @@ struct RepairPlan {
     bool publication_succeeded{};
     bool metadata_committed{};
     RepairExecutionError last_error{RepairExecutionError::none};
+    std::uint64_t catalog_version{};
+    std::vector<metadata::CatalogReplica> observed_catalog_replicas;
     bool operator==(const RepairPlan&) const = default;
 };
 
-enum class PlanningError { none, invalid_plan, invalid_membership };
+enum class PlanningError { none, invalid_plan, invalid_membership, invalid_catalog };
 struct PlanningResult {
     PlanningError error{PlanningError::none};
     std::vector<RepairPlan> plans;
 };
-enum class PlanValidation { current, stale_membership, stale_health, stale_placement };
+enum class PlanValidation {
+    current, stale_membership, stale_health, stale_placement, stale_catalog
+};
 
 class RepairPlanner {
 public:
     [[nodiscard]] PlanningResult plan(const metadata::PlacementPlan& placement,
-                                      const metadata::MembershipSnapshot& membership) const;
+                                      const metadata::MembershipSnapshot& membership,
+                                      const metadata::ReplicaCatalogSnapshot& catalog) const;
     [[nodiscard]] PlanValidation validate(const RepairPlan& plan,
                                           const metadata::PlacementPlan& placement,
-                                          const metadata::MembershipSnapshot& membership) const;
+                                          const metadata::MembershipSnapshot& membership,
+                                          const metadata::ReplicaCatalogSnapshot& catalog) const;
 };
 
 enum class RepairStoreError { none, invalid_record, conflict, filesystem_error };
@@ -100,14 +107,11 @@ struct RepairExecutionResult {
     RepairExecutionError error{RepairExecutionError::none};
     RepairPlanState state{RepairPlanState::planned};
 };
-using PlacementCommitter = std::function<bool(metadata::PlacementPlan&,
-                                               const RepairPlan&)>;
 
 class RepairExecutor {
 public:
-    RepairExecutor(RepairPlanStore& plans,
-        std::vector<std::shared_ptr<replication::StorageNode>> nodes,
-        PlacementCommitter committer);
+    RepairExecutor(RepairPlanStore& plans, metadata::DurableReplicaCatalog& catalog,
+        std::vector<std::shared_ptr<replication::StorageNode>> nodes);
     [[nodiscard]] RepairStoreError approve(std::string_view plan_id);
     [[nodiscard]] RepairStoreError cancel(std::string_view plan_id);
     [[nodiscard]] RepairExecutionResult execute(
@@ -115,8 +119,8 @@ public:
         const metadata::MembershipSnapshot& membership);
 private:
     RepairPlanStore& plans_;
+    metadata::DurableReplicaCatalog& catalog_;
     std::map<std::string, std::shared_ptr<replication::StorageNode>, std::less<>> nodes_;
-    PlacementCommitter committer_;
     RepairPlanner planner_;
     std::mutex execution_mutex_;
 };

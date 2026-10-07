@@ -7,10 +7,12 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -497,8 +499,199 @@ TEST(DurableReplicaCatalog, ExhaustedVersionCannotBeReused) {
                   identity(), chunk(),
                   {replica("node-a"), replica("node-b")}),
               ReplicaCatalogError::version_exhausted);
+    EXPECT_EQ(catalog.compare_exchange(
+                  {identity(), maximum, {replica("node-a")},
+                   {replica("node-a"), replica("node-b")}}).status,
+              ReplicaCatalogCasStatus::version_exhausted);
     EXPECT_EQ(catalog.erase(identity()), ReplicaCatalogError::version_exhausted);
     EXPECT_EQ(catalog.version(), maximum);
+}
+
+TEST(ReplicaCatalogCas, CommitsAtomicallyAndPreservesUnchangedRecordVersion) {
+    TempRoot root;
+    const auto first_key = identity("object-a");
+    const auto second_key = identity("object-b");
+    const std::vector<CatalogReplica> expected{
+        replica("node-a"), replica("node-b"), replica("node-c")};
+    const std::vector<CatalogReplica> desired{
+        replica("node-a"), replica("node-b"), replica("node-c"),
+        replica("node-d", CatalogReplicaState::present, 8)};
+    {
+        DurableReplicaCatalog catalog(root.path());
+        ASSERT_EQ(catalog.upsert(first_key, chunk(), expected),
+                  ReplicaCatalogError::none);
+        ASSERT_EQ(catalog.upsert(second_key, chunk(), {replica("node-z")}),
+                  ReplicaCatalogError::none);
+        const auto stale_global = catalog.compare_exchange(
+            {first_key, 1, expected, desired});
+        EXPECT_EQ(stale_global.status, ReplicaCatalogCasStatus::conflict);
+        EXPECT_EQ(catalog.get(first_key)->catalog_version, 1U);
+        const auto result = catalog.compare_exchange(
+            {first_key, 2, expected, desired});
+        EXPECT_EQ(result.status, ReplicaCatalogCasStatus::committed);
+        EXPECT_EQ(result.catalog_version, 3U);
+        ASSERT_TRUE(result.current_record);
+        EXPECT_EQ(result.current_record->catalog_version, 3U);
+        EXPECT_EQ(result.current_record->replicas, desired);
+        EXPECT_EQ(catalog.get(second_key)->catalog_version, 2U);
+    }
+
+    DurableReplicaCatalog restarted(root.path());
+    EXPECT_EQ(restarted.version(), 3U);
+    EXPECT_EQ(restarted.get(first_key)->replicas, desired);
+    EXPECT_EQ(restarted.get(first_key)->catalog_version, 3U);
+    EXPECT_EQ(restarted.get(second_key)->catalog_version, 2U);
+}
+
+TEST(ReplicaCatalogCas, RejectsStaleVersionAndExpectedStateWithoutMutation) {
+    TempRoot root;
+    DurableReplicaCatalog catalog(root.path());
+    const auto key = identity();
+    const std::vector<CatalogReplica> original{
+        replica("node-a"), replica("node-b"), replica("node-c")};
+    const std::vector<CatalogReplica> desired{
+        replica("node-a"), replica("node-b"), replica("node-c"),
+        replica("node-d", CatalogReplicaState::present, 8)};
+    ASSERT_EQ(catalog.upsert(key, chunk(), original), ReplicaCatalogError::none);
+    ASSERT_EQ(catalog.compare_exchange({key, 1, original, desired}).status,
+              ReplicaCatalogCasStatus::committed);
+
+    const auto retried = catalog.compare_exchange({key, 1, original, desired});
+    EXPECT_EQ(retried.status, ReplicaCatalogCasStatus::conflict);
+    ASSERT_TRUE(retried.current_record);
+    EXPECT_EQ(retried.current_record->catalog_version, 2U);
+    EXPECT_EQ(retried.current_record->replicas, desired);
+
+    auto wrong_expected = desired;
+    wrong_expected.back().node_id = "node-e";
+    const auto mismatched = catalog.compare_exchange(
+        {key, 2, wrong_expected, original});
+    EXPECT_EQ(mismatched.status, ReplicaCatalogCasStatus::conflict);
+    EXPECT_EQ(catalog.version(), 2U);
+    EXPECT_EQ(catalog.get(key)->replicas, desired);
+
+    const auto unchanged = catalog.compare_exchange({key, 2, desired, desired});
+    EXPECT_EQ(unchanged.status, ReplicaCatalogCasStatus::no_change);
+    EXPECT_EQ(unchanged.catalog_version, 2U);
+}
+
+TEST(ReplicaCatalogCas, SerializesConcurrentLogicalWriters) {
+    TempRoot root;
+    DurableReplicaCatalog catalog(root.path());
+    const auto key = identity();
+    const std::vector<CatalogReplica> original{
+        replica("node-a"), replica("node-b"), replica("node-c")};
+    const std::vector<CatalogReplica> with_d{
+        replica("node-a"), replica("node-b"), replica("node-c"),
+        replica("node-d", CatalogReplicaState::present, 8)};
+    const std::vector<CatalogReplica> with_e{
+        replica("node-a"), replica("node-b"), replica("node-c"),
+        replica("node-e", CatalogReplicaState::present, 8)};
+    ASSERT_EQ(catalog.upsert(key, chunk(), original), ReplicaCatalogError::none);
+
+    std::atomic_uint ready{0};
+    std::atomic_bool start{false};
+    ReplicaCatalogCasResult first;
+    ReplicaCatalogCasResult second;
+    const auto run = [&](const auto& desired, ReplicaCatalogCasResult& result) {
+        ready.fetch_add(1);
+        while (!start.load()) std::this_thread::yield();
+        result = catalog.compare_exchange({key, 1, original, desired});
+    };
+    std::thread one(run, std::cref(with_d), std::ref(first));
+    std::thread two(run, std::cref(with_e), std::ref(second));
+    while (ready.load() != 2U) std::this_thread::yield();
+    start.store(true);
+    one.join();
+    two.join();
+
+    const auto committed = static_cast<unsigned>(
+        first.status == ReplicaCatalogCasStatus::committed) +
+        static_cast<unsigned>(second.status == ReplicaCatalogCasStatus::committed);
+    const auto conflicts = static_cast<unsigned>(
+        first.status == ReplicaCatalogCasStatus::conflict) +
+        static_cast<unsigned>(second.status == ReplicaCatalogCasStatus::conflict);
+    EXPECT_EQ(committed, 1U);
+    EXPECT_EQ(conflicts, 1U);
+    EXPECT_EQ(catalog.version(), 2U);
+    const auto current = catalog.get(key); ASSERT_TRUE(current);
+    EXPECT_TRUE(current->replicas == with_d || current->replicas == with_e);
+}
+
+TEST(ReplicaCatalogCas, RejectsInvalidRequestsAndDuplicateReplicas) {
+    TempRoot root;
+    DurableReplicaCatalog catalog(root.path());
+    const auto key = identity();
+    const std::vector<CatalogReplica> original{replica("node-a")};
+    ASSERT_EQ(catalog.upsert(key, chunk(), original), ReplicaCatalogError::none);
+
+    EXPECT_EQ(catalog.compare_exchange({key, 0, original, original}).status,
+              ReplicaCatalogCasStatus::invalid_request);
+    EXPECT_EQ(catalog.compare_exchange(
+                  {identity("missing"), 1, original, original}).status,
+              ReplicaCatalogCasStatus::not_found);
+    EXPECT_EQ(catalog.compare_exchange(
+                  {key, 1, original, {replica("node-a"), replica("node-a")}}).status,
+              ReplicaCatalogCasStatus::invalid_request);
+    EXPECT_EQ(catalog.version(), 1U);
+    EXPECT_EQ(catalog.get(key)->replicas, original);
+}
+
+TEST(ReplicaCatalogCas, PreRenameFailuresRetainOldDurableState) {
+    for (const auto point : {ReplicaCatalogFaultPoint::record_creation,
+                             ReplicaCatalogFaultPoint::record_write,
+                             ReplicaCatalogFaultPoint::record_sync,
+                             ReplicaCatalogFaultPoint::record_rename}) {
+        TempRoot root;
+        const auto key = identity();
+        const std::vector<CatalogReplica> original{replica("node-a")};
+        const std::vector<CatalogReplica> desired{
+            replica("node-a"),
+            replica("node-b", CatalogReplicaState::present, 8)};
+        {
+            DurableReplicaCatalog baseline(root.path());
+            ASSERT_EQ(baseline.upsert(key, chunk(), original),
+                      ReplicaCatalogError::none);
+        }
+        DurableReplicaCatalog failing(root.path(), [point](auto current) {
+            return current == point;
+        });
+        const auto result = failing.compare_exchange({key, 1, original, desired});
+        EXPECT_EQ(result.status, ReplicaCatalogCasStatus::persistence_error);
+        EXPECT_EQ(result.catalog_version, 1U);
+        EXPECT_EQ(failing.get(key)->replicas, original);
+        DurableReplicaCatalog restarted(root.path());
+        EXPECT_EQ(restarted.version(), 1U);
+        EXPECT_EQ(restarted.get(key)->replicas, original);
+    }
+}
+
+TEST(ReplicaCatalogCas, DirectorySyncFailureReportsUnknownAndPoisonsWriter) {
+    TempRoot root;
+    bool fail = false;
+    DurableReplicaCatalog catalog(root.path(), [&](auto point) {
+        return fail && point == ReplicaCatalogFaultPoint::directory_sync;
+    });
+    const auto key = identity();
+    const std::vector<CatalogReplica> original{replica("node-a")};
+    const std::vector<CatalogReplica> desired{
+        replica("node-a"), replica("node-b", CatalogReplicaState::present, 8)};
+    ASSERT_EQ(catalog.upsert(key, chunk(), original), ReplicaCatalogError::none);
+    fail = true;
+
+    const auto result = catalog.compare_exchange({key, 1, original, desired});
+    EXPECT_EQ(result.status, ReplicaCatalogCasStatus::durability_unknown);
+    EXPECT_EQ(result.catalog_version, 2U);
+    ASSERT_TRUE(result.current_record);
+    EXPECT_EQ(result.current_record->replicas, desired);
+    EXPECT_TRUE(catalog.durability_unknown());
+    EXPECT_EQ(catalog.compare_exchange({key, 2, desired, original}).status,
+              ReplicaCatalogCasStatus::durability_unknown);
+
+    DurableReplicaCatalog restarted(root.path());
+    EXPECT_FALSE(restarted.durability_unknown());
+    EXPECT_EQ(restarted.version(), 2U);
+    EXPECT_EQ(restarted.get(key)->replicas, desired);
 }
 
 TEST(DurableReplicaCatalog, CorruptPublishedCatalogStopsStartupWithoutDeletion) {
@@ -571,12 +764,15 @@ TEST(DurableReplicaCatalog, NeverRewritesHistoricalCoordinatorOperationBytes) {
 
     {
         DurableReplicaCatalog catalog(root.path());
-        ASSERT_EQ(catalog.upsert(identity(), chunk(), {replica("node-a")}),
+        const std::vector<CatalogReplica> original{replica("node-a")};
+        const std::vector<CatalogReplica> desired{
+            replica("node-a"),
+            replica("node-b", CatalogReplicaState::present, 8)};
+        ASSERT_EQ(catalog.upsert(identity(), chunk(), original),
                   ReplicaCatalogError::none);
-        ASSERT_EQ(catalog.upsert(
-                      identity(), chunk(),
-                      {replica("node-a"), replica("node-b")}),
-                  ReplicaCatalogError::none);
+        ASSERT_EQ(catalog.compare_exchange(
+                      {identity(), 1, original, desired}).status,
+                  ReplicaCatalogCasStatus::committed);
         ASSERT_EQ(catalog.erase(identity()), ReplicaCatalogError::none);
     }
     DurableReplicaCatalog restarted(root.path());

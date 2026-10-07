@@ -20,7 +20,7 @@
 namespace atlasfs::repair {
 namespace {
 constexpr std::uint32_t kMagic = 0x4152504cU; // ARPL
-constexpr std::uint16_t kVersion = 2;
+constexpr std::uint16_t kVersion = 3;
 constexpr std::size_t kMaxRecordSize = 1024U * 1024U;
 
 template<class T> void append(std::vector<std::byte>& out, T value) {
@@ -68,6 +68,12 @@ bool valid_reason(RepairReason value) {
 bool valid_state(RepairPlanState value) {
     return value >= RepairPlanState::planned && value <= RepairPlanState::cancelled;
 }
+bool valid_catalog_state(metadata::CatalogReplicaState value) {
+    return value == metadata::CatalogReplicaState::present ||
+        value == metadata::CatalogReplicaState::missing ||
+        value == metadata::CatalogReplicaState::corrupt ||
+        value == metadata::CatalogReplicaState::unavailable;
+}
 bool valid_generation(std::string_view value) {
     return !value.empty() && value.size() <= atlasfs::storage::kMaxGenerationIdSize &&
         std::all_of(value.begin(), value.end(), [](unsigned char c) {
@@ -94,6 +100,24 @@ bool valid_plan(const RepairPlan& value) {
             (!previous.empty() && node <= previous)) return false;
         previous = node;
     }
+    if (value.catalog_version == 0) {
+        if (!value.observed_catalog_replicas.empty()) return false;
+    } else {
+        if (value.observed_catalog_replicas.size() != value.observed_replicas.size())
+            return false;
+        previous.clear();
+        for (std::size_t i = 0; i < value.observed_catalog_replicas.size(); ++i) {
+            const auto& replica = value.observed_catalog_replicas[i];
+            if (!metadata::NodeRegistry::valid_node_id(replica.node_id) ||
+                !valid_catalog_state(replica.state) || replica.evidence_version == 0 ||
+                (!previous.empty() && replica.node_id <= previous) ||
+                replica.node_id != value.observed_replicas[i] ||
+                ((replica.state == metadata::CatalogReplicaState::missing ||
+                  replica.state == metadata::CatalogReplicaState::unavailable) &&
+                 replica.integrity_checksum != 0)) return false;
+            previous = replica.node_id;
+        }
+    }
     const bool any_result = value.transfer_succeeded || value.verification_succeeded ||
         value.publication_succeeded || value.metadata_committed;
     if ((value.state == RepairPlanState::planned || value.state == RepairPlanState::approved ||
@@ -107,7 +131,7 @@ bool valid_plan(const RepairPlan& value) {
     if (value.metadata_committed && (!value.verification_succeeded ||
                                      !value.publication_succeeded)) return false;
     if (value.state == RepairPlanState::completed && !value.metadata_committed) return false;
-    if (value.last_error > RepairExecutionError::persistence_failure) return false;
+    if (value.last_error > RepairExecutionError::catalog_durability_unknown) return false;
     if ((value.state == RepairPlanState::planned || value.state == RepairPlanState::approved ||
          value.state == RepairPlanState::executing || value.state == RepairPlanState::completed ||
          value.state == RepairPlanState::unrecoverable) &&
@@ -117,9 +141,10 @@ bool valid_plan(const RepairPlan& value) {
     return true;
 }
 std::string plan_id(std::string_view object, std::string_view generation, std::uint32_t chunk,
-                    std::uint64_t membership, std::uint32_t slot) {
+                    std::uint64_t membership, std::uint64_t catalog,
+                    std::uint32_t slot) {
     std::vector<std::byte> bytes; append_string(bytes, object); append_string(bytes, generation);
-    append(bytes, chunk); append(bytes, membership); append(bytes, slot);
+    append(bytes, chunk); append(bytes, membership); append(bytes, catalog); append(bytes, slot);
     std::ostringstream output; output << "repair-" << std::hex << std::setw(8) << std::setfill('0')
                                       << atlasfs::integrity::crc32c(bytes);
     return output.str();
@@ -136,13 +161,17 @@ bool sync_fd(int fd) { int result; do { result = ::fsync(fd); } while (result < 
 }
 
 PlanningResult RepairPlanner::plan(const metadata::PlacementPlan& placement,
-                                   const metadata::MembershipSnapshot& membership) const {
+    const metadata::MembershipSnapshot& membership,
+    const metadata::ReplicaCatalogSnapshot& catalog) const {
     if (placement.replication_factor == 0 ||
         placement.replication_factor > metadata::kMaxReplicationFactor ||
-        !object_protocol::valid_object_id(placement.object_id) || placement.generation_id.empty())
+        !object_protocol::valid_object_id(placement.object_id) ||
+        !storage::valid_generation_id(placement.generation_id))
         return {PlanningError::invalid_plan, {}};
     try { static_cast<void>(metadata::encode_membership(membership)); }
     catch (...) { return {PlanningError::invalid_membership, {}}; }
+    try { static_cast<void>(metadata::encode_replica_catalog(catalog)); }
+    catch (...) { return {PlanningError::invalid_catalog, {}}; }
     std::map<std::string, metadata::StorageNode, std::less<>> nodes;
     for (const auto& node : membership.nodes)
         if (!metadata::NodeRegistry::valid_node_id(node.node_id) ||
@@ -157,13 +186,20 @@ PlanningResult RepairPlanner::plan(const metadata::PlacementPlan& placement,
             std::find(chunk_indices.begin(), chunk_indices.end(), chunk.chunk.index) !=
                 chunk_indices.end()) return {PlanningError::invalid_plan, {}};
         chunk_indices.push_back(chunk.chunk.index);
-        auto replicas = chunk.replica_node_ids; std::sort(replicas.begin(), replicas.end());
-        if (std::adjacent_find(replicas.begin(), replicas.end()) != replicas.end())
-            return {PlanningError::invalid_plan, {}};
+        const auto catalog_record = std::find_if(catalog.records.begin(), catalog.records.end(),
+            [&](const auto& record) { return record.identity == chunk.identity; });
+        if (catalog_record == catalog.records.end() || catalog_record->chunk != chunk.chunk)
+            return {PlanningError::invalid_catalog, {}};
+        std::vector<std::string> replicas;
+        replicas.reserve(catalog_record->replicas.size());
+        for (const auto& replica : catalog_record->replicas)
+            replicas.push_back(replica.node_id);
         std::vector<std::string> sources;
-        for (const auto& replica : replicas) {
-            const auto found = nodes.find(replica);
-            if (found != nodes.end() && healthy(found->second)) sources.push_back(replica);
+        for (const auto& replica : catalog_record->replicas) {
+            const auto found = nodes.find(replica.node_id);
+            if (replica.state == metadata::CatalogReplicaState::present &&
+                found != nodes.end() && healthy(found->second))
+                sources.push_back(replica.node_id);
         }
         std::vector<std::string> targets;
         for (const auto& [id, node] : nodes)
@@ -174,12 +210,20 @@ PlanningResult RepairPlanner::plan(const metadata::PlacementPlan& placement,
             ? placement.replication_factor - healthy_count : 0U;
         for (std::uint32_t slot = 0; slot < deficit; ++slot) {
             RepairPlan repair{plan_id(placement.object_id, placement.generation_id,
-                    chunk.chunk.index, membership.version, slot), placement.object_id,
+                    chunk.chunk.index, membership.version,
+                    catalog.catalog_version, slot), placement.object_id,
                 placement.generation_id, chunk.chunk.index, {}, {}, membership.version,
                 health_version, placement.replication_factor, replicas,
-                replicas.size() < placement.replication_factor ? RepairReason::replica_missing
-                                                               : RepairReason::replica_unavailable,
+                (replicas.size() < placement.replication_factor ||
+                 std::any_of(catalog_record->replicas.begin(), catalog_record->replicas.end(),
+                    [](const auto& replica) {
+                        return replica.state == metadata::CatalogReplicaState::missing ||
+                            replica.state == metadata::CatalogReplicaState::corrupt;
+                    })) ? RepairReason::replica_missing
+                        : RepairReason::replica_unavailable,
                 RepairPlanState::planned};
+            repair.catalog_version = catalog.catalog_version;
+            repair.observed_catalog_replicas = catalog_record->replicas;
             if (sources.empty()) {
                 repair.reason = RepairReason::source_unavailable;
                 repair.state = RepairPlanState::unrecoverable;
@@ -195,7 +239,8 @@ PlanningResult RepairPlanner::plan(const metadata::PlacementPlan& placement,
 }
 
 PlanValidation RepairPlanner::validate(const RepairPlan& repair,
-    const metadata::PlacementPlan& placement, const metadata::MembershipSnapshot& membership) const {
+    const metadata::PlacementPlan& placement, const metadata::MembershipSnapshot& membership,
+    const metadata::ReplicaCatalogSnapshot& catalog) const {
     if (repair.membership_version != membership.version) return PlanValidation::stale_membership;
     if (repair.health_evidence != evidence(membership)) return PlanValidation::stale_health;
     if (repair.object_id != placement.object_id || repair.generation_id != placement.generation_id)
@@ -203,9 +248,21 @@ PlanValidation RepairPlanner::validate(const RepairPlan& repair,
     const auto found = std::find_if(placement.chunks.begin(), placement.chunks.end(),
         [&](const auto& chunk) { return chunk.chunk.index == repair.chunk_index; });
     if (found == placement.chunks.end()) return PlanValidation::stale_placement;
-    auto replicas = found->replica_node_ids; std::sort(replicas.begin(), replicas.end());
-    return replicas == repair.observed_replicas ? PlanValidation::current
-                                                : PlanValidation::stale_placement;
+    const metadata::ChunkIdentity expected_identity{
+        repair.object_id, repair.generation_id, repair.chunk_index};
+    if (found->identity != expected_identity || found->chunk.index != repair.chunk_index)
+        return PlanValidation::stale_placement;
+    const auto catalog_record = std::find_if(catalog.records.begin(), catalog.records.end(),
+        [&](const auto& record) { return record.identity == found->identity; });
+    if (catalog_record == catalog.records.end() || found->chunk != catalog_record->chunk)
+        return PlanValidation::stale_catalog;
+    std::vector<std::string> replicas;
+    replicas.reserve(catalog_record->replicas.size());
+    for (const auto& replica : catalog_record->replicas) replicas.push_back(replica.node_id);
+    return repair.catalog_version == catalog.catalog_version &&
+            repair.observed_catalog_replicas == catalog_record->replicas &&
+            repair.observed_replicas == replicas
+        ? PlanValidation::current : PlanValidation::stale_catalog;
 }
 
 std::vector<std::byte> encode_repair_plan(const RepairPlan& value) {
@@ -225,6 +282,16 @@ std::vector<std::byte> encode_repair_plan(const RepairPlan& value) {
     append(out, static_cast<std::uint16_t>(value.last_error));
     append(out, static_cast<std::uint32_t>(value.observed_replicas.size()));
     for (const auto& node : value.observed_replicas) append_string(out, node);
+    append(out, value.catalog_version);
+    append(out, static_cast<std::uint32_t>(value.observed_catalog_replicas.size()));
+    for (const auto& replica : value.observed_catalog_replicas) {
+        append_string(out, replica.node_id);
+        append(out, static_cast<std::uint8_t>(replica.state));
+        append(out, std::uint8_t{0});
+        append(out, std::uint16_t{0});
+        append(out, replica.integrity_checksum);
+        append(out, replica.evidence_version);
+    }
     append(out, atlasfs::integrity::crc32c(out));
     if (out.size() > kMaxRecordSize) throw std::length_error("repair plan too large");
     return out;
@@ -238,7 +305,7 @@ std::optional<RepairPlan> decode_repair_plan(std::span<const std::byte> encoded)
     std::uint8_t state{}, reason{}, flags{}, reserved8{}; std::uint16_t execution_error{};
     RepairPlan value;
     if (!take(body, at, magic) || magic != kMagic || !take(body, at, version) ||
-        (version != 1 && version != kVersion) ||
+        (version != 1 && version != 2 && version != kVersion) ||
         !take(body, at, reserved) || reserved != 0 || !take(body, at, state) || !take(body, at, reason) ||
         !take(body, at, reserved) || reserved != 0 ||
         !take_string(body, at, storage_node_protocol::kMaxOperationIdSize, value.plan_id) ||
@@ -249,7 +316,7 @@ std::optional<RepairPlan> decode_repair_plan(std::span<const std::byte> encoded)
         !take(body, at, value.chunk_index) || !take(body, at, value.membership_version) ||
         !take(body, at, value.health_evidence) || !take(body, at, value.replication_factor))
         return std::nullopt;
-    if (version == 2 && (!take_string(body, at, storage_node_protocol::kMaxOperationIdSize,
+    if (version >= 2 && (!take_string(body, at, storage_node_protocol::kMaxOperationIdSize,
             value.execution_id, true) || !take(body, at, flags) || flags > 15 ||
             !take(body, at, reserved8) || reserved8 != 0 ||
             !take(body, at, execution_error))) return std::nullopt;
@@ -263,6 +330,26 @@ std::optional<RepairPlan> decode_repair_plan(std::span<const std::byte> encoded)
     for (std::uint32_t i = 0; i < count; ++i) { std::string node;
         if (!take_string(body, at, metadata::kMaxNodeIdSize, node)) return std::nullopt;
         value.observed_replicas.push_back(std::move(node)); }
+    if (version == 3) {
+        std::uint32_t catalog_count{};
+        if (!take(body, at, value.catalog_version) || !take(body, at, catalog_count) ||
+            catalog_count > metadata::kMaxCatalogReplicasPerChunk)
+            return std::nullopt;
+        value.observed_catalog_replicas.reserve(catalog_count);
+        for (std::uint32_t i = 0; i < catalog_count; ++i) {
+            metadata::CatalogReplica replica;
+            std::uint8_t catalog_state{}, catalog_reserved8{};
+            std::uint16_t catalog_reserved16{};
+            if (!take_string(body, at, metadata::kMaxNodeIdSize, replica.node_id) ||
+                !take(body, at, catalog_state) ||
+                !take(body, at, catalog_reserved8) || catalog_reserved8 != 0 ||
+                !take(body, at, catalog_reserved16) || catalog_reserved16 != 0 ||
+                !take(body, at, replica.integrity_checksum) ||
+                !take(body, at, replica.evidence_version)) return std::nullopt;
+            replica.state = static_cast<metadata::CatalogReplicaState>(catalog_state);
+            value.observed_catalog_replicas.push_back(std::move(replica));
+        }
+    }
     if ((version == 1 && static_cast<unsigned>(state) > 3U) ||
         at != body.size() || !valid_plan(value)) return std::nullopt;
     return value;
@@ -283,6 +370,7 @@ RepairPlanStore::RepairPlanStore(std::filesystem::path root, RepairFaultInjector
 }
 RepairStoreError RepairPlanStore::create(const RepairPlan& value) {
     if (!valid_plan(value)) return RepairStoreError::invalid_record;
+    if (value.catalog_version == 0) return RepairStoreError::invalid_record;
     if (value.state != RepairPlanState::planned &&
         value.state != RepairPlanState::unrecoverable) return RepairStoreError::invalid_record;
     const auto found = plans_.find(value.plan_id);
@@ -299,7 +387,9 @@ RepairStoreError RepairPlanStore::update(const RepairPlan& value) {
         old.target_node != value.target_node || old.membership_version != value.membership_version ||
         old.health_evidence != value.health_evidence ||
         old.replication_factor != value.replication_factor ||
-        old.observed_replicas != value.observed_replicas || old.reason != value.reason)
+        old.observed_replicas != value.observed_replicas || old.reason != value.reason ||
+        old.catalog_version != value.catalog_version ||
+        old.observed_catalog_replicas != value.observed_catalog_replicas)
         return RepairStoreError::conflict;
     const bool monotonic_results = (!old.transfer_succeeded || value.transfer_succeeded) &&
         (!old.verification_succeeded || value.verification_succeeded) &&
@@ -359,20 +449,20 @@ std::vector<RepairPlan> RepairPlanStore::list() const {
 const std::filesystem::path& RepairPlanStore::plans_directory() const noexcept { return directory_; }
 
 RepairExecutor::RepairExecutor(RepairPlanStore& plans,
-    std::vector<std::shared_ptr<replication::StorageNode>> nodes,
-    PlacementCommitter committer)
-    : plans_(plans), committer_(std::move(committer)) {
+    metadata::DurableReplicaCatalog& catalog,
+    std::vector<std::shared_ptr<replication::StorageNode>> nodes)
+    : plans_(plans), catalog_(catalog) {
     for (auto& node : nodes) {
         if (!node || !nodes_.emplace(std::string(node->id()), node).second)
             throw std::invalid_argument("repair executor requires distinct nodes");
     }
-    if (!committer_) throw std::invalid_argument("repair executor requires metadata committer");
 }
 
 RepairStoreError RepairExecutor::approve(std::string_view plan_id_value) {
     auto plan = plans_.get(plan_id_value);
     if (!plan || plan->state != RepairPlanState::planned || plan->source_node.empty() ||
-        plan->target_node.empty()) return RepairStoreError::conflict;
+        plan->target_node.empty() || plan->catalog_version == 0)
+        return RepairStoreError::conflict;
     plan->state = RepairPlanState::approved;
     return plans_.update(*plan);
 }
@@ -397,7 +487,11 @@ RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
     if (plan->state != RepairPlanState::approved)
         return {RepairExecutionError::not_approved, plan->state};
 
-    if (planner_.validate(*plan, placement, membership) != PlanValidation::current) {
+    const metadata::ChunkIdentity identity{plan->object_id, plan->generation_id,
+                                           plan->chunk_index};
+    auto catalog_snapshot = catalog_.snapshot();
+    if (planner_.validate(*plan, placement, membership, catalog_snapshot) !=
+            PlanValidation::current) {
         plan->state = RepairPlanState::stale;
         plan->last_error = RepairExecutionError::stale;
         if (plans_.update(*plan) != RepairStoreError::none)
@@ -471,7 +565,9 @@ RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
 
     // Final coordinator-local evidence check is intentionally adjacent to the
     // transfer. The mutex serializes competing executions in this executor.
-    if (planner_.validate(*plan, placement, membership) != PlanValidation::current) {
+    catalog_snapshot = catalog_.snapshot();
+    if (planner_.validate(*plan, placement, membership, catalog_snapshot) !=
+            PlanValidation::current) {
         plan->state = RepairPlanState::stale;
         plan->last_error = RepairExecutionError::stale;
         if (plans_.update(*plan) != RepairStoreError::none)
@@ -507,20 +603,38 @@ RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
     if (plans_.update(*plan) != RepairStoreError::none)
         return {RepairExecutionError::persistence_failure, plan->state};
 
-    auto candidate = placement;
-    auto& replicas = candidate.chunks[static_cast<std::size_t>(
-        std::distance(placement.chunks.begin(), chunk_it))].replica_node_ids;
-    if (std::find(replicas.begin(), replicas.end(), plan->target_node) == replicas.end()) {
-        replicas.push_back(plan->target_node);
-    }
-    if (!committer_(candidate, *plan)) {
-        plan->state = RepairPlanState::failed;
-        plan->last_error = RepairExecutionError::metadata_commit_failure;
+    auto desired_replicas = plan->observed_catalog_replicas;
+    desired_replicas.push_back({plan->target_node,
+        metadata::CatalogReplicaState::present, source_chunk.chunk.checksum,
+        membership.version});
+    std::sort(desired_replicas.begin(), desired_replicas.end(),
+        [](const auto& left, const auto& right) { return left.node_id < right.node_id; });
+    const auto committed = catalog_.compare_exchange({identity, plan->catalog_version,
+        plan->observed_catalog_replicas, desired_replicas});
+    if (committed.status != metadata::ReplicaCatalogCasStatus::committed) {
+        if (committed.status == metadata::ReplicaCatalogCasStatus::conflict ||
+            committed.status == metadata::ReplicaCatalogCasStatus::no_change ||
+            committed.status == metadata::ReplicaCatalogCasStatus::not_found) {
+            plan->state = RepairPlanState::stale;
+            plan->last_error = RepairExecutionError::conflicting_repair;
+        } else {
+            plan->state = RepairPlanState::failed;
+            plan->last_error = committed.status ==
+                    metadata::ReplicaCatalogCasStatus::durability_unknown
+                ? RepairExecutionError::catalog_durability_unknown
+                : RepairExecutionError::metadata_commit_failure;
+        }
+        const auto error = plan->last_error;
         if (plans_.update(*plan) != RepairStoreError::none)
-            return {RepairExecutionError::persistence_failure, RepairPlanState::executing};
-        return {RepairExecutionError::metadata_commit_failure, plan->state};
+            return {RepairExecutionError::persistence_failure,
+                    RepairPlanState::executing};
+        return {error, plan->state};
     }
-    placement = std::move(candidate);
+    auto& placement_replicas = placement.chunks[static_cast<std::size_t>(
+        std::distance(placement.chunks.begin(), chunk_it))].replica_node_ids;
+    placement_replicas.clear();
+    for (const auto& replica : desired_replicas)
+        placement_replicas.push_back(replica.node_id);
     plan->metadata_committed = true;
     plan->state = RepairPlanState::completed;
     if (plans_.update(*plan) != RepairStoreError::none)

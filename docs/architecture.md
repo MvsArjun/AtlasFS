@@ -268,30 +268,41 @@ failure after rename makes crash durability unknowable, so the process exposes
 `DURABILITY_UNKNOWN` and rejects all later mutations rather than guessing which
 version survived.
 
-Milestone 13 intentionally provides unconditional single-process upsert and erase
-operations, not concurrent repair commit semantics. `RepairExecutor` continues to
-require its external current-placement callback. It will use catalog
-compare-and-swap only after that operation can atomically validate the exact old
-replica set and catalog version in the next milestone. The composition root must
-explicitly populate the catalog and enforce one active catalog owner; concurrent
-or cross-process writers are unsupported until later race hardening.
+Compare-and-swap is the atomic unit for a single chunk. A request names the exact
+global catalog version and full expected replica state plus the desired replica
+state.
+The catalog validates all three under its coordinator-local mutex, then publishes
+the candidate with the existing write, sync, rename, and directory-sync protocol.
+A success advances the global version and only the changed record's version. A
+stale version or state returns a typed conflict together with the current record;
+an identical desired state is a no-op. Pre-rename failure retains the old state,
+while post-rename directory-sync failure exposes `DURABILITY_UNKNOWN` and poisons
+later mutations in that process.
+
+This serialization supports concurrent logical writers within one coordinator;
+it is not a distributed lock. The composition root must explicitly populate the
+catalog and enforce one active catalog owner. Cross-process writers, leases, and
+consensus remain unsupported.
 
 ### Operator-directed repair planning
 
 `RepairPlanner` is a read-only control-plane component. For each committed plan
-chunk it compares the requested replication factor with replicas on ACTIVE,
-freshly HEALTHY nodes. Sources and targets are selected deterministically by node
-ID; a target must be eligible and must not already appear in the observed replica
-set. Missing healthy sources become UNRECOVERABLE plans, while target exhaustion
-is retained as an explicit no-eligible-target reason rather than silently ignored.
+chunk it starts from the matching authoritative catalog record, then compares the
+requested replication factor with replicas on ACTIVE, freshly HEALTHY nodes.
+Sources and targets are selected deterministically by node ID; a target must be
+eligible and must not already appear in the catalog record. Missing healthy
+sources become UNRECOVERABLE plans, while target exhaustion is retained as an
+explicit no-eligible-target reason rather than silently ignored.
 
-Each `ARPL` repair record binds object, generation, chunk, observed replicas,
-membership version, and a checksum of the complete health evidence. Validation
-detects membership, health, generation, chunk, or placement changes as stale.
-Records are strictly parsed, CRC-32C protected, and atomically published beneath
+Each `ARPL` v3 repair record binds object, generation, chunk, membership version,
+a checksum of the complete health evidence, and the exact global catalog version
+and replica state observed during planning. Validation detects membership,
+health, generation, chunk, or catalog changes as stale. Records are strictly
+parsed, CRC-32C protected, and atomically published beneath
 `coordinator/repairs/`. The store reconstructs records on restart and rejects
-corruption without deletion. There is deliberately no execution path: plans do
-not contact storage nodes, copy chunks, mutate manifests or membership, retry
+corruption without deletion. Legacy v1 and v2 records remain readable but cannot
+be approved for execution because they lack catalog evidence. Planning does not
+contact storage nodes, copy chunks, mutate manifests or membership, retry
 operations, or alter historical operation participants.
 
 ### Operator-approved repair execution
@@ -299,23 +310,26 @@ operations, or alter historical operation participants.
 `RepairExecutor` is separate from the read-only planner. An operator must durably
 transition a plan from PLANNED to APPROVED before execution. Under a local mutex,
 the executor checks the current membership and health evidence, exact generation
-manifest, source chunk, target absence or equivalence, and observed placement.
-It persists EXECUTING before data movement and performs a final evidence check
+manifest, source chunk, target absence or equivalence, and catalog evidence. It
+persists EXECUTING before data movement and performs a final evidence check
 immediately before initiating the transfer.
 
 `ObjectStore::publish_repair_chunk` validates the complete manifest and chunk,
 writes and synchronizes temporary files, rereads their CRC-protected content, and
-only then atomically publishes them. The executor rereads the target before it
-invokes the required current-placement commit callback. ARPL v2 stores approval,
-execution state, step outcomes, execution identity, and typed terminal failure;
-v1 planning records remain readable. An EXECUTING record found after restart is
-never resumed automatically and exposes the completed steps for inspection.
+only then atomically publishes them. The executor rereads the target before
+issuing a catalog compare-and-swap with the version and full replica state
+captured by the plan. Only a durably committed CAS permits COMPLETED. A conflict
+records STALE with a typed conflicting-repair error; post-rename durability
+uncertainty records FAILED with a distinct catalog-durability-unknown error.
+Neither case is retried, replanned, or allowed to select a different target. The
+staged local target is retained for diagnosis.
 
-The metadata committer is an explicit durability boundary supplied by the
-coordinator; execution cannot be constructed without one. AtlasFS currently
-serializes only repairs sharing an executor instance, not independent processes,
-and the remote storage-node protocol does not yet expose repair publication.
-Neither limitation is hidden by retry or target reselection.
+ARPL v3 stores catalog evidence in addition to approval, execution state, step
+outcomes, execution identity, and typed terminal failure. An EXECUTING record
+found after restart is never resumed automatically and exposes the completed
+steps for inspection. AtlasFS serializes catalog writers within one coordinator,
+not independent processes, and the remote storage-node protocol does not yet
+expose repair publication.
 
 A storage node has a stable validated node ID, host, port, and coordinator-owned
 state. ACTIVE nodes are eligible for new placement. DRAINING nodes remain known
@@ -363,7 +377,6 @@ durable operation records. Object data and manifests remain durable.
 
 ## Intended evolution
 
-The next dependency is compare-and-swap mutation of the durable replica catalog,
-followed by wiring the repair executor's final metadata commit through that
-version-checked boundary. Coordinator networking, consensus, production
-concurrency, automatic retries, and automatic operation recovery remain deferred.
+The next dependency is remote staged repair publication through the storage-node
+protocol. Coordinator networking, consensus, cross-process writers, automatic
+retries, and automatic operation recovery remain deferred.

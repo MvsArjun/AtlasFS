@@ -381,6 +381,7 @@ ReplicaCatalogError DurableReplicaCatalog::upsert(
     if (!valid_payload(identity, chunk, replicas)) {
         return ReplicaCatalogError::invalid_record;
     }
+    const std::scoped_lock lock(mutex_);
     if (durability_unknown_) {
         return ReplicaCatalogError::durability_unknown;
     }
@@ -416,6 +417,7 @@ ReplicaCatalogError DurableReplicaCatalog::erase(const ChunkIdentity& identity) 
     if (!valid_identity(identity)) {
         return ReplicaCatalogError::invalid_record;
     }
+    const std::scoped_lock lock(mutex_);
     if (durability_unknown_) {
         return ReplicaCatalogError::durability_unknown;
     }
@@ -433,8 +435,73 @@ ReplicaCatalogError DurableReplicaCatalog::erase(const ChunkIdentity& identity) 
     return publish(std::move(candidate));
 }
 
+ReplicaCatalogCasResult DurableReplicaCatalog::compare_exchange(
+    ReplicaCatalogCompareExchange request) {
+    if (!valid_identity(request.identity) ||
+        request.expected_catalog_version == 0) {
+        return {ReplicaCatalogCasStatus::invalid_request, 0, std::nullopt};
+    }
+    const std::scoped_lock lock(mutex_);
+    auto result = [&](ReplicaCatalogCasStatus status) {
+        const auto current = find_record(snapshot_.records, request.identity);
+        std::optional<ReplicaCatalogRecord> record;
+        if (current != snapshot_.records.end() &&
+            current->identity == request.identity) {
+            record = *current;
+        }
+        return ReplicaCatalogCasResult{status, snapshot_.catalog_version,
+                                       std::move(record)};
+    };
+    if (durability_unknown_) {
+        return result(ReplicaCatalogCasStatus::durability_unknown);
+    }
+    const auto found = find_record(snapshot_.records, request.identity);
+    if (found == snapshot_.records.end() || found->identity != request.identity) {
+        return result(ReplicaCatalogCasStatus::not_found);
+    }
+    if (!valid_payload(request.identity, found->chunk,
+                       request.expected_replicas) ||
+        !valid_payload(request.identity, found->chunk,
+                       request.desired_replicas)) {
+        return result(ReplicaCatalogCasStatus::invalid_request);
+    }
+    if (snapshot_.catalog_version != request.expected_catalog_version ||
+        found->replicas != request.expected_replicas) {
+        return result(ReplicaCatalogCasStatus::conflict);
+    }
+    if (found->replicas == request.desired_replicas) {
+        return result(ReplicaCatalogCasStatus::no_change);
+    }
+    if (snapshot_.catalog_version == std::numeric_limits<std::uint64_t>::max()) {
+        return result(ReplicaCatalogCasStatus::version_exhausted);
+    }
+
+    ReplicaCatalogSnapshot candidate = snapshot_;
+    const auto next_version = candidate.catalog_version + 1U;
+    const auto candidate_found = find_record(candidate.records, request.identity);
+    candidate_found->replicas = std::move(request.desired_replicas);
+    candidate_found->catalog_version = next_version;
+    candidate.catalog_version = next_version;
+    switch (publish(std::move(candidate))) {
+        case ReplicaCatalogError::none:
+            return result(ReplicaCatalogCasStatus::committed);
+        case ReplicaCatalogError::durability_unknown:
+            return result(ReplicaCatalogCasStatus::durability_unknown);
+        case ReplicaCatalogError::version_exhausted:
+            return result(ReplicaCatalogCasStatus::version_exhausted);
+        case ReplicaCatalogError::invalid_record:
+            return result(ReplicaCatalogCasStatus::invalid_request);
+        case ReplicaCatalogError::persistence_error:
+        case ReplicaCatalogError::conflict:
+        case ReplicaCatalogError::not_found:
+            return result(ReplicaCatalogCasStatus::persistence_error);
+    }
+    return result(ReplicaCatalogCasStatus::persistence_error);
+}
+
 std::optional<ReplicaCatalogRecord> DurableReplicaCatalog::get(
     const ChunkIdentity& identity) const {
+    const std::scoped_lock lock(mutex_);
     const auto found = find_record(snapshot_.records, identity);
     return found == snapshot_.records.end() || found->identity != identity
                ? std::optional<ReplicaCatalogRecord>{}
@@ -442,14 +509,22 @@ std::optional<ReplicaCatalogRecord> DurableReplicaCatalog::get(
 }
 
 std::vector<ReplicaCatalogRecord> DurableReplicaCatalog::list() const {
+    const std::scoped_lock lock(mutex_);
     return snapshot_.records;
 }
 
-std::uint64_t DurableReplicaCatalog::version() const noexcept {
+ReplicaCatalogSnapshot DurableReplicaCatalog::snapshot() const {
+    const std::scoped_lock lock(mutex_);
+    return snapshot_;
+}
+
+std::uint64_t DurableReplicaCatalog::version() const {
+    const std::scoped_lock lock(mutex_);
     return snapshot_.catalog_version;
 }
 
-bool DurableReplicaCatalog::durability_unknown() const noexcept {
+bool DurableReplicaCatalog::durability_unknown() const {
+    const std::scoped_lock lock(mutex_);
     return durability_unknown_;
 }
 
