@@ -2,10 +2,13 @@
 
 #include "atlasfs/coordinator.hpp"
 #include "atlasfs/membership.hpp"
+#include "atlasfs/replication.hpp"
 
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -14,7 +17,19 @@
 
 namespace atlasfs::repair {
 
-enum class RepairPlanState : std::uint8_t { planned = 1, unrecoverable = 2, stale = 3 };
+enum class RepairExecutionError : std::uint16_t {
+    none, plan_not_found, not_approved, already_completed, cancelled, stale,
+    source_unavailable, target_unavailable, source_chunk_missing,
+    generation_mismatch, chunk_identity_mismatch, integrity_failure,
+    target_already_contains_chunk, transfer_failure, verification_failure,
+    target_publication_failure, metadata_commit_failure, conflicting_repair,
+    persistence_failure
+};
+
+enum class RepairPlanState : std::uint8_t {
+    planned = 1, unrecoverable = 2, stale = 3, approved = 4,
+    executing = 5, completed = 6, failed = 7, cancelled = 8
+};
 enum class RepairReason : std::uint8_t {
     replica_unavailable = 1, replica_missing = 2, source_unavailable = 3,
     no_eligible_target = 4
@@ -33,6 +48,12 @@ struct RepairPlan {
     std::vector<std::string> observed_replicas;
     RepairReason reason{RepairReason::replica_unavailable};
     RepairPlanState state{RepairPlanState::planned};
+    std::string execution_id;
+    bool transfer_succeeded{};
+    bool verification_succeeded{};
+    bool publication_succeeded{};
+    bool metadata_committed{};
+    RepairExecutionError last_error{RepairExecutionError::none};
     bool operator==(const RepairPlan&) const = default;
 };
 
@@ -64,13 +85,40 @@ class RepairPlanStore {
 public:
     explicit RepairPlanStore(std::filesystem::path root, RepairFaultInjector fault = {});
     [[nodiscard]] RepairStoreError create(const RepairPlan& plan);
+    [[nodiscard]] RepairStoreError update(const RepairPlan& plan);
     [[nodiscard]] std::optional<RepairPlan> get(std::string_view plan_id) const;
     [[nodiscard]] std::vector<RepairPlan> list() const;
     [[nodiscard]] const std::filesystem::path& plans_directory() const noexcept;
 private:
+    [[nodiscard]] RepairStoreError persist(const RepairPlan& plan);
     std::filesystem::path directory_;
     RepairFaultInjector fault_;
     std::map<std::string, RepairPlan, std::less<>> plans_;
+};
+
+struct RepairExecutionResult {
+    RepairExecutionError error{RepairExecutionError::none};
+    RepairPlanState state{RepairPlanState::planned};
+};
+using PlacementCommitter = std::function<bool(metadata::PlacementPlan&,
+                                               const RepairPlan&)>;
+
+class RepairExecutor {
+public:
+    RepairExecutor(RepairPlanStore& plans,
+        std::vector<std::shared_ptr<replication::StorageNode>> nodes,
+        PlacementCommitter committer);
+    [[nodiscard]] RepairStoreError approve(std::string_view plan_id);
+    [[nodiscard]] RepairStoreError cancel(std::string_view plan_id);
+    [[nodiscard]] RepairExecutionResult execute(
+        std::string_view plan_id, metadata::PlacementPlan& placement,
+        const metadata::MembershipSnapshot& membership);
+private:
+    RepairPlanStore& plans_;
+    std::map<std::string, std::shared_ptr<replication::StorageNode>, std::less<>> nodes_;
+    PlacementCommitter committer_;
+    RepairPlanner planner_;
+    std::mutex execution_mutex_;
 };
 
 }  // namespace atlasfs::repair

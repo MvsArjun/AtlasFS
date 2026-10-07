@@ -95,6 +95,11 @@ public:
     [[nodiscard]] ChunkResult get_replica_chunk(std::string_view object_id,
                                                 std::string_view generation_id,
                                                 std::uint32_t chunk_index) const;
+    // Atomically publishes one verified repair chunk. The chunk is not visible
+    // through get_replica_chunk until its current-object manifest is committed.
+    [[nodiscard]] StoreError publish_repair_chunk(
+        std::string_view object_id, const ObjectManifest& manifest,
+        const ChunkMetadata& chunk, std::span<const std::byte> data);
 
     [[nodiscard]] const std::filesystem::path& objects_directory() const noexcept;
     [[nodiscard]] const std::filesystem::path& chunks_directory() const noexcept;

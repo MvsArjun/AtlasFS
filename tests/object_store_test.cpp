@@ -324,5 +324,41 @@ TEST(ObjectStore, StartupRemovesTransactionsTemporaryManifestsAndOrphanGeneratio
     EXPECT_EQ(recovered.get("kept").data, bytes({1, 2, 3, 4, 5}));
 }
 
+TEST(ObjectStore, RepairChunkIsVerifiedPublishedAndRestartSafe) {
+    TemporaryDirectory directory;
+    const auto data = bytes({42});
+    const auto checksum = integrity::crc32c(data);
+    const ObjectManifest manifest{1, 4, checksum, "generation-repair",
+                                  {{0, 1, checksum}}};
+    {
+        ObjectStore store(directory.path(), 1024, 4);
+        ASSERT_EQ(store.publish_repair_chunk("object", manifest, manifest.chunks[0], data),
+                  StoreError::none);
+        const auto chunk = store.get_replica_chunk("object", "generation-repair", 0);
+        EXPECT_EQ(chunk.error, StoreError::none); EXPECT_EQ(chunk.data, data);
+    }
+    ObjectStore restarted(directory.path(), 1024, 4);
+    const auto chunk = restarted.get_replica_chunk("object", "generation-repair", 0);
+    EXPECT_EQ(chunk.error, StoreError::none); EXPECT_EQ(chunk.data, data);
+}
+
+TEST(ObjectStore, FailedRepairWriteNeverAdvertisesPartialChunk) {
+    TemporaryDirectory directory;
+    const auto data = bytes({42}); const auto checksum = integrity::crc32c(data);
+    const ObjectManifest manifest{1, 4, checksum, "generation-repair",
+                                  {{0, 1, checksum}}};
+    {
+        ObjectStore store(directory.path(), 1024, 4,
+            [](PutFaultPoint point) { return point == PutFaultPoint::chunk_write; });
+        EXPECT_EQ(store.publish_repair_chunk("object", manifest, manifest.chunks[0], data),
+                  StoreError::filesystem_error);
+        EXPECT_EQ(store.get_replica_chunk("object", "generation-repair", 0).error,
+                  StoreError::not_found);
+    }
+    ObjectStore restarted(directory.path(), 1024, 4);
+    EXPECT_EQ(restarted.get_replica_chunk("object", "generation-repair", 0).error,
+              StoreError::not_found);
+}
+
 }  // namespace
 }  // namespace atlasfs::storage

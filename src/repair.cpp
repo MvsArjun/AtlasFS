@@ -9,16 +9,18 @@
 #include <fcntl.h>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
 #include <type_traits>
+#include <utility>
 #include <unistd.h>
 
 namespace atlasfs::repair {
 namespace {
 constexpr std::uint32_t kMagic = 0x4152504cU; // ARPL
-constexpr std::uint16_t kVersion = 1;
+constexpr std::uint16_t kVersion = 2;
 constexpr std::size_t kMaxRecordSize = 1024U * 1024U;
 
 template<class T> void append(std::vector<std::byte>& out, T value) {
@@ -64,7 +66,7 @@ bool valid_reason(RepairReason value) {
     return value >= RepairReason::replica_unavailable && value <= RepairReason::no_eligible_target;
 }
 bool valid_state(RepairPlanState value) {
-    return value >= RepairPlanState::planned && value <= RepairPlanState::stale;
+    return value >= RepairPlanState::planned && value <= RepairPlanState::cancelled;
 }
 bool valid_generation(std::string_view value) {
     return !value.empty() && value.size() <= atlasfs::storage::kMaxGenerationIdSize &&
@@ -80,7 +82,10 @@ bool valid_plan(const RepairPlan& value) {
         value.chunk_index >= atlasfs::storage::kMaxChunkCount || value.replication_factor == 0 ||
         value.replication_factor > atlasfs::metadata::kMaxReplicationFactor ||
         value.observed_replicas.size() > atlasfs::metadata::kMaxMembershipNodes ||
-        !valid_reason(value.reason) || !valid_state(value.state)) return false;
+        !valid_reason(value.reason) || !valid_state(value.state) ||
+        value.execution_id.size() > atlasfs::storage_node_protocol::kMaxOperationIdSize ||
+        (!value.execution_id.empty() &&
+         !atlasfs::storage_node_protocol::valid_operation_id(value.execution_id))) return false;
     if (!value.source_node.empty() && !atlasfs::metadata::NodeRegistry::valid_node_id(value.source_node)) return false;
     if (!value.target_node.empty() && !atlasfs::metadata::NodeRegistry::valid_node_id(value.target_node)) return false;
     std::string previous;
@@ -89,6 +94,26 @@ bool valid_plan(const RepairPlan& value) {
             (!previous.empty() && node <= previous)) return false;
         previous = node;
     }
+    const bool any_result = value.transfer_succeeded || value.verification_succeeded ||
+        value.publication_succeeded || value.metadata_committed;
+    if ((value.state == RepairPlanState::planned || value.state == RepairPlanState::approved ||
+         value.state == RepairPlanState::cancelled ||
+         value.state == RepairPlanState::unrecoverable) &&
+        (!value.execution_id.empty() || any_result)) return false;
+    if ((value.state == RepairPlanState::executing || value.state == RepairPlanState::completed ||
+         value.state == RepairPlanState::failed) && value.execution_id.empty()) return false;
+    if (value.verification_succeeded && !value.transfer_succeeded) return false;
+    if (value.publication_succeeded && !value.transfer_succeeded) return false;
+    if (value.metadata_committed && (!value.verification_succeeded ||
+                                     !value.publication_succeeded)) return false;
+    if (value.state == RepairPlanState::completed && !value.metadata_committed) return false;
+    if (value.last_error > RepairExecutionError::persistence_failure) return false;
+    if ((value.state == RepairPlanState::planned || value.state == RepairPlanState::approved ||
+         value.state == RepairPlanState::executing || value.state == RepairPlanState::completed ||
+         value.state == RepairPlanState::unrecoverable) &&
+        value.last_error != RepairExecutionError::none) return false;
+    if (value.state == RepairPlanState::failed && value.last_error == RepairExecutionError::none)
+        return false;
     return true;
 }
 std::string plan_id(std::string_view object, std::string_view generation, std::uint32_t chunk,
@@ -97,6 +122,14 @@ std::string plan_id(std::string_view object, std::string_view generation, std::u
     append(bytes, chunk); append(bytes, membership); append(bytes, slot);
     std::ostringstream output; output << "repair-" << std::hex << std::setw(8) << std::setfill('0')
                                       << atlasfs::integrity::crc32c(bytes);
+    return output.str();
+}
+std::string execution_id(std::string_view plan) {
+    const auto* begin = reinterpret_cast<const std::byte*>(plan.data());
+    const auto checksum = atlasfs::integrity::crc32c(
+        std::span<const std::byte>(begin, plan.size()));
+    std::ostringstream output;
+    output << "execution-" << std::hex << std::setw(8) << std::setfill('0') << checksum;
     return output.str();
 }
 bool sync_fd(int fd) { int result; do { result = ::fsync(fd); } while (result < 0 && errno == EINTR); return result == 0; }
@@ -183,6 +216,13 @@ std::vector<std::byte> encode_repair_plan(const RepairPlan& value) {
     append_string(out, value.generation_id); append_string(out, value.source_node);
     append_string(out, value.target_node); append(out, value.chunk_index); append(out, value.membership_version);
     append(out, value.health_evidence); append(out, value.replication_factor);
+    append_string(out, value.execution_id);
+    std::uint8_t flags = static_cast<std::uint8_t>(value.transfer_succeeded) |
+        static_cast<std::uint8_t>(value.verification_succeeded << 1U) |
+        static_cast<std::uint8_t>(value.publication_succeeded << 2U) |
+        static_cast<std::uint8_t>(value.metadata_committed << 3U);
+    append(out, flags); append(out, std::uint8_t{0});
+    append(out, static_cast<std::uint16_t>(value.last_error));
     append(out, static_cast<std::uint32_t>(value.observed_replicas.size()));
     for (const auto& node : value.observed_replicas) append_string(out, node);
     append(out, atlasfs::integrity::crc32c(out));
@@ -195,8 +235,10 @@ std::optional<RepairPlan> decode_repair_plan(std::span<const std::byte> encoded)
     const auto body = encoded.first(encoded.size() - 4); std::size_t crc_at = body.size(); std::uint32_t crc{};
     if (!take(encoded, crc_at, crc) || crc != atlasfs::integrity::crc32c(body)) return std::nullopt;
     std::size_t at = 0; std::uint32_t magic{}, count{}; std::uint16_t version{}, reserved{};
-    std::uint8_t state{}, reason{}; RepairPlan value;
-    if (!take(body, at, magic) || magic != kMagic || !take(body, at, version) || version != kVersion ||
+    std::uint8_t state{}, reason{}, flags{}, reserved8{}; std::uint16_t execution_error{};
+    RepairPlan value;
+    if (!take(body, at, magic) || magic != kMagic || !take(body, at, version) ||
+        (version != 1 && version != kVersion) ||
         !take(body, at, reserved) || reserved != 0 || !take(body, at, state) || !take(body, at, reason) ||
         !take(body, at, reserved) || reserved != 0 ||
         !take_string(body, at, storage_node_protocol::kMaxOperationIdSize, value.plan_id) ||
@@ -205,13 +247,24 @@ std::optional<RepairPlan> decode_repair_plan(std::span<const std::byte> encoded)
         !take_string(body, at, metadata::kMaxNodeIdSize, value.source_node, true) ||
         !take_string(body, at, metadata::kMaxNodeIdSize, value.target_node, true) ||
         !take(body, at, value.chunk_index) || !take(body, at, value.membership_version) ||
-        !take(body, at, value.health_evidence) || !take(body, at, value.replication_factor) ||
-        !take(body, at, count) || count > metadata::kMaxMembershipNodes) return std::nullopt;
+        !take(body, at, value.health_evidence) || !take(body, at, value.replication_factor))
+        return std::nullopt;
+    if (version == 2 && (!take_string(body, at, storage_node_protocol::kMaxOperationIdSize,
+            value.execution_id, true) || !take(body, at, flags) || flags > 15 ||
+            !take(body, at, reserved8) || reserved8 != 0 ||
+            !take(body, at, execution_error))) return std::nullopt;
+    if (!take(body, at, count) || count > metadata::kMaxMembershipNodes) return std::nullopt;
     value.state = static_cast<RepairPlanState>(state); value.reason = static_cast<RepairReason>(reason);
+    value.transfer_succeeded = (flags & 1U) != 0;
+    value.verification_succeeded = (flags & 2U) != 0;
+    value.publication_succeeded = (flags & 4U) != 0;
+    value.metadata_committed = (flags & 8U) != 0;
+    value.last_error = static_cast<RepairExecutionError>(execution_error);
     for (std::uint32_t i = 0; i < count; ++i) { std::string node;
         if (!take_string(body, at, metadata::kMaxNodeIdSize, node)) return std::nullopt;
         value.observed_replicas.push_back(std::move(node)); }
-    if (at != body.size() || !valid_plan(value)) return std::nullopt;
+    if ((version == 1 && static_cast<unsigned>(state) > 3U) ||
+        at != body.size() || !valid_plan(value)) return std::nullopt;
     return value;
 }
 
@@ -230,8 +283,44 @@ RepairPlanStore::RepairPlanStore(std::filesystem::path root, RepairFaultInjector
 }
 RepairStoreError RepairPlanStore::create(const RepairPlan& value) {
     if (!valid_plan(value)) return RepairStoreError::invalid_record;
+    if (value.state != RepairPlanState::planned &&
+        value.state != RepairPlanState::unrecoverable) return RepairStoreError::invalid_record;
     const auto found = plans_.find(value.plan_id);
     if (found != plans_.end()) return found->second == value ? RepairStoreError::none : RepairStoreError::conflict;
+    return persist(value);
+}
+RepairStoreError RepairPlanStore::update(const RepairPlan& value) {
+    if (!valid_plan(value)) return RepairStoreError::invalid_record;
+    const auto found = plans_.find(value.plan_id);
+    if (found == plans_.end()) return RepairStoreError::conflict;
+    const auto& old = found->second;
+    if (old.object_id != value.object_id || old.generation_id != value.generation_id ||
+        old.chunk_index != value.chunk_index || old.source_node != value.source_node ||
+        old.target_node != value.target_node || old.membership_version != value.membership_version ||
+        old.health_evidence != value.health_evidence ||
+        old.replication_factor != value.replication_factor ||
+        old.observed_replicas != value.observed_replicas || old.reason != value.reason)
+        return RepairStoreError::conflict;
+    const bool monotonic_results = (!old.transfer_succeeded || value.transfer_succeeded) &&
+        (!old.verification_succeeded || value.verification_succeeded) &&
+        (!old.publication_succeeded || value.publication_succeeded) &&
+        (!old.metadata_committed || value.metadata_committed) &&
+        (old.execution_id.empty() || old.execution_id == value.execution_id);
+    const bool transition = monotonic_results && (
+        (old.state == RepairPlanState::planned &&
+            (value.state == RepairPlanState::approved || value.state == RepairPlanState::cancelled ||
+             value.state == RepairPlanState::stale)) ||
+        (old.state == RepairPlanState::approved &&
+            (value.state == RepairPlanState::executing || value.state == RepairPlanState::cancelled ||
+             value.state == RepairPlanState::stale)) ||
+        (old.state == RepairPlanState::executing &&
+            (value.state == RepairPlanState::completed || value.state == RepairPlanState::failed ||
+             value.state == RepairPlanState::stale)) ||
+        (old.state == value.state &&
+         (old.state == RepairPlanState::executing || old == value)));
+    return transition ? persist(value) : RepairStoreError::conflict;
+}
+RepairStoreError RepairPlanStore::persist(const RepairPlan& value) {
     if (fault_ && fault_(RepairFaultPoint::record_creation)) return RepairStoreError::filesystem_error;
     const auto bytes = encode_repair_plan(value); const auto temporary = directory_ / (value.plan_id + ".tmp");
     const auto final = directory_ / value.plan_id;
@@ -252,7 +341,7 @@ RepairStoreError RepairPlanStore::create(const RepairPlan& value) {
     if (directory < 0) return RepairStoreError::filesystem_error;
     const bool synced = sync_fd(directory); const bool closed = ::close(directory) == 0;
     if (!synced || !closed) return RepairStoreError::filesystem_error;
-    plans_.emplace(value.plan_id, value); return RepairStoreError::none;
+    plans_[value.plan_id] = value; return RepairStoreError::none;
 }
 std::optional<RepairPlan> RepairPlanStore::get(std::string_view id) const {
     const auto found = plans_.find(id);
@@ -268,5 +357,175 @@ std::vector<RepairPlan> RepairPlanStore::list() const {
     return result;
 }
 const std::filesystem::path& RepairPlanStore::plans_directory() const noexcept { return directory_; }
+
+RepairExecutor::RepairExecutor(RepairPlanStore& plans,
+    std::vector<std::shared_ptr<replication::StorageNode>> nodes,
+    PlacementCommitter committer)
+    : plans_(plans), committer_(std::move(committer)) {
+    for (auto& node : nodes) {
+        if (!node || !nodes_.emplace(std::string(node->id()), node).second)
+            throw std::invalid_argument("repair executor requires distinct nodes");
+    }
+    if (!committer_) throw std::invalid_argument("repair executor requires metadata committer");
+}
+
+RepairStoreError RepairExecutor::approve(std::string_view plan_id_value) {
+    auto plan = plans_.get(plan_id_value);
+    if (!plan || plan->state != RepairPlanState::planned || plan->source_node.empty() ||
+        plan->target_node.empty()) return RepairStoreError::conflict;
+    plan->state = RepairPlanState::approved;
+    return plans_.update(*plan);
+}
+
+RepairStoreError RepairExecutor::cancel(std::string_view plan_id_value) {
+    auto plan = plans_.get(plan_id_value);
+    if (!plan || (plan->state != RepairPlanState::planned &&
+                  plan->state != RepairPlanState::approved)) return RepairStoreError::conflict;
+    plan->state = RepairPlanState::cancelled;
+    return plans_.update(*plan);
+}
+
+RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
+    metadata::PlacementPlan& placement, const metadata::MembershipSnapshot& membership) {
+    const std::scoped_lock lock(execution_mutex_);
+    auto plan = plans_.get(plan_id_value);
+    if (!plan) return {RepairExecutionError::plan_not_found, RepairPlanState::planned};
+    if (plan->state == RepairPlanState::completed)
+        return {RepairExecutionError::already_completed, plan->state};
+    if (plan->state == RepairPlanState::cancelled)
+        return {RepairExecutionError::cancelled, plan->state};
+    if (plan->state != RepairPlanState::approved)
+        return {RepairExecutionError::not_approved, plan->state};
+
+    if (planner_.validate(*plan, placement, membership) != PlanValidation::current) {
+        plan->state = RepairPlanState::stale;
+        plan->last_error = RepairExecutionError::stale;
+        if (plans_.update(*plan) != RepairStoreError::none)
+            return {RepairExecutionError::persistence_failure, RepairPlanState::approved};
+        return {RepairExecutionError::stale, plan->state};
+    }
+    auto stale = [&](RepairExecutionError error) {
+        plan->state = RepairPlanState::stale;
+        plan->last_error = error;
+        if (plans_.update(*plan) != RepairStoreError::none)
+            return RepairExecutionResult{RepairExecutionError::persistence_failure,
+                                         RepairPlanState::approved};
+        return RepairExecutionResult{error, plan->state};
+    };
+    auto member = [&](std::string_view id) -> const metadata::StorageNode* {
+        const auto found = std::find_if(membership.nodes.begin(), membership.nodes.end(),
+            [&](const auto& node) { return node.node_id == id; });
+        return found == membership.nodes.end() ? nullptr : &*found;
+    };
+    const auto eligible = [](const metadata::StorageNode* node) {
+        return node && node->state == metadata::NodeState::active &&
+            node->health == metadata::NodeHealthState::healthy && node->health_current;
+    };
+    if (!eligible(member(plan->source_node)))
+        return stale(RepairExecutionError::source_unavailable);
+    if (!eligible(member(plan->target_node)))
+        return stale(RepairExecutionError::target_unavailable);
+    const auto source = nodes_.find(plan->source_node);
+    const auto target = nodes_.find(plan->target_node);
+    if (source == nodes_.end()) return stale(RepairExecutionError::source_unavailable);
+    if (target == nodes_.end()) return stale(RepairExecutionError::target_unavailable);
+
+    const auto chunk_it = std::find_if(placement.chunks.begin(), placement.chunks.end(),
+        [&](const auto& chunk) { return chunk.chunk.index == plan->chunk_index; });
+    if (chunk_it == placement.chunks.end()) return stale(RepairExecutionError::stale);
+    const auto source_chunk = source->second->get_chunk(
+        plan->object_id, plan->generation_id, plan->chunk_index);
+    if (source_chunk.error == storage::StoreError::not_found)
+        return stale(RepairExecutionError::source_chunk_missing);
+    if (source_chunk.error != storage::StoreError::none)
+        return stale(RepairExecutionError::source_unavailable);
+    storage::ObjectManifest expected_manifest{placement.object_size, placement.chunk_size,
+        placement.object_checksum, placement.generation_id, {}};
+    expected_manifest.chunks.reserve(placement.chunks.size());
+    for (const auto& chunk : placement.chunks) expected_manifest.chunks.push_back(chunk.chunk);
+    std::sort(expected_manifest.chunks.begin(), expected_manifest.chunks.end(),
+        [](const auto& left, const auto& right) { return left.index < right.index; });
+    if (source_chunk.manifest != expected_manifest ||
+        source_chunk.manifest.generation_id != plan->generation_id ||
+        source_chunk.chunk != chunk_it->chunk ||
+        source_chunk.chunk.index != plan->chunk_index)
+        return stale(RepairExecutionError::chunk_identity_mismatch);
+    if (source_chunk.data.size() != source_chunk.chunk.length ||
+        integrity::crc32c(source_chunk.data) != source_chunk.chunk.checksum)
+        return stale(RepairExecutionError::integrity_failure);
+
+    const auto existing = target->second->get_chunk(
+        plan->object_id, plan->generation_id, plan->chunk_index);
+    if (existing.error == storage::StoreError::none) {
+        if (existing.manifest != expected_manifest || existing.chunk != source_chunk.chunk ||
+            existing.data != source_chunk.data)
+            return stale(RepairExecutionError::integrity_failure);
+    } else if (existing.error != storage::StoreError::not_found) {
+        return stale(RepairExecutionError::target_unavailable);
+    }
+
+    plan->state = RepairPlanState::executing;
+    plan->execution_id = execution_id(plan->plan_id);
+    if (plans_.update(*plan) != RepairStoreError::none)
+        return {RepairExecutionError::persistence_failure, RepairPlanState::approved};
+
+    // Final coordinator-local evidence check is intentionally adjacent to the
+    // transfer. The mutex serializes competing executions in this executor.
+    if (planner_.validate(*plan, placement, membership) != PlanValidation::current) {
+        plan->state = RepairPlanState::stale;
+        plan->last_error = RepairExecutionError::stale;
+        if (plans_.update(*plan) != RepairStoreError::none)
+            return {RepairExecutionError::persistence_failure, RepairPlanState::executing};
+        return {RepairExecutionError::stale, plan->state};
+    }
+
+    if (existing.error != storage::StoreError::none) {
+        const auto transferred = target->second->repair_chunk(plan->object_id,
+            source_chunk.manifest, source_chunk.chunk, source_chunk.data);
+        if (transferred != storage::StoreError::none) {
+            plan->state = RepairPlanState::failed;
+            plan->last_error = RepairExecutionError::transfer_failure;
+            if (plans_.update(*plan) != RepairStoreError::none)
+                return {RepairExecutionError::persistence_failure, RepairPlanState::executing};
+            return {RepairExecutionError::transfer_failure, plan->state};
+        }
+    }
+    plan->transfer_succeeded = true;
+    plan->publication_succeeded = true;
+    const auto verified = target->second->get_chunk(
+        plan->object_id, plan->generation_id, plan->chunk_index);
+    if (verified.error != storage::StoreError::none || verified.chunk != source_chunk.chunk ||
+        verified.data != source_chunk.data ||
+        integrity::crc32c(verified.data) != source_chunk.chunk.checksum) {
+        plan->state = RepairPlanState::failed;
+        plan->last_error = RepairExecutionError::verification_failure;
+        if (plans_.update(*plan) != RepairStoreError::none)
+            return {RepairExecutionError::persistence_failure, RepairPlanState::executing};
+        return {RepairExecutionError::verification_failure, plan->state};
+    }
+    plan->verification_succeeded = true;
+    if (plans_.update(*plan) != RepairStoreError::none)
+        return {RepairExecutionError::persistence_failure, plan->state};
+
+    auto candidate = placement;
+    auto& replicas = candidate.chunks[static_cast<std::size_t>(
+        std::distance(placement.chunks.begin(), chunk_it))].replica_node_ids;
+    if (std::find(replicas.begin(), replicas.end(), plan->target_node) == replicas.end()) {
+        replicas.push_back(plan->target_node);
+    }
+    if (!committer_(candidate, *plan)) {
+        plan->state = RepairPlanState::failed;
+        plan->last_error = RepairExecutionError::metadata_commit_failure;
+        if (plans_.update(*plan) != RepairStoreError::none)
+            return {RepairExecutionError::persistence_failure, RepairPlanState::executing};
+        return {RepairExecutionError::metadata_commit_failure, plan->state};
+    }
+    placement = std::move(candidate);
+    plan->metadata_committed = true;
+    plan->state = RepairPlanState::completed;
+    if (plans_.update(*plan) != RepairStoreError::none)
+        return {RepairExecutionError::persistence_failure, RepairPlanState::executing};
+    return {RepairExecutionError::none, plan->state};
+}
 
 }  // namespace atlasfs::repair

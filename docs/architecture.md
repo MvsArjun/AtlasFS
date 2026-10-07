@@ -249,6 +249,29 @@ corruption without deletion. There is deliberately no execution path: plans do
 not contact storage nodes, copy chunks, mutate manifests or membership, retry
 operations, or alter historical operation participants.
 
+### Operator-approved repair execution
+
+`RepairExecutor` is separate from the read-only planner. An operator must durably
+transition a plan from PLANNED to APPROVED before execution. Under a local mutex,
+the executor checks the current membership and health evidence, exact generation
+manifest, source chunk, target absence or equivalence, and observed placement.
+It persists EXECUTING before data movement and performs a final evidence check
+immediately before initiating the transfer.
+
+`ObjectStore::publish_repair_chunk` validates the complete manifest and chunk,
+writes and synchronizes temporary files, rereads their CRC-protected content, and
+only then atomically publishes them. The executor rereads the target before it
+invokes the required current-placement commit callback. ARPL v2 stores approval,
+execution state, step outcomes, execution identity, and typed terminal failure;
+v1 planning records remain readable. An EXECUTING record found after restart is
+never resumed automatically and exposes the completed steps for inspection.
+
+The metadata committer is an explicit durability boundary supplied by the
+coordinator; execution cannot be constructed without one. AtlasFS currently
+serializes only repairs sharing an executor instance, not independent processes,
+and the remote storage-node protocol does not yet expose repair publication.
+Neither limitation is hidden by retry or target reselection.
+
 A storage node has a stable validated node ID, host, port, and coordinator-owned
 state. ACTIVE nodes are eligible for new placement. DRAINING nodes remain known
 but receive no new chunks, while UNAVAILABLE nodes are likewise excluded. No

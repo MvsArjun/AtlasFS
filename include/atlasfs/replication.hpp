@@ -87,6 +87,11 @@ public:
                                                      std::string_view generation_id) = 0;
     [[nodiscard]] virtual OperationQueryResult query_operation(
         std::string_view operation_id) const = 0;
+    [[nodiscard]] virtual storage::StoreError repair_chunk(
+        std::string_view, const storage::ObjectManifest&,
+        const storage::ChunkMetadata&, std::span<const std::byte>) {
+        return storage::StoreError::invalid_operation_state;
+    }
 };
 
 class LocalStorageNode final : public StorageNode {
@@ -122,6 +127,10 @@ public:
                                              std::string_view generation_id) override;
     [[nodiscard]] OperationQueryResult query_operation(
         std::string_view operation_id) const override;
+    [[nodiscard]] storage::StoreError repair_chunk(
+        std::string_view object_id, const storage::ObjectManifest& manifest,
+        const storage::ChunkMetadata& chunk,
+        std::span<const std::byte> data) override;
     [[nodiscard]] const storage::ObjectStore& store() const noexcept;
 
 private:

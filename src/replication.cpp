@@ -159,6 +159,12 @@ OperationQueryResult LocalStorageNode::query_operation(
             found->second.state, found->second.fingerprint};
 }
 
+storage::StoreError LocalStorageNode::repair_chunk(
+    std::string_view object_id, const storage::ObjectManifest& manifest,
+    const storage::ChunkMetadata& chunk, std::span<const std::byte> data) {
+    return store_.publish_repair_chunk(object_id, manifest, chunk, data);
+}
+
 const storage::ObjectStore& LocalStorageNode::store() const noexcept { return store_; }
 
 ReplicaManager::ReplicaManager(std::vector<std::shared_ptr<StorageNode>> nodes) {

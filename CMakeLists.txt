@@ -143,11 +143,11 @@ if(BUILD_TESTING)
         tests/coordinator_test.cpp
         tests/membership_test.cpp
         tests/node_registry_test.cpp
-        tests/repair_test.cpp
     )
     target_link_libraries(atlasfs_metadata_tests PRIVATE AtlasFS::metadata GTest::gtest_main)
     add_executable(atlasfs_replication_tests
         tests/coordinator_operation_test.cpp
+        tests/repair_test.cpp
         tests/replication_test.cpp
         tests/recovery_test.cpp
         tests/storage_node_protocol_test.cpp

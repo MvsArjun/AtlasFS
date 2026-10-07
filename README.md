@@ -52,6 +52,14 @@ are evidence-bound to membership, health, generation, chunk, and observed replic
 placement, and are durably stored under `coordinator/repairs/`. Planning never
 copies or deletes data and never rewrites historical operation records.
 
+Approved plans may now be executed explicitly through `RepairExecutor`. Execution
+is locally serialized, revalidates membership, health, generation, chunk, and
+replica evidence immediately before transfer, and journals progress in ARPL v2.
+Local targets stage, sync, reread, and verify repair bytes before atomic
+publication. A required metadata-commit callback completes current placement;
+historical operation records remain immutable. There is no automatic approval,
+execution, retry, source/target reselection, or background repair.
+
 ## Build and test
 
 Prerequisites: CMake 3.20+, a C++20 compiler, Git, and network access on the first

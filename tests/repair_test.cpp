@@ -1,4 +1,6 @@
 #include "atlasfs/repair.hpp"
+#include "atlasfs/checksum.hpp"
+#include "atlasfs/coordinator_operation.hpp"
 
 #include <gtest/gtest.h>
 
@@ -36,6 +38,59 @@ RepairPlan sample() {
             metadata::NodeHealthState::unavailable), node("c"), node("d")}));
     return result.plans.front();
 }
+
+class FakeRepairNode final : public replication::StorageNode {
+public:
+    explicit FakeRepairNode(std::string id) : id_(std::move(id)) {}
+    std::string_view id() const noexcept override { return id_; }
+    storage::StoreError prepare(std::string_view, std::string_view,
+        const storage::ObjectManifest&, std::span<const std::uint32_t>,
+        std::span<const std::byte>) override { return storage::StoreError::none; }
+    storage::StoreError verify_prepared(std::string_view, std::string_view,
+        std::string_view, std::span<const std::uint32_t>) const override {
+        return storage::StoreError::none;
+    }
+    storage::StoreError commit(std::string_view, std::string_view,
+        std::string_view) override { return storage::StoreError::none; }
+    storage::StoreError abort(std::string_view, std::string_view,
+        std::string_view) override { return storage::StoreError::none; }
+    storage::StoreError finalize(std::string_view, std::string_view,
+        std::string_view) override { return storage::StoreError::none; }
+    storage::ChunkResult get_chunk(std::string_view, std::string_view,
+        std::uint32_t) const override {
+        return chunk_ ? *chunk_ : storage::ChunkResult{storage::StoreError::not_found, {}, {}, {}};
+    }
+    storage::StoreError remove(std::string_view, std::string_view) override {
+        return storage::StoreError::none;
+    }
+    replication::OperationQueryResult query_operation(std::string_view id) const override {
+        return {storage::StoreError::none, std::string(id),
+                replication::OperationState::unknown, 0};
+    }
+    storage::StoreError repair_chunk(std::string_view,
+        const storage::ObjectManifest& manifest, const storage::ChunkMetadata& chunk,
+        std::span<const std::byte> data) override {
+        ++repairs;
+        if (repair_error != storage::StoreError::none) return repair_error;
+        chunk_ = storage::ChunkResult{storage::StoreError::none, manifest, chunk,
+                                     {data.begin(), data.end()}};
+        return storage::StoreError::none;
+    }
+    std::string id_;
+    std::optional<storage::ChunkResult> chunk_;
+    storage::StoreError repair_error{storage::StoreError::none};
+    unsigned repairs{};
+};
+
+struct ExecutionFixture {
+    std::vector<std::byte> data{std::byte{42}};
+    std::uint32_t checksum{integrity::crc32c(data)};
+    storage::ObjectManifest manifest{1, 1, checksum, "generation-1", {{0, 1, checksum}}};
+    metadata::PlacementPlan placement{"object", "generation-1", 1, 1, checksum, 10, 3,
+        false, {{{"object", "generation-1", 0}, {0, 1, checksum}, {"a", "b", "c"}}}};
+    metadata::MembershipSnapshot members{membership({node("a"), node("b", metadata::NodeState::active,
+        metadata::NodeHealthState::unavailable), node("c"), node("d")})};
+};
 
 TEST(RepairPlanner, ProducesNoPlanWhenAllReplicasAreHealthy) {
     const auto result = RepairPlanner{}.plan(placement({"a", "b", "c"}),
@@ -117,6 +172,120 @@ TEST(RepairPlanStore, CorruptPublishedPlanStopsStartupWithoutDeletion) {
       path = store.plans_directory() / value.plan_id; }
     std::ofstream(path, std::ios::binary | std::ios::trunc).put('x');
     EXPECT_THROW(RepairPlanStore(root.path()), std::runtime_error); EXPECT_TRUE(std::filesystem::exists(path));
+}
+
+TEST(RepairExecutor, RequiresExplicitApprovalAndHonorsCancellation) {
+    TempRoot root; ExecutionFixture fixture;
+    const auto plan = RepairPlanner{}.plan(fixture.placement, fixture.members).plans.front();
+    RepairPlanStore store(root.path()); ASSERT_EQ(store.create(plan), RepairStoreError::none);
+    auto source = std::make_shared<FakeRepairNode>("a");
+    source->chunk_ = storage::ChunkResult{storage::StoreError::none, fixture.manifest,
+        fixture.manifest.chunks[0], fixture.data};
+    auto target = std::make_shared<FakeRepairNode>("d");
+    RepairExecutor executor(store, {source, target}, [](auto&, const auto&) { return true; });
+    EXPECT_EQ(executor.execute(plan.plan_id, fixture.placement, fixture.members).error,
+              RepairExecutionError::not_approved);
+    EXPECT_EQ(target->repairs, 0U);
+    ASSERT_EQ(executor.cancel(plan.plan_id), RepairStoreError::none);
+    EXPECT_EQ(executor.execute(plan.plan_id, fixture.placement, fixture.members).error,
+              RepairExecutionError::cancelled);
+}
+
+TEST(RepairExecutor, ApprovedPlanCopiesVerifiesCommitsAndIsIdempotent) {
+    TempRoot root; ExecutionFixture fixture;
+    const auto plan = RepairPlanner{}.plan(fixture.placement, fixture.members).plans.front();
+    RepairPlanStore store(root.path()); ASSERT_EQ(store.create(plan), RepairStoreError::none);
+    auto source = std::make_shared<FakeRepairNode>("a");
+    source->chunk_ = storage::ChunkResult{storage::StoreError::none, fixture.manifest,
+        fixture.manifest.chunks[0], fixture.data};
+    auto target = std::make_shared<FakeRepairNode>("d");
+    RepairExecutor executor(store, {source, target}, [](auto&, const auto&) { return true; });
+    ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+    const auto result = executor.execute(plan.plan_id, fixture.placement, fixture.members);
+    EXPECT_EQ(result.error, RepairExecutionError::none);
+    EXPECT_EQ(result.state, RepairPlanState::completed); EXPECT_EQ(target->repairs, 1U);
+    EXPECT_NE(std::find(fixture.placement.chunks[0].replica_node_ids.begin(),
+                       fixture.placement.chunks[0].replica_node_ids.end(), "d"),
+              fixture.placement.chunks[0].replica_node_ids.end());
+    const auto durable = store.get(plan.plan_id); ASSERT_TRUE(durable);
+    EXPECT_TRUE(durable->transfer_succeeded); EXPECT_TRUE(durable->verification_succeeded);
+    EXPECT_TRUE(durable->publication_succeeded); EXPECT_TRUE(durable->metadata_committed);
+    EXPECT_EQ(decode_repair_plan(encode_repair_plan(*durable)), durable);
+    EXPECT_EQ(executor.execute(plan.plan_id, fixture.placement, fixture.members).error,
+              RepairExecutionError::already_completed);
+    EXPECT_EQ(target->repairs, 1U);
+}
+
+TEST(RepairExecutor, ExecutionNeverRewritesHistoricalOperationRecord) {
+    TempRoot root; ExecutionFixture fixture;
+    metadata::CoordinatorOperationStore operations(root.path());
+    const auto historical = metadata::make_coordinator_operation(
+        fixture.placement, "historical-op", 77);
+    ASSERT_EQ(operations.create(historical), metadata::CoordinatorRecordError::none);
+    const auto before = metadata::encode_coordinator_operation(*operations.get("historical-op"));
+    const auto plan = RepairPlanner{}.plan(fixture.placement, fixture.members).plans.front();
+    RepairPlanStore store(root.path()); ASSERT_EQ(store.create(plan), RepairStoreError::none);
+    auto source = std::make_shared<FakeRepairNode>("a");
+    source->chunk_ = storage::ChunkResult{storage::StoreError::none, fixture.manifest,
+        fixture.manifest.chunks[0], fixture.data};
+    auto target = std::make_shared<FakeRepairNode>("d");
+    RepairExecutor executor(store, {source, target}, [](auto&, const auto&) { return true; });
+    ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+    ASSERT_EQ(executor.execute(plan.plan_id, fixture.placement, fixture.members).error,
+              RepairExecutionError::none);
+    EXPECT_EQ(metadata::encode_coordinator_operation(*operations.get("historical-op")), before);
+}
+
+TEST(RepairExecutor, RevalidationPreventsCopyWhenEvidenceChanges) {
+    TempRoot root; ExecutionFixture fixture;
+    const auto plan = RepairPlanner{}.plan(fixture.placement, fixture.members).plans.front();
+    RepairPlanStore store(root.path()); ASSERT_EQ(store.create(plan), RepairStoreError::none);
+    auto source = std::make_shared<FakeRepairNode>("a");
+    auto target = std::make_shared<FakeRepairNode>("d");
+    RepairExecutor executor(store, {source, target}, [](auto&, const auto&) { return true; });
+    ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+    fixture.members.version++;
+    EXPECT_EQ(executor.execute(plan.plan_id, fixture.placement, fixture.members).error,
+              RepairExecutionError::stale);
+    EXPECT_EQ(target->repairs, 0U); EXPECT_EQ(store.get(plan.plan_id)->state, RepairPlanState::stale);
+}
+
+TEST(RepairExecutor, SourceIntegrityAndTransferFailuresDoNotCommitMetadata) {
+    for (const bool corrupt_source : {true, false}) {
+        TempRoot root; ExecutionFixture fixture;
+        const auto plan = RepairPlanner{}.plan(fixture.placement, fixture.members).plans.front();
+        RepairPlanStore store(root.path()); ASSERT_EQ(store.create(plan), RepairStoreError::none);
+        auto source = std::make_shared<FakeRepairNode>("a");
+        auto bad_data = fixture.data; if (corrupt_source) bad_data[0] = std::byte{7};
+        source->chunk_ = storage::ChunkResult{storage::StoreError::none, fixture.manifest,
+            fixture.manifest.chunks[0], bad_data};
+        auto target = std::make_shared<FakeRepairNode>("d");
+        if (!corrupt_source) target->repair_error = storage::StoreError::filesystem_error;
+        RepairExecutor executor(store, {source, target}, [](auto&, const auto&) { return true; });
+        ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+        const auto before = fixture.placement;
+        const auto result = executor.execute(plan.plan_id, fixture.placement, fixture.members);
+        EXPECT_EQ(result.error, corrupt_source ? RepairExecutionError::integrity_failure
+                                               : RepairExecutionError::transfer_failure);
+        EXPECT_EQ(fixture.placement, before);
+    }
+}
+
+TEST(RepairExecutor, MetadataCommitFailureLeavesPublishedChunkVisibleForInspection) {
+    TempRoot root; ExecutionFixture fixture;
+    const auto plan = RepairPlanner{}.plan(fixture.placement, fixture.members).plans.front();
+    RepairPlanStore store(root.path()); ASSERT_EQ(store.create(plan), RepairStoreError::none);
+    auto source = std::make_shared<FakeRepairNode>("a");
+    source->chunk_ = storage::ChunkResult{storage::StoreError::none, fixture.manifest,
+        fixture.manifest.chunks[0], fixture.data};
+    auto target = std::make_shared<FakeRepairNode>("d");
+    RepairExecutor executor(store, {source, target}, [](auto&, const auto&) { return false; });
+    ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+    const auto before = fixture.placement;
+    EXPECT_EQ(executor.execute(plan.plan_id, fixture.placement, fixture.members).error,
+              RepairExecutionError::metadata_commit_failure);
+    EXPECT_EQ(fixture.placement, before); EXPECT_TRUE(target->chunk_.has_value());
+    EXPECT_EQ(store.get(plan.plan_id)->state, RepairPlanState::failed);
 }
 }  // namespace
 }  // namespace atlasfs::repair
