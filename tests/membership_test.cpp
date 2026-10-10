@@ -56,7 +56,8 @@ TEST(MembershipSerialization, RejectsCorruptionAndInvalidFields) {
         EXPECT_FALSE(decode_membership(changed));
     }
     auto invalid = node("a"); invalid.endpoint.port = 0;
-    EXPECT_THROW(encode_membership({1, {invalid}}), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_membership({1, {invalid}})),
+                 std::invalid_argument);
 }
 TEST(DurableMembership, MutationsAreVersionedPersistedAndRestartSafe) {
     TempRoot root;

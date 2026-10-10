@@ -66,11 +66,11 @@ TEST(CoordinatorOperationRecord, RejectsMagicVersionReservedAndLifecycle) {
 
 TEST(CoordinatorOperationRecord, RejectsUnsafeAndOversizedIdentityAndParticipants) {
     auto invalid = record("../operation");
-    EXPECT_THROW(encode_coordinator_operation(invalid), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_coordinator_operation(invalid)), std::invalid_argument);
     invalid = record(); invalid.participants[0].node_id = "../node";
-    EXPECT_THROW(encode_coordinator_operation(invalid), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_coordinator_operation(invalid)), std::invalid_argument);
     invalid = record(); invalid.participants.clear();
-    EXPECT_THROW(encode_coordinator_operation(invalid), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_coordinator_operation(invalid)), std::invalid_argument);
 }
 
 TEST(CoordinatorOperationStore, CreatesReloadsUpdatesAndOrdersRecords) {

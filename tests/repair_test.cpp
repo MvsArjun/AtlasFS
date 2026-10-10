@@ -9,6 +9,7 @@
 #include <atomic>
 #include <fstream>
 #include <thread>
+#include <utility>
 #include <unistd.h>
 
 namespace atlasfs::repair {
@@ -475,6 +476,152 @@ TEST(RepairExecutor, RestartRetainsCompletedCatalogAndPlanEvidence) {
     EXPECT_EQ(plan->observed_catalog_replicas.size(), 3U);
 }
 
+TEST(RepairExecutor, ReconcilesCrashAfterExecutingPlanWasPersisted) {
+    TempRoot root; ExecutionFixture fixture; std::string plan_id;
+    auto source = std::make_shared<FakeRepairNode>("a");
+    source->chunk_ = storage::ChunkResult{storage::StoreError::none, fixture.manifest,
+        fixture.manifest.chunks[0], fixture.data};
+    auto target = std::make_shared<FakeRepairNode>("d");
+    {
+        metadata::DurableReplicaCatalog catalog(root.path());
+        ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+        const auto plan = execution_plan(fixture, catalog); plan_id = plan.plan_id;
+        RepairPlanStore plans(root.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+        bool interrupted = false;
+        RepairExecutor executor(plans, catalog, {source, target}, [&](auto point) {
+            return point == RepairExecutionFaultPoint::after_executing_persist &&
+                !std::exchange(interrupted, true);
+        });
+        ASSERT_EQ(executor.approve(plan_id), RepairStoreError::none);
+        EXPECT_EQ(executor.execute(plan_id, fixture.placement, fixture.members).error,
+                  RepairExecutionError::recovery_interrupted);
+        EXPECT_EQ(plans.get(plan_id)->state, RepairPlanState::executing);
+        EXPECT_EQ(target->repairs, 0U);
+    }
+    metadata::DurableReplicaCatalog catalog(root.path());
+    RepairPlanStore plans(root.path());
+    RepairExecutor executor(plans, catalog, {source, target});
+    EXPECT_EQ(executor.reconcile(plan_id, fixture.placement, fixture.members).error,
+              RepairExecutionError::none);
+    EXPECT_EQ(plans.get(plan_id)->state, RepairPlanState::completed);
+    EXPECT_EQ(target->repairs, 1U);
+}
+
+TEST(RepairExecutor, ReconcilesCrashAfterPublicationWithoutRepublishing) {
+    TempRoot root; ExecutionFixture fixture; std::string plan_id;
+    auto source = std::make_shared<FakeRepairNode>("a");
+    source->chunk_ = storage::ChunkResult{storage::StoreError::none, fixture.manifest,
+        fixture.manifest.chunks[0], fixture.data};
+    auto target = std::make_shared<FakeRepairNode>("d");
+    {
+        metadata::DurableReplicaCatalog catalog(root.path());
+        ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+        const auto plan = execution_plan(fixture, catalog); plan_id = plan.plan_id;
+        RepairPlanStore plans(root.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+        RepairExecutor executor(plans, catalog, {source, target}, [](auto point) {
+            return point == RepairExecutionFaultPoint::after_publication_persist;
+        });
+        ASSERT_EQ(executor.approve(plan_id), RepairStoreError::none);
+        EXPECT_EQ(executor.execute(plan_id, fixture.placement, fixture.members).error,
+                  RepairExecutionError::recovery_interrupted);
+        const auto durable = plans.get(plan_id); ASSERT_TRUE(durable);
+        EXPECT_TRUE(durable->publication_succeeded);
+        EXPECT_TRUE(durable->verification_succeeded);
+        EXPECT_FALSE(durable->metadata_committed);
+        EXPECT_EQ(target->repairs, 1U);
+    }
+    metadata::DurableReplicaCatalog catalog(root.path());
+    RepairPlanStore plans(root.path());
+    RepairExecutor executor(plans, catalog, {source, target});
+    EXPECT_EQ(executor.reconcile(plan_id, fixture.placement, fixture.members).error,
+              RepairExecutionError::none);
+    EXPECT_EQ(target->repairs, 1U);
+    EXPECT_EQ(catalog.version(), 2U);
+}
+
+TEST(RepairExecutor, ReconcilesCrashAfterCatalogCommitWithoutRecopying) {
+    TempRoot root; ExecutionFixture fixture; std::string plan_id;
+    const auto original_placement = fixture.placement;
+    auto source = std::make_shared<FakeRepairNode>("a");
+    source->chunk_ = storage::ChunkResult{storage::StoreError::none, fixture.manifest,
+        fixture.manifest.chunks[0], fixture.data};
+    auto target = std::make_shared<FakeRepairNode>("d");
+    {
+        metadata::DurableReplicaCatalog catalog(root.path());
+        ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+        const auto plan = execution_plan(fixture, catalog); plan_id = plan.plan_id;
+        RepairPlanStore plans(root.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+        RepairExecutor executor(plans, catalog, {source, target}, [](auto point) {
+            return point == RepairExecutionFaultPoint::after_catalog_commit;
+        });
+        ASSERT_EQ(executor.approve(plan_id), RepairStoreError::none);
+        EXPECT_EQ(executor.execute(plan_id, fixture.placement, fixture.members).error,
+                  RepairExecutionError::recovery_interrupted);
+        EXPECT_EQ(catalog.version(), 2U);
+        EXPECT_EQ(fixture.placement, original_placement);
+        EXPECT_EQ(plans.get(plan_id)->state, RepairPlanState::executing);
+    }
+    metadata::DurableReplicaCatalog catalog(root.path());
+    RepairPlanStore plans(root.path());
+    RepairExecutor executor(plans, catalog, {source, target});
+    EXPECT_EQ(executor.reconcile(plan_id, fixture.placement, fixture.members).error,
+              RepairExecutionError::none);
+    EXPECT_EQ(plans.get(plan_id)->state, RepairPlanState::completed);
+    EXPECT_EQ(target->repairs, 1U);
+    EXPECT_EQ(fixture.placement.chunks[0].replica_node_ids,
+              (std::vector<std::string>{"a", "c", "d"}));
+}
+
+TEST(RepairExecutor, ReconciliationRejectsConcurrentCatalogAndMembershipChanges) {
+    for (const bool change_membership : {false, true}) {
+        TempRoot root; ExecutionFixture fixture;
+        metadata::DurableReplicaCatalog catalog(root.path());
+        ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+        const auto plan = execution_plan(fixture, catalog);
+        RepairPlanStore plans(root.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+        auto source = std::make_shared<FakeRepairNode>("a");
+        source->chunk_ = storage::ChunkResult{storage::StoreError::none, fixture.manifest,
+            fixture.manifest.chunks[0], fixture.data};
+        auto target = std::make_shared<FakeRepairNode>("d");
+        RepairExecutor interrupted(plans, catalog, {source, target}, [](auto point) {
+            return point == RepairExecutionFaultPoint::after_publication_persist;
+        });
+        ASSERT_EQ(interrupted.approve(plan.plan_id), RepairStoreError::none);
+        ASSERT_EQ(interrupted.execute(plan.plan_id, fixture.placement, fixture.members).error,
+                  RepairExecutionError::recovery_interrupted);
+        const auto repairs = target->repairs;
+        if (change_membership) {
+            ++fixture.members.version;
+        } else {
+            const auto current = catalog.get(fixture.placement.chunks[0].identity);
+            ASSERT_TRUE(current);
+            auto competing = current->replicas;
+            competing.push_back({"e", metadata::CatalogReplicaState::present,
+                                 fixture.checksum, fixture.members.version});
+            ASSERT_EQ(catalog.compare_exchange({current->identity,
+                current->catalog_version, current->replicas, competing}).status,
+                metadata::ReplicaCatalogCasStatus::committed);
+        }
+        RepairExecutor recovering(plans, catalog, {source, target});
+        EXPECT_EQ(recovering.reconcile(plan.plan_id, fixture.placement, fixture.members).error,
+                  RepairExecutionError::stale);
+        EXPECT_EQ(plans.get(plan.plan_id)->state, RepairPlanState::stale);
+        EXPECT_EQ(target->repairs, repairs);
+    }
+}
+
+TEST(RepairExecutor, ReconciliationRejectsPlansWithoutAmbiguousDurableState) {
+    TempRoot root; ExecutionFixture fixture;
+    metadata::DurableReplicaCatalog catalog(root.path());
+    ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+    const auto plan = execution_plan(fixture, catalog);
+    RepairPlanStore plans(root.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+    RepairExecutor executor(plans, catalog, {});
+    EXPECT_EQ(executor.reconcile(plan.plan_id, fixture.placement, fixture.members).error,
+              RepairExecutionError::not_reconcilable);
+    EXPECT_EQ(plans.get(plan.plan_id)->state, RepairPlanState::planned);
+}
+
 TEST(RepairExecutor, RemotePublicationThenCatalogCasCompletesFourNodeRepair) {
     TempRoot root;
     ExecutionFixture fixture;
@@ -578,6 +725,24 @@ TEST(RepairExecutor, LostRemoteResponseLeavesPhysicalReplicaNonAuthoritative) {
     RepairPlanStore restarted_plans(root.path());
     EXPECT_EQ(restarted_plans.get(plan.plan_id)->last_error,
               RepairExecutionError::remote_result_unknown);
+
+    metadata::DurableReplicaCatalog restarted_catalog(root.path());
+    replication::StorageNodeServer restarted_server(
+        target_local, root.path() / "target-journal");
+    auto restarted_remote = std::make_shared<replication::RemoteStorageNodeClient>(
+        "d", restarted_server.port());
+    RepairExecutor restarted_executor(
+        restarted_plans, restarted_catalog, {source, restarted_remote});
+    std::thread restarted_thread([&] { restarted_server.serve(); });
+    const auto reconciled = restarted_executor.reconcile(
+        plan.plan_id, fixture.placement, fixture.members);
+    restarted_server.stop();
+    restarted_thread.join();
+
+    EXPECT_EQ(reconciled.error, RepairExecutionError::none);
+    EXPECT_EQ(reconciled.state, RepairPlanState::completed);
+    EXPECT_EQ(restarted_catalog.version(), 2U);
+    EXPECT_TRUE(restarted_plans.get(plan.plan_id)->metadata_committed);
 }
 
 TEST(RepairExecutor, RemoteReplicaRemainsPhysicalWhenCatalogCasConflicts) {

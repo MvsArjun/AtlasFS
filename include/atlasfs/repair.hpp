@@ -26,7 +26,8 @@ enum class RepairExecutionError : std::uint16_t {
     target_publication_failure, metadata_commit_failure, conflicting_repair,
     persistence_failure, catalog_durability_unknown, remote_result_unknown,
     remote_identity_mismatch, remote_connection_failure, remote_timeout,
-    remote_protocol_error, remote_target_rejected
+    remote_protocol_error, remote_target_rejected, not_reconcilable,
+    recovery_interrupted
 };
 
 enum class RepairPlanState : std::uint8_t {
@@ -110,20 +111,36 @@ struct RepairExecutionResult {
     RepairPlanState state{RepairPlanState::planned};
 };
 
+enum class RepairExecutionFaultPoint {
+    after_executing_persist,
+    after_publication_persist,
+    after_catalog_commit,
+};
+using RepairExecutionFaultInjector =
+    std::function<bool(RepairExecutionFaultPoint)>;
+
 class RepairExecutor {
 public:
     RepairExecutor(RepairPlanStore& plans, metadata::DurableReplicaCatalog& catalog,
-        std::vector<std::shared_ptr<replication::StorageNode>> nodes);
+        std::vector<std::shared_ptr<replication::StorageNode>> nodes,
+        RepairExecutionFaultInjector fault = {});
     [[nodiscard]] RepairStoreError approve(std::string_view plan_id);
     [[nodiscard]] RepairStoreError cancel(std::string_view plan_id);
     [[nodiscard]] RepairExecutionResult execute(
         std::string_view plan_id, metadata::PlacementPlan& placement,
         const metadata::MembershipSnapshot& membership);
+    [[nodiscard]] RepairExecutionResult reconcile(
+        std::string_view plan_id, metadata::PlacementPlan& placement,
+        const metadata::MembershipSnapshot& membership);
 private:
+    [[nodiscard]] RepairExecutionResult execute_locked(
+        std::string_view plan_id, metadata::PlacementPlan& placement,
+        const metadata::MembershipSnapshot& membership, bool recovering);
     RepairPlanStore& plans_;
     metadata::DurableReplicaCatalog& catalog_;
     std::map<std::string, std::shared_ptr<replication::StorageNode>, std::less<>> nodes_;
     RepairPlanner planner_;
+    RepairExecutionFaultInjector fault_;
     std::mutex execution_mutex_;
 };
 

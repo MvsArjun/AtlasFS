@@ -159,8 +159,12 @@ idempotent across restart and conflicting reuse is rejected.
 TCP send and receive waits are bounded to five seconds by default. Once a
 mutating request may have been sent, a timeout, disconnect, malformed response,
 or lost response is conservatively reported as an unknown result. The client
-does not retry automatically. A successful physical response still does not make
-the replica authoritative; only the subsequent coordinator catalog CAS does.
+does not retry automatically. An explicit coordinator reconciliation may replay
+the byte-equivalent request with the same plan and execution IDs; the durable
+target journal then returns the recorded result or rejects a conflicting reuse.
+This recovery behavior adds no wire fields or message types. A successful
+physical response still does not make the replica authoritative; only the
+subsequent coordinator catalog CAS does.
 
 The current trust boundary is the existing coordinator-to-storage-node channel
 and validated node identity. AtlasFS does not yet provide cryptographic peer

@@ -60,14 +60,16 @@ public:
     void stop() noexcept;
 private:
     struct Record {
-        storage_node_protocol::OperationState state;
+        storage_node_protocol::OperationState state{
+            storage_node_protocol::OperationState::unknown};
         std::uint32_t fingerprint{};
         std::uint32_t probe_chunk{};
         std::string object_id;
         std::string generation_id;
     };
     struct RepairRecord {
-        storage_node_protocol::RepairResponseStatus status;
+        storage_node_protocol::RepairResponseStatus status{
+            storage_node_protocol::RepairResponseStatus::target_rejected};
         std::uint32_t fingerprint{};
         std::uint32_t chunk_index{};
         std::string plan_id;

@@ -67,6 +67,16 @@ inspection. Historical operation records remain immutable. There is no automatic
 approval, execution, retry, replan, source/target reselection, or background
 repair.
 
+Interrupted repair execution is reconciled only through an explicit
+`RepairExecutor::reconcile` call. Reconciliation accepts a durable `EXECUTING`
+plan or a narrowly defined ambiguous failure, revalidates the original
+membership, health, placement, and catalog evidence, and reuses the original
+execution ID. A lost remote response is resolved by replaying that exact request
+against the target's durable idempotency journal. If the catalog contains the
+one exact transition the plan would have committed, reconciliation finishes the
+durable plan without copying again; any other catalog or membership change marks
+the plan stale. Startup itself still performs no repair action.
+
 An authoritative current-replica catalog abstraction is now durable in the
 separate `coordinator/replicas/catalog` snapshot. Its strict, versioned `ARPC` format
 records generation-aware chunk identity and metadata together with sorted replica
@@ -134,4 +144,5 @@ transfers one bounded logical object per PUT or GET.
 Node membership, plans, and replication orchestration are in-process and
 single-threaded. Storage roots, chunks, manifests, and current replica metadata
 are durable and independent. Multiple catalog writers, automatic repair,
-consensus, and production concurrency remain deliberately out of scope.
+consensus, transport authentication, and production concurrency remain
+deliberately out of scope.

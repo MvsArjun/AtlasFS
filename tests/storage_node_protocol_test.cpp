@@ -83,7 +83,8 @@ TEST(StorageNodeProtocol, RejectsTruncationUnknownVersionAndUnsafeIdentifiers) {
     encoded[1] = std::byte{3};
     EXPECT_FALSE(snp::decode_get_chunk(encoded));
     EXPECT_FALSE(snp::valid_operation_id("../operation"));
-    EXPECT_THROW(snp::encode_identity({"../operation", "object", "generation-rpc"}),
+    EXPECT_THROW(static_cast<void>(snp::encode_identity(
+        {"../operation", "object", "generation-rpc"})),
                  std::invalid_argument);
 }
 
@@ -105,11 +106,13 @@ TEST(StorageNodeProtocol, StrictlyRejectsMalformedRepairPayloads) {
     auto reserved = encoded;
     reserved[3] = std::byte{1};
     EXPECT_FALSE(snp::decode_repair_chunk(reserved));
-    EXPECT_THROW(snp::encode_repair_chunk({"repair-plan", "execution-1", "../node",
-        "object", manifest(), manifest().chunks[1], {std::byte{5}}}),
+    EXPECT_THROW(static_cast<void>(snp::encode_repair_chunk(
+        {"repair-plan", "execution-1", "../node", "object", manifest(),
+         manifest().chunks[1], {std::byte{5}}})),
         std::invalid_argument);
-    EXPECT_THROW(snp::encode_repair_chunk({"../plan", "execution-1", "node-b",
-        "object", manifest(), manifest().chunks[1], {std::byte{5}}}),
+    EXPECT_THROW(static_cast<void>(snp::encode_repair_chunk(
+        {"../plan", "execution-1", "node-b", "object", manifest(),
+         manifest().chunks[1], {std::byte{5}}})),
         std::invalid_argument);
 }
 

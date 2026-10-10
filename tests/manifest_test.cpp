@@ -98,7 +98,7 @@ TEST(Manifest, RejectsOversizedObjectAndChunkCountBeforeAllocation) {
 TEST(Manifest, EncoderRejectsInconsistentMetadata) {
     auto manifest = sample_manifest();
     manifest.chunks[1].index = 5;
-    EXPECT_THROW(encode_manifest(manifest), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_manifest(manifest)), std::invalid_argument);
 }
 
 }  // namespace

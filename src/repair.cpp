@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iterator>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -131,7 +132,7 @@ bool valid_plan(const RepairPlan& value) {
     if (value.metadata_committed && (!value.verification_succeeded ||
                                      !value.publication_succeeded)) return false;
     if (value.state == RepairPlanState::completed && !value.metadata_committed) return false;
-    if (value.last_error > RepairExecutionError::remote_target_rejected) return false;
+    if (value.last_error > RepairExecutionError::recovery_interrupted) return false;
     if ((value.state == RepairPlanState::planned || value.state == RepairPlanState::approved ||
          value.state == RepairPlanState::executing || value.state == RepairPlanState::completed ||
          value.state == RepairPlanState::unrecoverable) &&
@@ -209,19 +210,23 @@ PlanningResult RepairPlanner::plan(const metadata::PlacementPlan& placement,
         const auto deficit = placement.replication_factor > healthy_count
             ? placement.replication_factor - healthy_count : 0U;
         for (std::uint32_t slot = 0; slot < deficit; ++slot) {
-            RepairPlan repair{plan_id(placement.object_id, placement.generation_id,
-                    chunk.chunk.index, membership.version,
-                    catalog.catalog_version, slot), placement.object_id,
-                placement.generation_id, chunk.chunk.index, {}, {}, membership.version,
-                health_version, placement.replication_factor, replicas,
-                (replicas.size() < placement.replication_factor ||
-                 std::any_of(catalog_record->replicas.begin(), catalog_record->replicas.end(),
+            RepairPlan repair;
+            repair.plan_id = plan_id(placement.object_id, placement.generation_id,
+                chunk.chunk.index, membership.version, catalog.catalog_version, slot);
+            repair.object_id = placement.object_id;
+            repair.generation_id = placement.generation_id;
+            repair.chunk_index = chunk.chunk.index;
+            repair.membership_version = membership.version;
+            repair.health_evidence = health_version;
+            repair.replication_factor = placement.replication_factor;
+            repair.observed_replicas = replicas;
+            repair.reason = (replicas.size() < placement.replication_factor ||
+                std::any_of(catalog_record->replicas.begin(), catalog_record->replicas.end(),
                     [](const auto& replica) {
                         return replica.state == metadata::CatalogReplicaState::missing ||
                             replica.state == metadata::CatalogReplicaState::corrupt;
                     })) ? RepairReason::replica_missing
-                        : RepairReason::replica_unavailable,
-                RepairPlanState::planned};
+                        : RepairReason::replica_unavailable;
             repair.catalog_version = catalog.catalog_version;
             repair.observed_catalog_replicas = catalog_record->replicas;
             if (sources.empty()) {
@@ -406,6 +411,10 @@ RepairStoreError RepairPlanStore::update(const RepairPlan& value) {
         (old.state == RepairPlanState::executing &&
             (value.state == RepairPlanState::completed || value.state == RepairPlanState::failed ||
              value.state == RepairPlanState::stale)) ||
+        (old.state == RepairPlanState::failed && value.state == RepairPlanState::executing &&
+            (old.last_error == RepairExecutionError::remote_result_unknown ||
+             old.last_error == RepairExecutionError::catalog_durability_unknown ||
+             old.last_error == RepairExecutionError::metadata_commit_failure)) ||
         (old.state == value.state &&
          (old.state == RepairPlanState::executing || old == value)));
     return transition ? persist(value) : RepairStoreError::conflict;
@@ -450,8 +459,9 @@ const std::filesystem::path& RepairPlanStore::plans_directory() const noexcept {
 
 RepairExecutor::RepairExecutor(RepairPlanStore& plans,
     metadata::DurableReplicaCatalog& catalog,
-    std::vector<std::shared_ptr<replication::StorageNode>> nodes)
-    : plans_(plans), catalog_(catalog) {
+    std::vector<std::shared_ptr<replication::StorageNode>> nodes,
+    RepairExecutionFaultInjector fault)
+    : plans_(plans), catalog_(catalog), fault_(std::move(fault)) {
     for (auto& node : nodes) {
         if (!node || !nodes_.emplace(std::string(node->id()), node).second)
             throw std::invalid_argument("repair executor requires distinct nodes");
@@ -478,20 +488,116 @@ RepairStoreError RepairExecutor::cancel(std::string_view plan_id_value) {
 RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
     metadata::PlacementPlan& placement, const metadata::MembershipSnapshot& membership) {
     const std::scoped_lock lock(execution_mutex_);
+    return execute_locked(plan_id_value, placement, membership, false);
+}
+
+RepairExecutionResult RepairExecutor::reconcile(std::string_view plan_id_value,
+    metadata::PlacementPlan& placement, const metadata::MembershipSnapshot& membership) {
+    const std::scoped_lock lock(execution_mutex_);
+    return execute_locked(plan_id_value, placement, membership, true);
+}
+
+RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_value,
+    metadata::PlacementPlan& placement, const metadata::MembershipSnapshot& membership,
+    bool recovering) {
     auto plan = plans_.get(plan_id_value);
     if (!plan) return {RepairExecutionError::plan_not_found, RepairPlanState::planned};
     if (plan->state == RepairPlanState::completed)
         return {RepairExecutionError::already_completed, plan->state};
     if (plan->state == RepairPlanState::cancelled)
         return {RepairExecutionError::cancelled, plan->state};
-    if (plan->state != RepairPlanState::approved)
+    const bool recoverable_failure = plan->state == RepairPlanState::failed &&
+        (plan->last_error == RepairExecutionError::remote_result_unknown ||
+         plan->last_error == RepairExecutionError::catalog_durability_unknown ||
+         plan->last_error == RepairExecutionError::metadata_commit_failure);
+    const bool replay_unknown_publication = recoverable_failure &&
+        plan->last_error == RepairExecutionError::remote_result_unknown;
+    if (recovering) {
+        if (plan->state != RepairPlanState::executing && !recoverable_failure)
+            return {RepairExecutionError::not_reconcilable, plan->state};
+    } else if (plan->state != RepairPlanState::approved) {
         return {RepairExecutionError::not_approved, plan->state};
+    }
+    if (recoverable_failure) {
+        plan->state = RepairPlanState::executing;
+        plan->last_error = RepairExecutionError::none;
+        if (plans_.update(*plan) != RepairStoreError::none)
+            return {RepairExecutionError::persistence_failure, RepairPlanState::failed};
+    }
 
     const metadata::ChunkIdentity identity{plan->object_id, plan->generation_id,
                                            plan->chunk_index};
+    const auto chunk_it = std::find_if(placement.chunks.begin(), placement.chunks.end(),
+        [&](const auto& chunk) { return chunk.chunk.index == plan->chunk_index; });
+    if (chunk_it == placement.chunks.end()) {
+        plan->state = RepairPlanState::stale;
+        plan->last_error = RepairExecutionError::stale;
+        if (plans_.update(*plan) != RepairStoreError::none)
+            return {RepairExecutionError::persistence_failure, plan->state};
+        return {RepairExecutionError::stale, plan->state};
+    }
+    const auto member = [&](std::string_view id) -> const metadata::StorageNode* {
+        const auto found = std::find_if(membership.nodes.begin(), membership.nodes.end(),
+            [&](const auto& node) { return node.node_id == id; });
+        return found == membership.nodes.end() ? nullptr : &*found;
+    };
+    const auto eligible = [](const metadata::StorageNode* node) {
+        return node && node->state == metadata::NodeState::active &&
+            node->health == metadata::NodeHealthState::healthy && node->health_current;
+    };
+    auto desired_replicas = plan->observed_catalog_replicas;
+    if (desired_replicas.size() >= plan->replication_factor) {
+        const auto replace = std::find_if(desired_replicas.begin(), desired_replicas.end(),
+            [&](const auto& replica) {
+                return replica.state != metadata::CatalogReplicaState::present ||
+                    !eligible(member(replica.node_id));
+            });
+        if (replace != desired_replicas.end()) desired_replicas.erase(replace);
+    }
+    desired_replicas.push_back({plan->target_node,
+        metadata::CatalogReplicaState::present, chunk_it->chunk.checksum,
+        membership.version});
+    std::sort(desired_replicas.begin(), desired_replicas.end(),
+        [](const auto& left, const auto& right) { return left.node_id < right.node_id; });
+
     auto catalog_snapshot = catalog_.snapshot();
-    if (planner_.validate(*plan, placement, membership, catalog_snapshot) !=
-            PlanValidation::current) {
+    auto validation = planner_.validate(*plan, placement, membership, catalog_snapshot);
+    if (recovering && validation == PlanValidation::stale_catalog) {
+        auto evidence_snapshot = catalog_snapshot;
+        evidence_snapshot.catalog_version = plan->catalog_version;
+        const metadata::ChunkIdentity planned_identity{
+            plan->object_id, plan->generation_id, plan->chunk_index};
+        const auto record = std::find_if(evidence_snapshot.records.begin(),
+            evidence_snapshot.records.end(), [&](auto& value) {
+                return value.identity == planned_identity;
+            });
+        if (record != evidence_snapshot.records.end()) {
+            record->catalog_version = plan->catalog_version;
+            record->replicas = plan->observed_catalog_replicas;
+            if (planner_.validate(*plan, placement, membership, evidence_snapshot) ==
+                    PlanValidation::current) {
+                const auto current = catalog_.get(identity);
+                if (plan->catalog_version != std::numeric_limits<std::uint64_t>::max() &&
+                    catalog_snapshot.catalog_version == plan->catalog_version + 1U &&
+                    current && current->catalog_version == plan->catalog_version + 1U &&
+                    current->replicas == desired_replicas) {
+                    auto& placement_replicas = placement.chunks[static_cast<std::size_t>(
+                        std::distance(placement.chunks.begin(), chunk_it))].replica_node_ids;
+                    placement_replicas.clear();
+                    for (const auto& replica : desired_replicas)
+                        placement_replicas.push_back(replica.node_id);
+                    plan->metadata_committed = true;
+                    plan->state = RepairPlanState::completed;
+                    plan->last_error = RepairExecutionError::none;
+                    if (plans_.update(*plan) != RepairStoreError::none)
+                        return {RepairExecutionError::persistence_failure,
+                                RepairPlanState::executing};
+                    return {RepairExecutionError::none, plan->state};
+                }
+            }
+        }
+    }
+    if (validation != PlanValidation::current) {
         plan->state = RepairPlanState::stale;
         plan->last_error = RepairExecutionError::stale;
         if (plans_.update(*plan) != RepairStoreError::none)
@@ -506,15 +612,6 @@ RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
                                          RepairPlanState::approved};
         return RepairExecutionResult{error, plan->state};
     };
-    auto member = [&](std::string_view id) -> const metadata::StorageNode* {
-        const auto found = std::find_if(membership.nodes.begin(), membership.nodes.end(),
-            [&](const auto& node) { return node.node_id == id; });
-        return found == membership.nodes.end() ? nullptr : &*found;
-    };
-    const auto eligible = [](const metadata::StorageNode* node) {
-        return node && node->state == metadata::NodeState::active &&
-            node->health == metadata::NodeHealthState::healthy && node->health_current;
-    };
     if (!eligible(member(plan->source_node)))
         return stale(RepairExecutionError::source_unavailable);
     if (!eligible(member(plan->target_node)))
@@ -524,9 +621,6 @@ RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
     if (source == nodes_.end()) return stale(RepairExecutionError::source_unavailable);
     if (target == nodes_.end()) return stale(RepairExecutionError::target_unavailable);
 
-    const auto chunk_it = std::find_if(placement.chunks.begin(), placement.chunks.end(),
-        [&](const auto& chunk) { return chunk.chunk.index == plan->chunk_index; });
-    if (chunk_it == placement.chunks.end()) return stale(RepairExecutionError::stale);
     const auto source_chunk = source->second->get_chunk(
         plan->object_id, plan->generation_id, plan->chunk_index);
     if (source_chunk.error == storage::StoreError::not_found)
@@ -558,10 +652,14 @@ RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
         return stale(RepairExecutionError::target_unavailable);
     }
 
-    plan->state = RepairPlanState::executing;
-    plan->execution_id = execution_id(plan->plan_id);
-    if (plans_.update(*plan) != RepairStoreError::none)
-        return {RepairExecutionError::persistence_failure, RepairPlanState::approved};
+    if (!recovering) {
+        plan->state = RepairPlanState::executing;
+        plan->execution_id = execution_id(plan->plan_id);
+        if (plans_.update(*plan) != RepairStoreError::none)
+            return {RepairExecutionError::persistence_failure, RepairPlanState::approved};
+    }
+    if (fault_ && fault_(RepairExecutionFaultPoint::after_executing_persist))
+        return {RepairExecutionError::recovery_interrupted, RepairPlanState::executing};
 
     // Final coordinator-local evidence check is intentionally adjacent to the
     // transfer. The mutex serializes competing executions in this executor.
@@ -575,7 +673,7 @@ RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
         return {RepairExecutionError::stale, plan->state};
     }
 
-    if (existing.error != storage::StoreError::none) {
+    if (existing.error != storage::StoreError::none || replay_unknown_publication) {
         const auto published = target->second->publish_repair(
             plan->plan_id, plan->execution_id, plan->target_node, plan->object_id,
             source_chunk.manifest, source_chunk.chunk, source_chunk.data);
@@ -634,21 +732,9 @@ RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
     plan->verification_succeeded = true;
     if (plans_.update(*plan) != RepairStoreError::none)
         return {RepairExecutionError::persistence_failure, plan->state};
+    if (fault_ && fault_(RepairExecutionFaultPoint::after_publication_persist))
+        return {RepairExecutionError::recovery_interrupted, RepairPlanState::executing};
 
-    auto desired_replicas = plan->observed_catalog_replicas;
-    if (desired_replicas.size() >= plan->replication_factor) {
-        const auto replace = std::find_if(desired_replicas.begin(), desired_replicas.end(),
-            [&](const auto& replica) {
-                return replica.state != metadata::CatalogReplicaState::present ||
-                    !eligible(member(replica.node_id));
-            });
-        if (replace != desired_replicas.end()) desired_replicas.erase(replace);
-    }
-    desired_replicas.push_back({plan->target_node,
-        metadata::CatalogReplicaState::present, source_chunk.chunk.checksum,
-        membership.version});
-    std::sort(desired_replicas.begin(), desired_replicas.end(),
-        [](const auto& left, const auto& right) { return left.node_id < right.node_id; });
     const auto committed = catalog_.compare_exchange({identity, plan->catalog_version,
         plan->observed_catalog_replicas, desired_replicas});
     if (committed.status != metadata::ReplicaCatalogCasStatus::committed) {
@@ -670,6 +756,8 @@ RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
                     RepairPlanState::executing};
         return {error, plan->state};
     }
+    if (fault_ && fault_(RepairExecutionFaultPoint::after_catalog_commit))
+        return {RepairExecutionError::recovery_interrupted, RepairPlanState::executing};
     auto& placement_replicas = placement.chunks[static_cast<std::size_t>(
         std::distance(placement.chunks.begin(), chunk_it))].replica_node_ids;
     placement_replicas.clear();

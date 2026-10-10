@@ -96,7 +96,7 @@ std::optional<std::string> PlacementPolicy::select(
 
 std::vector<std::string> RendezvousPlacement::rank(
     const ChunkIdentity& chunk, std::span<const StorageNode> eligible_nodes) const {
-    struct RankedNode { std::uint64_t score; std::string node_id; };
+    struct RankedNode { std::uint64_t score{}; std::string node_id; };
     std::vector<RankedNode> ranked;
     ranked.reserve(eligible_nodes.size());
     for (const auto& node : eligible_nodes) {

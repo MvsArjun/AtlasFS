@@ -348,10 +348,29 @@ verified target; otherwise it adds the target without rewriting healthy entries.
 ARPL v3 stores catalog evidence in addition to approval, execution state, step
 outcomes, execution identity, and typed terminal failure. An EXECUTING record
 found after restart is never resumed automatically and exposes the completed
-steps for inspection. Physical publication is deliberately distinct from
-authoritative catalog commitment. If the CAS fails, the verified target remains
-present but non-authoritative for later operator-directed reconciliation. AtlasFS
-serializes catalog writers within one coordinator, not independent processes.
+steps for inspection.
+
+An operator may explicitly pass such a record to `RepairExecutor::reconcile`.
+The same path also accepts only FAILED records whose result was ambiguous at the
+remote publication or catalog durability boundary. Reconciliation first checks
+the original membership version, complete health evidence, placement identity,
+and catalog evidence; it never replans, changes source or target, or generates a
+new execution ID. For a lost remote response it replays the exact publication,
+allowing the target's durable fingerprint journal to return the prior result.
+For an interrupted EXECUTING record it verifies any existing target bytes before
+continuing.
+
+The catalog is handled as a three-way decision. If it still equals the plan's
+original evidence, execution may continue with the original compare-and-swap. If
+its global version is exactly the next version and the affected record equals
+the exact replica set the plan would have committed, the coordinator recognizes
+that its pre-crash CAS succeeded and durably completes the plan without copying.
+Every other catalog state is stale. This deliberately rejects even apparently
+compatible later catalog versions because another writer may have acted after
+the repair. Physical publication remains distinct from authoritative catalog
+commitment; a rejected reconciliation leaves the verified bytes available for
+inspection but does not make them authoritative. AtlasFS serializes catalog
+writers within one coordinator, not independent processes.
 
 A storage node has a stable validated node ID, host, port, and coordinator-owned
 state. ACTIVE nodes are eligible for new placement. DRAINING nodes remain known
@@ -399,7 +418,7 @@ durable operation records. Object data and manifests remain durable.
 
 ## Intended evolution
 
-The next dependency is distributed repair crash recovery and reconciliation,
-especially coordinator crashes between physical publication and authoritative
-catalog commitment. Consensus, cross-process catalog writers, automatic retries,
-and automatic operation recovery remain deferred.
+The next dependency is authenticated coordinator-to-node transport and durable
+operator-facing audit/reporting around recovery decisions. Consensus,
+cross-process catalog writers, automatic retries, automatic repair, and automatic
+operation recovery remain deferred.

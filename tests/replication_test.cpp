@@ -123,7 +123,7 @@ TEST(ReplicaManager, RefusesAnUnderReplicatedPlanBeforeWriting) {
 }
 
 TEST(ReplicaManager, RollsBackFirstMiddleAndLastReplicaWriteFailures) {
-    for (const auto failed_id : {std::string("node-a"), std::string("node-b"),
+    for (const auto& failed_id : {std::string("node-a"), std::string("node-b"),
                                  std::string("node-c")}) {
         TemporaryDirectory directory;
         const auto data = sample_data();

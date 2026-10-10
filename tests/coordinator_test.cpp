@@ -45,7 +45,7 @@ TEST(MetadataCoordinator, PlacesChunkOnOnlyActiveNode) {
 
 TEST(MetadataCoordinator, ProducesDeterministicPlacementForOneTwoAndThreeNodes) {
     const ChunkIdentity chunk{"object", "generation-1", 7};
-    for (const std::vector<std::string> ids : {
+    for (const std::vector<std::string>& ids : {
              std::vector<std::string>{"node-a"},
              std::vector<std::string>{"node-a", "node-b"},
              std::vector<std::string>{"node-a", "node-b", "node-c"}}) {

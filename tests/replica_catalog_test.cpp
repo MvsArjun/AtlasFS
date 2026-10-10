@@ -215,32 +215,32 @@ TEST(ReplicaCatalogSerialization, RejectsReservedStateAndCountViolations) {
 TEST(ReplicaCatalogSerialization, RejectsInvalidIdentityStateAndEvidence) {
     auto value = snapshot();
     value.records[0].identity.object_id = "../object";
-    EXPECT_THROW(encode_replica_catalog(value), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_replica_catalog(value)), std::invalid_argument);
 
     value = snapshot();
     value.records[0].identity.generation_id = "bad/generation";
-    EXPECT_THROW(encode_replica_catalog(value), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_replica_catalog(value)), std::invalid_argument);
 
     value = snapshot();
     value.records[0].chunk.index = 1;
-    EXPECT_THROW(encode_replica_catalog(value), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_replica_catalog(value)), std::invalid_argument);
 
     value = snapshot();
     value.records[0].replicas[0].node_id = "bad/node";
-    EXPECT_THROW(encode_replica_catalog(value), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_replica_catalog(value)), std::invalid_argument);
 
     value = snapshot();
     value.records[0].replicas[0].state =
         static_cast<CatalogReplicaState>(99);
-    EXPECT_THROW(encode_replica_catalog(value), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_replica_catalog(value)), std::invalid_argument);
 
     value = snapshot();
     value.records[0].replicas[0].integrity_checksum++;
-    EXPECT_THROW(encode_replica_catalog(value), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_replica_catalog(value)), std::invalid_argument);
 
     value = snapshot();
     value.records[0].replicas[0].evidence_version = 0;
-    EXPECT_THROW(encode_replica_catalog(value), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_replica_catalog(value)), std::invalid_argument);
 
     const auto canonical = snapshot();
     const auto encoded = encode_replica_catalog(canonical);
@@ -279,11 +279,11 @@ TEST(ReplicaCatalogSerialization, RejectsInvalidIdentityStateAndEvidence) {
 TEST(ReplicaCatalogSerialization, RejectsNonCanonicalReplicaAndRecordOrdering) {
     auto value = snapshot();
     std::swap(value.records[0].replicas[0], value.records[0].replicas[1]);
-    EXPECT_THROW(encode_replica_catalog(value), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_replica_catalog(value)), std::invalid_argument);
 
     value = snapshot();
     value.records[0].replicas.push_back(value.records[0].replicas.back());
-    EXPECT_THROW(encode_replica_catalog(value), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(encode_replica_catalog(value)), std::invalid_argument);
 
     auto first = snapshot().records.front();
     first.identity.object_id = "object-b";
@@ -291,12 +291,12 @@ TEST(ReplicaCatalogSerialization, RejectsNonCanonicalReplicaAndRecordOrdering) {
     auto second = snapshot().records.front();
     second.identity.object_id = "object-a";
     second.catalog_version = 2;
-    EXPECT_THROW(encode_replica_catalog({2, {first, second}}),
+    EXPECT_THROW(static_cast<void>(encode_replica_catalog({2, {first, second}})),
                  std::invalid_argument);
 
     std::swap(first, second);
     second.catalog_version = first.catalog_version;
-    EXPECT_THROW(encode_replica_catalog({2, {first, second}}),
+    EXPECT_THROW(static_cast<void>(encode_replica_catalog({2, {first, second}})),
                  std::invalid_argument);
 }
 

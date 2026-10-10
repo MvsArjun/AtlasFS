@@ -343,10 +343,10 @@ bool StorageNodeServer::persist_repair(
 }
 
 protocol::Message StorageNodeServer::handle(const protocol::Message& request) {
-    auto reply = [&](protocol::MessageType type, snp::Response response) {
+    auto reply = [&](protocol::MessageType type, const snp::Response& response) {
         return protocol::Message{type, 0, request.request_id, snp::encode_response(response)};
     };
-    auto repair_reply = [&](snp::RepairResponse response) {
+    auto repair_reply = [&](const snp::RepairResponse& response) {
         return protocol::Message{protocol::MessageType::storage_repair_chunk_response,
             0, request.request_id, snp::encode_repair_response(response)};
     };
