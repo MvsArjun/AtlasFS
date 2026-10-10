@@ -56,12 +56,16 @@ data and never rewrites historical operation records.
 Approved plans may be executed explicitly through `RepairExecutor`. Execution is
 locally serialized, revalidates membership, health, generation, chunk, and exact
 catalog evidence immediately before transfer, and journals progress in ARPL v3.
-Local targets stage, sync, reread, and verify repair bytes before atomic
-publication. Completion requires a durable catalog compare-and-swap against the
-plan's evidence; a conflict makes the plan stale and unknown post-rename
-durability is a typed failure. Historical operation records remain immutable.
-There is no automatic approval, execution, retry, replan, source/target
-reselection, or background repair.
+Local and remote targets use the same repair-publisher boundary. Remote requests
+bind plan, execution, target-node, object, generation, manifest, chunk, and
+integrity evidence without accepting filesystem paths. Targets stage, sync,
+reread, and verify repair bytes before atomic publication. Completion requires a
+confirmed physical publication followed by a durable catalog compare-and-swap
+against the plan's evidence. A lost remote response remains explicitly unknown;
+a CAS conflict leaves a physical but non-authoritative replica for operator
+inspection. Historical operation records remain immutable. There is no automatic
+approval, execution, retry, replan, source/target reselection, or background
+repair.
 
 An authoritative current-replica catalog abstraction is now durable in the
 separate `coordinator/replicas/catalog` snapshot. Its strict, versioned `ARPC` format
@@ -82,12 +86,25 @@ deliberately deferred.
 ## Build and test
 
 Prerequisites: CMake 3.20+, a C++20 compiler, Git, and network access on the first
-configure (CMake fetches the pinned GoogleTest release).
+configure (CMake fetches the pinned GoogleTest release). The filesystem and
+networking implementation requires a POSIX environment.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
+```
+
+On Windows, the MSYS2 MSYS runtime provides the required POSIX interfaces. From
+an MSYS2 MSYS shell, install and use the reproducible toolchain as follows (the
+MinGW shells target the native Windows API and are not suitable here):
+
+```sh
+pacman -Syu
+pacman -S --needed gcc cmake ninja git
+cmake -S . -B build-msys -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-msys --parallel
+ctest --test-dir build-msys --output-on-failure
 ```
 
 The project enables `-Wall -Wextra -Wpedantic` on GCC and Clang. See

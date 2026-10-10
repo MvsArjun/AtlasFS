@@ -199,7 +199,7 @@ TEST(StorageIntegration, ReportsPersistedCorruptionWithoutReturningData) {
         client.close();
         server.stop_and_rethrow();
     }
-    const auto object_path = directory.path() / "objects" / "object";
+    const auto object_path = directory.path() / "objects" / "committed" / "object";
     std::filesystem::resize_file(object_path, std::filesystem::file_size(object_path) - 1U);
     {
         RunningStorageServer server(directory.path());

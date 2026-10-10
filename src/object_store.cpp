@@ -521,8 +521,9 @@ StoreError ObjectStore::publish_repair_chunk(
             return StoreError::filesystem_error;
         }
         std::filesystem::rename(temporary, generation_manifest, error);
-        if (error || sync_directory(generation) != StoreError::none)
-            return StoreError::filesystem_error;
+        if (error) return StoreError::filesystem_error;
+        if (sync_directory(generation) != StoreError::none)
+            return StoreError::result_unknown;
     }
     const auto final_chunk = generation / chunk_filename(chunk.index);
     if (const auto existing = read_regular_file(final_chunk, chunk.length)) {
@@ -548,8 +549,9 @@ StoreError ObjectStore::publish_repair_chunk(
             return StoreError::filesystem_error;
         }
         std::filesystem::rename(temporary_chunk, final_chunk, error);
-        if (error || sync_directory(generation) != StoreError::none)
-            return StoreError::filesystem_error;
+        if (error) return StoreError::filesystem_error;
+        if (sync_directory(generation) != StoreError::none)
+            return StoreError::result_unknown;
     }
 
     if (!committed) {
@@ -568,8 +570,9 @@ StoreError ObjectStore::publish_repair_chunk(
             return StoreError::filesystem_error;
         }
         std::filesystem::rename(temporary_manifest, object_path(object_id), error);
-        if (error || sync_directory(objects_directory_) != StoreError::none)
-            return StoreError::filesystem_error;
+        if (error) return StoreError::filesystem_error;
+        if (sync_directory(objects_directory_) != StoreError::none)
+            return StoreError::result_unknown;
     }
     return StoreError::none;
 }
@@ -628,6 +631,7 @@ std::filesystem::path ObjectStore::next_temporary_path() {
 }
 
 StoreError ObjectStore::sync_directory(const std::filesystem::path& path) const noexcept {
+    if (should_fail(PutFaultPoint::directory_sync)) return StoreError::filesystem_error;
     FileDescriptor directory(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     if (!directory.valid()) { return StoreError::filesystem_error; }
     int result;
@@ -680,6 +684,10 @@ void ObjectStore::clean_incomplete_state() {
     for (const auto& generation : referenced) {
         removals.clear();
         const auto directory = chunks_directory_ / generation;
+        if (!std::filesystem::exists(directory, error)) {
+            if (error) break;
+            continue;
+        }
         for (std::filesystem::directory_iterator it(directory, error), end;
              !error && it != end; it.increment(error)) {
             if (it->path().filename().string().starts_with(".repair-"))

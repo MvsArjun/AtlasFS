@@ -203,7 +203,9 @@ TEST(ReplicaManager, FailedReplacementPreservesOldGeneration) {
     };
     auto nodes = make_nodes(directory.path(), {}, {}, commit_failure);
     ReplicaManager manager(as_storage_nodes(nodes));
-    EXPECT_EQ(manager.put(new_plan, new_data).status, ReplicationStatus::replica_write_failed);
+    const auto replacement = manager.put(new_plan, new_data);
+    EXPECT_EQ(replacement.status, ReplicationStatus::replica_write_failed)
+        << "rollback failures: " << ::testing::PrintToString(replacement.rollback_failed_nodes);
     const auto restored = manager.get(old_plan);
     EXPECT_EQ(restored.status, ReplicationStatus::success);
     EXPECT_EQ(restored.data, old_data);

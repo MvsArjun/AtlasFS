@@ -1,6 +1,8 @@
 #include "atlasfs/storage_node_protocol.hpp"
 
+#include "atlasfs/node_registry.hpp"
 #include "atlasfs/object_protocol.hpp"
+#include "atlasfs/protocol.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -59,6 +61,11 @@ bool valid_generation_id(std::string_view value) {
               (c >= '0' && c <= '9') || c == '-')) return false;
     }
     return true;
+}
+
+bool valid_repair_status(RepairResponseStatus value) {
+    return value >= RepairResponseStatus::published &&
+           value <= RepairResponseStatus::result_unknown;
 }
 
 }  // namespace
@@ -154,6 +161,105 @@ std::optional<GetChunkRequest> decode_get_chunk(std::span<const std::byte> bytes
         value.chunk_index >= storage::kMaxChunkCount ||
         !storage::ObjectStore::valid_object_id(value.object_id) ||
         !valid_generation_id(value.generation_id)) return std::nullopt;
+    return value;
+}
+
+std::vector<std::byte> encode_repair_chunk(const RepairChunkRequest& request) {
+    if (!valid_operation_id(request.plan_id) ||
+        !valid_operation_id(request.execution_id) ||
+        !metadata::NodeRegistry::valid_node_id(request.target_node_id) ||
+        !storage::ObjectStore::valid_object_id(request.object_id) ||
+        request.chunk.index >= storage::kMaxChunkCount ||
+        request.data.size() > object_protocol::kMaxObjectDataSize) {
+        throw std::invalid_argument("invalid repair request");
+    }
+    const auto manifest = storage::encode_manifest(request.manifest);
+    std::vector<std::byte> out;
+    prefix(out);
+    append(out, std::uint16_t{0});
+    append_string(out, request.plan_id);
+    append_string(out, request.execution_id);
+    append_string(out, request.target_node_id);
+    append_string(out, request.object_id);
+    append(out, static_cast<std::uint32_t>(manifest.size()));
+    out.insert(out.end(), manifest.begin(), manifest.end());
+    append(out, request.chunk.index);
+    append(out, request.chunk.length);
+    append(out, request.chunk.checksum);
+    append(out, static_cast<std::uint32_t>(request.data.size()));
+    out.insert(out.end(), request.data.begin(), request.data.end());
+    if (out.size() > protocol::kDefaultMaxPayloadSize) {
+        throw std::length_error("repair request exceeds frame limit");
+    }
+    return out;
+}
+
+std::optional<RepairChunkRequest> decode_repair_chunk(
+    std::span<const std::byte> bytes) {
+    RepairChunkRequest value;
+    std::size_t at = 0;
+    std::uint16_t reserved{};
+    std::uint32_t size{};
+    if (bytes.size() > protocol::kDefaultMaxPayloadSize ||
+        !take_prefix(bytes, at) || !take(bytes, at, reserved) || reserved != 0 ||
+        !take_string(bytes, at, kMaxOperationIdSize, value.plan_id) ||
+        !take_string(bytes, at, kMaxOperationIdSize, value.execution_id) ||
+        !take_string(bytes, at, metadata::kMaxNodeIdSize, value.target_node_id) ||
+        !take_string(bytes, at, object_protocol::kMaxObjectIdSize, value.object_id) ||
+        !valid_operation_id(value.plan_id) || !valid_operation_id(value.execution_id) ||
+        !metadata::NodeRegistry::valid_node_id(value.target_node_id) ||
+        !storage::ObjectStore::valid_object_id(value.object_id) ||
+        !take(bytes, at, size) || size > bytes.size() - at) {
+        return std::nullopt;
+    }
+    const auto manifest = storage::decode_manifest(bytes.subspan(at, size));
+    if (!manifest) return std::nullopt;
+    value.manifest = *manifest;
+    at += size;
+    if (!take(bytes, at, value.chunk.index) ||
+        !take(bytes, at, value.chunk.length) ||
+        !take(bytes, at, value.chunk.checksum) ||
+        value.chunk.index >= storage::kMaxChunkCount ||
+        !take(bytes, at, size) || size > object_protocol::kMaxObjectDataSize ||
+        size != bytes.size() - at) {
+        return std::nullopt;
+    }
+    value.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(at), bytes.end());
+    return value;
+}
+
+std::vector<std::byte> encode_repair_response(const RepairResponse& response) {
+    if (!valid_repair_status(response.status) ||
+        !valid_operation_id(response.plan_id) ||
+        !valid_operation_id(response.execution_id)) {
+        throw std::invalid_argument("invalid repair response");
+    }
+    std::vector<std::byte> out;
+    prefix(out);
+    append(out, std::uint16_t{0});
+    append(out, static_cast<std::uint16_t>(response.status));
+    append_string(out, response.plan_id);
+    append_string(out, response.execution_id);
+    append(out, response.request_fingerprint);
+    return out;
+}
+
+std::optional<RepairResponse> decode_repair_response(
+    std::span<const std::byte> bytes) {
+    RepairResponse value;
+    std::size_t at = 0;
+    std::uint16_t reserved{}, status{};
+    if (!take_prefix(bytes, at) || !take(bytes, at, reserved) || reserved != 0 ||
+        !take(bytes, at, status) ||
+        status > static_cast<std::uint16_t>(RepairResponseStatus::result_unknown) ||
+        !take_string(bytes, at, kMaxOperationIdSize, value.plan_id) ||
+        !take_string(bytes, at, kMaxOperationIdSize, value.execution_id) ||
+        !take(bytes, at, value.request_fingerprint) || at != bytes.size()) {
+        return std::nullopt;
+    }
+    value.status = static_cast<RepairResponseStatus>(status);
+    if (!valid_repair_status(value.status) || !valid_operation_id(value.plan_id) ||
+        !valid_operation_id(value.execution_id)) return std::nullopt;
     return value;
 }
 

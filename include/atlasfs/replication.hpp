@@ -58,6 +58,25 @@ struct ReplicatedDeleteResult {
     std::vector<std::string> failed_nodes;
 };
 
+enum class RepairPublishStatus {
+    published,
+    already_present_valid,
+    connection_failure,
+    timeout,
+    malformed_response,
+    identity_mismatch,
+    target_rejected,
+    invalid_manifest,
+    checksum_mismatch,
+    publication_failure,
+    result_unknown,
+};
+
+struct RepairPublishResult {
+    RepairPublishStatus status{RepairPublishStatus::target_rejected};
+    storage::StoreError storage_error{storage::StoreError::none};
+};
+
 class StorageNode {
 public:
     virtual ~StorageNode() = default;
@@ -87,10 +106,12 @@ public:
                                                      std::string_view generation_id) = 0;
     [[nodiscard]] virtual OperationQueryResult query_operation(
         std::string_view operation_id) const = 0;
-    [[nodiscard]] virtual storage::StoreError repair_chunk(
+    [[nodiscard]] virtual RepairPublishResult publish_repair(
+        std::string_view, std::string_view, std::string_view,
         std::string_view, const storage::ObjectManifest&,
         const storage::ChunkMetadata&, std::span<const std::byte>) {
-        return storage::StoreError::invalid_operation_state;
+        return {RepairPublishStatus::target_rejected,
+                storage::StoreError::invalid_operation_state};
     }
 };
 
@@ -127,8 +148,10 @@ public:
                                              std::string_view generation_id) override;
     [[nodiscard]] OperationQueryResult query_operation(
         std::string_view operation_id) const override;
-    [[nodiscard]] storage::StoreError repair_chunk(
-        std::string_view object_id, const storage::ObjectManifest& manifest,
+    [[nodiscard]] RepairPublishResult publish_repair(
+        std::string_view plan_id, std::string_view execution_id,
+        std::string_view target_node_id, std::string_view object_id,
+        const storage::ObjectManifest& manifest,
         const storage::ChunkMetadata& chunk,
         std::span<const std::byte> data) override;
     [[nodiscard]] const storage::ObjectStore& store() const noexcept;

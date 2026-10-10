@@ -34,6 +34,12 @@ public:
                                              std::string_view) override;
     [[nodiscard]] OperationQueryResult query_operation(
         std::string_view operation_id) const override;
+    [[nodiscard]] RepairPublishResult publish_repair(
+        std::string_view plan_id, std::string_view execution_id,
+        std::string_view target_node_id, std::string_view object_id,
+        const storage::ObjectManifest& manifest,
+        const storage::ChunkMetadata& chunk,
+        std::span<const std::byte> data) override;
     [[nodiscard]] storage_node_protocol::OperationState query(std::string_view operation_id);
 private:
     [[nodiscard]] storage_node_protocol::Response exchange(
@@ -47,7 +53,8 @@ private:
 class StorageNodeServer {
 public:
     StorageNodeServer(std::shared_ptr<StorageNode> node, std::filesystem::path journal_root,
-                     std::uint16_t port = 0, bool drop_commit_response_once = false);
+                     std::uint16_t port = 0, bool drop_commit_response_once = false,
+                     bool drop_repair_response_once = false);
     [[nodiscard]] std::uint16_t port() const noexcept;
     void serve();
     void stop() noexcept;
@@ -59,13 +66,27 @@ private:
         std::string object_id;
         std::string generation_id;
     };
+    struct RepairRecord {
+        storage_node_protocol::RepairResponseStatus status;
+        std::uint32_t fingerprint{};
+        std::uint32_t chunk_index{};
+        std::string plan_id;
+        std::string object_id;
+        std::string generation_id;
+    };
     [[nodiscard]] protocol::Message handle(const protocol::Message& request);
     void load_records();
+    void load_repair_records();
     [[nodiscard]] bool persist(std::string_view operation_id, const Record& record);
+    [[nodiscard]] bool persist_repair(
+        std::string_view execution_id, const RepairRecord& record);
     std::shared_ptr<StorageNode> node_;
     std::filesystem::path operations_directory_;
+    std::filesystem::path repairs_directory_;
     std::map<std::string, Record, std::less<>> records_;
+    std::map<std::string, RepairRecord, std::less<>> repair_records_;
     bool drop_commit_response_once_{};
+    bool drop_repair_response_once_{};
     net::TcpServer server_;
 };
 

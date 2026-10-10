@@ -107,7 +107,7 @@ them cleanly. Reserved flag bits must be zero until their semantics are specifie
 
 ## Storage-node protocol
 
-Replica traffic uses the same frame with distinct message types 200–211. Each
+Replica traffic uses the same frame with distinct message types 200–213. Each
 payload begins with a two-byte big-endian storage protocol version. Milestone 8
 uses version 2. Unknown versions, malformed lengths, unsafe identifiers, and
 out-of-bound chunk counts are rejected.
@@ -133,3 +133,35 @@ the echoed operation ID and state. Recovery clients must compare both values wit
 the expected operation identity. UNKNOWN operations have no stored fingerprint.
 This version-2 field is required by Milestone 8 recovery clients. Version-1
 Milestone 7 payloads are rejected rather than being misinterpreted.
+
+### Remote repair publication
+
+`REPAIR_CHUNK` uses request type 212 and response type 213. The request contains
+the storage protocol version, a zero reserved field, bounded repair-plan and
+execution IDs, the intended target node ID, object ID, complete encoded manifest,
+explicit chunk index/length/checksum, and bounded chunk bytes. It never contains
+a destination path. The node validates every identifier and its own target
+identity before allowing `ObjectStore` to derive a storage location.
+
+The target validates manifest/chunk consistency and the transferred checksum,
+then uses synchronized temporary files, reread verification, atomic rename, and
+directory synchronization. A valid existing identical replica returns
+`already_present_valid`; conflicting, corrupt, or unrelated existing content is
+not overwritten.
+
+Responses echo the plan and execution IDs plus the CRC-32C fingerprint of the
+complete canonical request. Result values distinguish published,
+already-present-valid, identity mismatch, target rejection, invalid manifest,
+checksum mismatch, publication failure, and result unknown. The node journals
+the fingerprint and result by validated execution ID, so exact duplicates are
+idempotent across restart and conflicting reuse is rejected.
+
+TCP send and receive waits are bounded to five seconds by default. Once a
+mutating request may have been sent, a timeout, disconnect, malformed response,
+or lost response is conservatively reported as an unknown result. The client
+does not retry automatically. A successful physical response still does not make
+the replica authoritative; only the subsequent coordinator catalog CAS does.
+
+The current trust boundary is the existing coordinator-to-storage-node channel
+and validated node identity. AtlasFS does not yet provide cryptographic peer
+authentication or encrypted transport.

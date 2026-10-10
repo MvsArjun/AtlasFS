@@ -179,7 +179,7 @@ TEST(DurableReplicaManager, AmbiguousCommitIsPersistedBeforeReturning) {
     DurableReplicaManager durable(store, replicas);
     const std::vector<std::byte> data{std::byte{42}};
     const auto checksum = integrity::crc32c(data);
-    PlacementPlan plan{"object", "generation-1", 1, checksum, 1, 50, 2, false,
+    PlacementPlan plan{"object", "generation-1", 1, 1, checksum, 50, 2, false,
         {{{"object", "generation-1", 0}, {0, 1, checksum}, {"node-a", "node-b"}}}};
 
     const auto result = durable.put(plan, data, "op-ambiguous", 77);

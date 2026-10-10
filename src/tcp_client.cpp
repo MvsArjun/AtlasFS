@@ -4,12 +4,25 @@
 #include <cerrno>
 #include <stdexcept>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <system_error>
 #include <utility>
 
 namespace atlasfs::net {
 
-TcpClient::TcpClient(std::uint16_t port) : socket_(connect_loopback(port)) {}
+TcpClient::TcpClient(std::uint16_t port, std::chrono::milliseconds timeout)
+    : socket_(connect_loopback(port)) {
+    if (timeout.count() <= 0) {
+        throw std::invalid_argument("TCP timeout must be positive");
+    }
+    const timeval value{
+        static_cast<time_t>(timeout.count() / 1000),
+        static_cast<suseconds_t>((timeout.count() % 1000) * 1000)};
+    if (::setsockopt(socket_.get(), SOL_SOCKET, SO_RCVTIMEO, &value, sizeof(value)) != 0 ||
+        ::setsockopt(socket_.get(), SOL_SOCKET, SO_SNDTIMEO, &value, sizeof(value)) != 0) {
+        throw std::system_error(errno, std::generic_category(), "setsockopt(timeout)");
+    }
+}
 
 protocol::Message TcpClient::request(const protocol::Message& message) {
     if (!socket_.valid()) {

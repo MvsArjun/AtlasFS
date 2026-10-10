@@ -40,6 +40,7 @@ enum class PutFaultPoint {
     manifest_sync,
     generation_rename,
     commit_rename,
+    directory_sync,
     rollback_deletion,
 };
 

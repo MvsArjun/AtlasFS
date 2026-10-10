@@ -57,6 +57,23 @@ rejected. On restart unfinished PREPARE is conservatively recovered as ABORTED.
 If a COMMIT response is lost, the client reports an unknown result and the
 manager does not blindly roll it back; QUERY_OPERATION resolves durable state.
 
+Remote repair publication uses the same `StorageNode` publisher boundary as local
+repair and message types 212/213. The bounded request contains no path: it binds
+the repair plan and execution IDs, intended target node, object and generation,
+complete protected manifest, exact chunk metadata, and bytes. The server rejects
+wrong-node requests before storage access and derives every location through
+`ObjectStore`'s validated layout. The existing temporary-write, file-sync,
+reread, checksum, atomic-rename, and directory-sync path provides publication.
+
+The storage node durably fingerprints each execution under its repair journal.
+An exact duplicate returns the recorded result after checking successful physical
+state; conflicting execution-ID reuse is rejected. A restart ignores incomplete
+journal temporary files, while `ObjectStore` removes only its clearly named
+incomplete repair artifacts. A bounded socket timeout prevents indefinite waits.
+After a mutating request is sent, transport failure or a malformed/lost response
+is `REMOTE_RESULT_UNKNOWN`, because publication may already have occurred. There
+is no automatic resend.
+
 ### Distributed operation recovery
 
 `RecoveryCoordinator` consumes the same `StorageNode` interface as replication,
@@ -316,20 +333,25 @@ immediately before initiating the transfer.
 
 `ObjectStore::publish_repair_chunk` validates the complete manifest and chunk,
 writes and synchronizes temporary files, rereads their CRC-protected content, and
-only then atomically publishes them. The executor rereads the target before
-issuing a catalog compare-and-swap with the version and full replica state
-captured by the plan. Only a durably committed CAS permits COMPLETED. A conflict
-records STALE with a typed conflicting-repair error; post-rename durability
-uncertainty records FAILED with a distinct catalog-durability-unknown error.
-Neither case is retried, replanned, or allowed to select a different target. The
-staged local target is retained for diagnosis.
+only then atomically publishes them. `LocalStorageNode` and
+`RemoteStorageNodeClient` implement the same typed publisher operation, so the
+executor does not branch on location. It rereads the target before issuing a
+catalog compare-and-swap with the version and full replica state captured by the
+plan. Only confirmed physical publication followed by a durably committed CAS
+permits COMPLETED. A conflict records STALE with a typed conflicting-repair
+error; post-rename catalog uncertainty and remote-result uncertainty are distinct
+FAILED outcomes. None is retried, replanned, or allowed to select a new target.
+When the observed set is already at the requested replication factor, the CAS
+replaces one deterministically selected unhealthy or non-present entry with the
+verified target; otherwise it adds the target without rewriting healthy entries.
 
 ARPL v3 stores catalog evidence in addition to approval, execution state, step
 outcomes, execution identity, and typed terminal failure. An EXECUTING record
 found after restart is never resumed automatically and exposes the completed
-steps for inspection. AtlasFS serializes catalog writers within one coordinator,
-not independent processes, and the remote storage-node protocol does not yet
-expose repair publication.
+steps for inspection. Physical publication is deliberately distinct from
+authoritative catalog commitment. If the CAS fails, the verified target remains
+present but non-authoritative for later operator-directed reconciliation. AtlasFS
+serializes catalog writers within one coordinator, not independent processes.
 
 A storage node has a stable validated node ID, host, port, and coordinator-owned
 state. ACTIVE nodes are eligible for new placement. DRAINING nodes remain known
@@ -377,6 +399,7 @@ durable operation records. Object data and manifests remain durable.
 
 ## Intended evolution
 
-The next dependency is remote staged repair publication through the storage-node
-protocol. Coordinator networking, consensus, cross-process writers, automatic
-retries, and automatic operation recovery remain deferred.
+The next dependency is distributed repair crash recovery and reconciliation,
+especially coordinator crashes between physical publication and authoritative
+catalog commitment. Consensus, cross-process catalog writers, automatic retries,
+and automatic operation recovery remain deferred.

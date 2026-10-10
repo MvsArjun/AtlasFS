@@ -69,7 +69,9 @@ LocalStorageNode::LocalStorageNode(std::string node_id, std::filesystem::path ro
                                    storage::PutFaultInjector fault_injector)
     : node_id_(std::move(node_id)),
       store_(std::move(root), max_object_size, chunk_size, std::move(fault_injector)) {
-    if (node_id_.empty()) { throw std::invalid_argument("storage node requires an id"); }
+    if (!metadata::NodeRegistry::valid_node_id(node_id_)) {
+        throw std::invalid_argument("storage node requires a valid id");
+    }
 }
 
 std::string_view LocalStorageNode::id() const noexcept { return node_id_; }
@@ -126,7 +128,8 @@ storage::StoreError LocalStorageNode::abort(std::string_view operation_id,
     const auto found = operations_.find(operation_id);
     if (found == operations_.end()) return storage::StoreError::operation_conflict;
     if (found->second.state == OperationState::aborted) return storage::StoreError::none;
-    if (found->second.state != OperationState::prepared)
+    if (found->second.state != OperationState::prepared &&
+        found->second.state != OperationState::committed)
         return storage::StoreError::invalid_operation_state;
     const auto error = store_.abort_replica(object_id, generation_id);
     if (error == storage::StoreError::none) found->second.state = OperationState::aborted;
@@ -159,10 +162,60 @@ OperationQueryResult LocalStorageNode::query_operation(
             found->second.state, found->second.fingerprint};
 }
 
-storage::StoreError LocalStorageNode::repair_chunk(
-    std::string_view object_id, const storage::ObjectManifest& manifest,
-    const storage::ChunkMetadata& chunk, std::span<const std::byte> data) {
-    return store_.publish_repair_chunk(object_id, manifest, chunk, data);
+RepairPublishResult LocalStorageNode::publish_repair(
+    std::string_view plan_id, std::string_view execution_id,
+    std::string_view target_node_id, std::string_view object_id,
+    const storage::ObjectManifest& manifest, const storage::ChunkMetadata& chunk,
+    std::span<const std::byte> data) {
+    if (!storage_node_protocol::valid_operation_id(plan_id) ||
+        !storage_node_protocol::valid_operation_id(execution_id) ||
+        target_node_id != node_id_) {
+        return {RepairPublishStatus::identity_mismatch,
+                storage::StoreError::operation_conflict};
+    }
+    if (!storage::ObjectStore::valid_object_id(object_id) ||
+        chunk.index >= manifest.chunks.size() || manifest.chunks[chunk.index] != chunk) {
+        return {RepairPublishStatus::invalid_manifest,
+                storage::StoreError::corrupt_object};
+    }
+    if (data.size() != chunk.length || integrity::crc32c(data) != chunk.checksum) {
+        return {RepairPublishStatus::checksum_mismatch,
+                storage::StoreError::checksum_mismatch};
+    }
+    const auto existing = store_.get_replica_chunk(
+        object_id, manifest.generation_id, chunk.index);
+    if (existing.error == storage::StoreError::none) {
+        if (existing.manifest == manifest && existing.chunk == chunk &&
+            existing.data.size() == data.size() &&
+            std::equal(existing.data.begin(), existing.data.end(), data.begin())) {
+            return {RepairPublishStatus::already_present_valid,
+                    storage::StoreError::none};
+        }
+        return {RepairPublishStatus::target_rejected,
+                storage::StoreError::operation_conflict};
+    }
+    if (existing.error != storage::StoreError::not_found) {
+        return {RepairPublishStatus::target_rejected, existing.error};
+    }
+    const auto error = store_.publish_repair_chunk(object_id, manifest, chunk, data);
+    switch (error) {
+        case storage::StoreError::none:
+            return {RepairPublishStatus::published, error};
+        case storage::StoreError::result_unknown:
+            return {RepairPublishStatus::result_unknown, error};
+        case storage::StoreError::checksum_mismatch:
+            return {RepairPublishStatus::checksum_mismatch, error};
+        case storage::StoreError::invalid_object_id:
+        case storage::StoreError::operation_conflict:
+            return {RepairPublishStatus::invalid_manifest, error};
+        case storage::StoreError::not_found:
+        case storage::StoreError::corrupt_object:
+        case storage::StoreError::filesystem_error:
+        case storage::StoreError::payload_too_large:
+        case storage::StoreError::invalid_operation_state:
+            return {RepairPublishStatus::publication_failure, error};
+    }
+    return {RepairPublishStatus::publication_failure, error};
 }
 
 const storage::ObjectStore& LocalStorageNode::store() const noexcept { return store_; }

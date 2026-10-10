@@ -1,12 +1,14 @@
 #include "atlasfs/repair.hpp"
 #include "atlasfs/checksum.hpp"
 #include "atlasfs/coordinator_operation.hpp"
+#include "atlasfs/remote_storage_node.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <atomic>
 #include <fstream>
+#include <thread>
 #include <unistd.h>
 
 namespace atlasfs::repair {
@@ -93,15 +95,18 @@ public:
         return {storage::StoreError::none, std::string(id),
                 replication::OperationState::unknown, 0};
     }
-    storage::StoreError repair_chunk(std::string_view,
-        const storage::ObjectManifest& manifest, const storage::ChunkMetadata& chunk,
-        std::span<const std::byte> data) override {
+    replication::RepairPublishResult publish_repair(
+        std::string_view, std::string_view, std::string_view,
+        std::string_view, const storage::ObjectManifest& manifest,
+        const storage::ChunkMetadata& chunk, std::span<const std::byte> data) override {
         ++repairs;
-        if (repair_error != storage::StoreError::none) return repair_error;
+        if (repair_error != storage::StoreError::none)
+            return {replication::RepairPublishStatus::publication_failure, repair_error};
         chunk_ = storage::ChunkResult{storage::StoreError::none, manifest, chunk,
                                      {data.begin(), data.end()}};
         if (after_repair) after_repair();
-        return storage::StoreError::none;
+        return {replication::RepairPublishStatus::published,
+                storage::StoreError::none};
     }
     std::string id_;
     std::optional<storage::ChunkResult> chunk_;
@@ -341,7 +346,7 @@ TEST(RepairExecutor, SourceIntegrityAndTransferFailuresDoNotCommitMetadata) {
         const auto before = fixture.placement;
         const auto result = executor.execute(plan.plan_id, fixture.placement, fixture.members);
         EXPECT_EQ(result.error, corrupt_source ? RepairExecutionError::integrity_failure
-                                               : RepairExecutionError::transfer_failure);
+                                               : RepairExecutionError::target_publication_failure);
         EXPECT_EQ(fixture.placement, before);
     }
 }
@@ -468,6 +473,158 @@ TEST(RepairExecutor, RestartRetainsCompletedCatalogAndPlanEvidence) {
     EXPECT_EQ(plan->state, RepairPlanState::completed);
     EXPECT_TRUE(plan->metadata_committed);
     EXPECT_EQ(plan->observed_catalog_replicas.size(), 3U);
+}
+
+TEST(RepairExecutor, RemotePublicationThenCatalogCasCompletesFourNodeRepair) {
+    TempRoot root;
+    ExecutionFixture fixture;
+    metadata::DurableReplicaCatalog catalog(root.path());
+    ASSERT_EQ(seed_catalog(catalog, fixture.placement),
+              metadata::ReplicaCatalogError::none);
+    metadata::CoordinatorOperationStore operations(root.path());
+    const auto historical = metadata::make_coordinator_operation(
+        fixture.placement, "historical-remote", 77);
+    ASSERT_EQ(operations.create(historical), metadata::CoordinatorRecordError::none);
+    const auto history_before = metadata::encode_coordinator_operation(
+        *operations.get("historical-remote"));
+
+    auto source = std::make_shared<replication::LocalStorageNode>(
+        "a", root.path() / "source", 1024, 1);
+    ASSERT_EQ(source->publish_repair("seed-plan", "seed-execution", "a", "object",
+        fixture.manifest, fixture.manifest.chunks[0], fixture.data).status,
+        replication::RepairPublishStatus::published);
+    auto replica_b = std::make_shared<replication::LocalStorageNode>(
+        "b", root.path() / "replica-b", 1024, 1);
+    auto replica_c = std::make_shared<replication::LocalStorageNode>(
+        "c", root.path() / "replica-c", 1024, 1);
+    ASSERT_EQ(replica_b->publish_repair("seed-plan", "seed-execution-b", "b", "object",
+        fixture.manifest, fixture.manifest.chunks[0], fixture.data).status,
+        replication::RepairPublishStatus::published);
+    ASSERT_EQ(replica_c->publish_repair("seed-plan", "seed-execution-c", "c", "object",
+        fixture.manifest, fixture.manifest.chunks[0], fixture.data).status,
+        replication::RepairPublishStatus::published);
+    auto target_local = std::make_shared<replication::LocalStorageNode>(
+        "d", root.path() / "target", 1024, 1);
+    replication::StorageNodeServer server(
+        target_local, root.path() / "target-journal");
+    auto target_remote = std::make_shared<replication::RemoteStorageNodeClient>(
+        "d", server.port());
+
+    const auto plan = execution_plan(fixture, catalog);
+    RepairPlanStore plans(root.path());
+    ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+    RepairExecutor executor(plans, catalog, {source, target_remote});
+    ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+    std::thread server_thread([&] { server.serve(); });
+    const auto result = executor.execute(
+        plan.plan_id, fixture.placement, fixture.members);
+    server.stop();
+    server_thread.join();
+
+    EXPECT_EQ(result.error, RepairExecutionError::none);
+    EXPECT_EQ(result.state, RepairPlanState::completed);
+    EXPECT_EQ(target_local->get_chunk("object", "generation-1", 0).data,
+              fixture.data);
+    const auto current = catalog.get(fixture.placement.chunks[0].identity);
+    ASSERT_TRUE(current);
+    std::vector<std::string> current_nodes;
+    for (const auto& replica : current->replicas)
+        current_nodes.push_back(replica.node_id);
+    EXPECT_EQ(current_nodes, (std::vector<std::string>{"a", "c", "d"}));
+    EXPECT_EQ(metadata::encode_coordinator_operation(
+        *operations.get("historical-remote")), history_before);
+
+}
+
+TEST(RepairExecutor, LostRemoteResponseLeavesPhysicalReplicaNonAuthoritative) {
+    TempRoot root;
+    ExecutionFixture fixture;
+    metadata::DurableReplicaCatalog catalog(root.path());
+    ASSERT_EQ(seed_catalog(catalog, fixture.placement),
+              metadata::ReplicaCatalogError::none);
+    auto source = std::make_shared<replication::LocalStorageNode>(
+        "a", root.path() / "source", 1024, 1);
+    ASSERT_EQ(source->publish_repair("seed-plan", "seed-execution", "a", "object",
+        fixture.manifest, fixture.manifest.chunks[0], fixture.data).status,
+        replication::RepairPublishStatus::published);
+    auto target_local = std::make_shared<replication::LocalStorageNode>(
+        "d", root.path() / "target", 1024, 1);
+    replication::StorageNodeServer server(
+        target_local, root.path() / "target-journal", 0, false, true);
+    auto target_remote = std::make_shared<replication::RemoteStorageNodeClient>(
+        "d", server.port());
+    const auto plan = execution_plan(fixture, catalog);
+    RepairPlanStore plans(root.path());
+    ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+    RepairExecutor executor(plans, catalog, {source, target_remote});
+    ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+    std::thread server_thread([&] { try { server.serve(); } catch (...) {} });
+
+    const auto before = catalog.snapshot();
+    const auto result = executor.execute(
+        plan.plan_id, fixture.placement, fixture.members);
+    server_thread.join();
+
+    EXPECT_EQ(result.error, RepairExecutionError::remote_result_unknown);
+    EXPECT_EQ(result.state, RepairPlanState::failed);
+    EXPECT_EQ(catalog.snapshot(), before);
+    EXPECT_EQ(target_local->get_chunk("object", "generation-1", 0).data,
+              fixture.data);
+    const auto durable = plans.get(plan.plan_id);
+    ASSERT_TRUE(durable);
+    EXPECT_FALSE(durable->transfer_succeeded);
+    EXPECT_FALSE(durable->publication_succeeded);
+    EXPECT_FALSE(durable->metadata_committed);
+    RepairPlanStore restarted_plans(root.path());
+    EXPECT_EQ(restarted_plans.get(plan.plan_id)->last_error,
+              RepairExecutionError::remote_result_unknown);
+}
+
+TEST(RepairExecutor, RemoteReplicaRemainsPhysicalWhenCatalogCasConflicts) {
+    TempRoot root;
+    ExecutionFixture fixture;
+    metadata::DurableReplicaCatalog catalog(root.path());
+    ASSERT_EQ(seed_catalog(catalog, fixture.placement),
+              metadata::ReplicaCatalogError::none);
+    const auto initial = catalog.get(fixture.placement.chunks[0].identity);
+    ASSERT_TRUE(initial);
+    auto competing = initial->replicas;
+    competing.push_back({"e", metadata::CatalogReplicaState::present,
+                         fixture.checksum, fixture.members.version});
+    auto source = std::make_shared<FakeRepairNode>("a");
+    source->chunk_ = storage::ChunkResult{storage::StoreError::none,
+        fixture.manifest, fixture.manifest.chunks[0], fixture.data};
+    auto target_local = std::make_shared<FakeRepairNode>("d");
+    auto competing_status = metadata::ReplicaCatalogCasStatus::invalid_request;
+    target_local->after_repair = [&] {
+        competing_status = catalog.compare_exchange({initial->identity,
+            initial->catalog_version, initial->replicas, competing}).status;
+    };
+    replication::StorageNodeServer server(
+        target_local, root.path() / "target-journal");
+    auto target_remote = std::make_shared<replication::RemoteStorageNodeClient>(
+        "d", server.port());
+    const auto plan = execution_plan(fixture, catalog);
+    RepairPlanStore plans(root.path());
+    ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+    RepairExecutor executor(plans, catalog, {source, target_remote});
+    ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+    std::thread server_thread([&] { server.serve(); });
+
+    const auto result = executor.execute(
+        plan.plan_id, fixture.placement, fixture.members);
+    server.stop();
+    server_thread.join();
+
+    EXPECT_EQ(result.error, RepairExecutionError::conflicting_repair);
+    EXPECT_EQ(result.state, RepairPlanState::stale);
+    EXPECT_EQ(competing_status, metadata::ReplicaCatalogCasStatus::committed);
+    EXPECT_TRUE(target_local->chunk_.has_value());
+    EXPECT_EQ(catalog.get(initial->identity)->replicas, competing);
+    const auto durable = plans.get(plan.plan_id);
+    ASSERT_TRUE(durable);
+    EXPECT_TRUE(durable->publication_succeeded);
+    EXPECT_FALSE(durable->metadata_committed);
 }
 }  // namespace
 }  // namespace atlasfs::repair

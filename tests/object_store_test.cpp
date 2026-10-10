@@ -189,7 +189,7 @@ TEST(ObjectStore, ConstructorReportsFilesystemFailure) {
     TemporaryDirectory directory;
     const auto file_path = directory.path() / "regular-file";
     std::ofstream(file_path).put('x');
-    EXPECT_THROW(ObjectStore(file_path), std::exception);
+    EXPECT_THROW(static_cast<void>(ObjectStore(file_path)), std::exception);
 }
 
 TEST(ObjectStore, ChunksAllBoundarySizesAndReassemblesExactly) {
@@ -358,6 +358,23 @@ TEST(ObjectStore, FailedRepairWriteNeverAdvertisesPartialChunk) {
     ObjectStore restarted(directory.path(), 1024, 4);
     EXPECT_EQ(restarted.get_replica_chunk("object", "generation-repair", 0).error,
               StoreError::not_found);
+}
+
+TEST(ObjectStore, RepairDirectorySyncFailureReportsUnknownAfterVisibleRename) {
+    TemporaryDirectory directory;
+    const auto data = bytes({42});
+    const auto checksum = integrity::crc32c(data);
+    const ObjectManifest manifest{1, 4, checksum, "generation-repair",
+                                  {{0, 1, checksum}}};
+    unsigned directory_syncs{};
+    ObjectStore store(directory.path(), 1024, 4,
+        [&](PutFaultPoint point) {
+            return point == PutFaultPoint::directory_sync &&
+                   ++directory_syncs == 4U;
+        });
+    EXPECT_EQ(store.publish_repair_chunk(
+        "object", manifest, manifest.chunks[0], data), StoreError::result_unknown);
+    EXPECT_EQ(store.get_replica_chunk("object", "generation-repair", 0).data, data);
 }
 
 }  // namespace

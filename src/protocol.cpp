@@ -51,6 +51,8 @@ bool is_known_type(std::uint16_t raw_type) {
         case MessageType::storage_delete_response:
         case MessageType::storage_query_request:
         case MessageType::storage_query_response:
+        case MessageType::storage_repair_chunk_request:
+        case MessageType::storage_repair_chunk_response:
             return true;
     }
     return false;

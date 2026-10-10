@@ -98,6 +98,8 @@ protocol::Message StorageRequestHandler::operator()(const protocol::Message& req
         case protocol::MessageType::storage_delete_response:
         case protocol::MessageType::storage_query_request:
         case protocol::MessageType::storage_query_response:
+        case protocol::MessageType::storage_repair_chunk_request:
+        case protocol::MessageType::storage_repair_chunk_response:
             return status_response(protocol::MessageType::error_response, request.request_id,
                                    object_protocol::Status::invalid_request);
     }

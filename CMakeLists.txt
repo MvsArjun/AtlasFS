@@ -6,6 +6,13 @@ if(NOT UNIX)
     message(FATAL_ERROR "AtlasFS networking currently requires a POSIX platform")
 endif()
 
+# MSYS2 exposes the POSIX durability and descriptor flags AtlasFS uses behind
+# the standard GNU feature-test macro. Linux toolchains expose these interfaces
+# already; keep this compatibility definition scoped to MSYS builds.
+if(MSYS)
+    add_compile_definitions(_GNU_SOURCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

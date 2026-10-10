@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <thread>
 #include <unistd.h>
@@ -64,6 +65,13 @@ TEST(StorageNodeProtocol, RoundTripsAllBoundedPayloadShapes) {
                            snp::OperationState::prepared, 123, {}};
     EXPECT_EQ(snp::decode_response(snp::encode_response(response))->state,
               snp::OperationState::prepared);
+    const snp::RepairChunkRequest repair{"repair-plan", "execution-1", "node-b",
+        "object", manifest(), manifest().chunks[1], {std::byte{5}}};
+    EXPECT_EQ(snp::decode_repair_chunk(snp::encode_repair_chunk(repair)), repair);
+    const snp::RepairResponse repair_response{
+        snp::RepairResponseStatus::published, "repair-plan", "execution-1", 42};
+    EXPECT_EQ(snp::decode_repair_response(snp::encode_repair_response(repair_response)),
+              repair_response);
 }
 
 TEST(StorageNodeProtocol, RejectsTruncationUnknownVersionAndUnsafeIdentifiers) {
@@ -77,6 +85,159 @@ TEST(StorageNodeProtocol, RejectsTruncationUnknownVersionAndUnsafeIdentifiers) {
     EXPECT_FALSE(snp::valid_operation_id("../operation"));
     EXPECT_THROW(snp::encode_identity({"../operation", "object", "generation-rpc"}),
                  std::invalid_argument);
+}
+
+TEST(StorageNodeProtocol, StrictlyRejectsMalformedRepairPayloads) {
+    namespace snp = storage_node_protocol;
+    const snp::RepairChunkRequest request{"repair-plan", "execution-1", "node-b",
+        "object", manifest(), manifest().chunks[1], {std::byte{5}}};
+    const auto encoded = snp::encode_repair_chunk(request);
+    for (std::size_t size = 0; size < encoded.size(); ++size) {
+        EXPECT_FALSE(snp::decode_repair_chunk(
+            std::span<const std::byte>(encoded).first(size)));
+    }
+    auto unsupported = encoded;
+    unsupported[1] = std::byte{3};
+    EXPECT_FALSE(snp::decode_repair_chunk(unsupported));
+    auto trailing = encoded;
+    trailing.push_back(std::byte{0});
+    EXPECT_FALSE(snp::decode_repair_chunk(trailing));
+    auto reserved = encoded;
+    reserved[3] = std::byte{1};
+    EXPECT_FALSE(snp::decode_repair_chunk(reserved));
+    EXPECT_THROW(snp::encode_repair_chunk({"repair-plan", "execution-1", "../node",
+        "object", manifest(), manifest().chunks[1], {std::byte{5}}}),
+        std::invalid_argument);
+    EXPECT_THROW(snp::encode_repair_chunk({"../plan", "execution-1", "node-b",
+        "object", manifest(), manifest().chunks[1], {std::byte{5}}}),
+        std::invalid_argument);
+}
+
+TEST(StorageNodeProtocol, RemoteRepairValidatesIdentityAndIsIdempotent) {
+    TempRoot root;
+    auto local = std::make_shared<LocalStorageNode>(
+        "node-a", root.path() / "store", 1024, 4);
+    StorageNodeServer server(local, root.path() / "journal");
+    std::thread thread([&] { server.serve(); });
+    RemoteStorageNodeClient remote("node-a", server.port());
+    const auto value = manifest();
+    const std::vector<std::byte> chunk{std::byte{5}};
+
+    EXPECT_EQ(remote.publish_repair("repair-plan", "execution-wrong", "node-b",
+        "object", value, value.chunks[1], chunk).status,
+        RepairPublishStatus::identity_mismatch);
+    EXPECT_EQ(remote.publish_repair("repair-plan", "execution-1", "node-a",
+        "object", value, value.chunks[1], chunk).status,
+        RepairPublishStatus::published);
+    EXPECT_EQ(remote.publish_repair("repair-plan", "execution-1", "node-a",
+        "object", value, value.chunks[1], chunk).status,
+        RepairPublishStatus::published);
+    EXPECT_EQ(remote.publish_repair("repair-plan", "execution-1", "node-a",
+        "different-object", value, value.chunks[1], chunk).status,
+        RepairPublishStatus::target_rejected);
+    EXPECT_EQ(remote.publish_repair("repair-plan", "execution-2", "node-a",
+        "object", value, value.chunks[1], chunk).status,
+        RepairPublishStatus::already_present_valid);
+    EXPECT_EQ(remote.publish_repair("repair-plan", "execution-bad-checksum", "node-a",
+        "object", value, value.chunks[1], std::vector<std::byte>{std::byte{4}}).status,
+        RepairPublishStatus::checksum_mismatch);
+    EXPECT_EQ(remote.publish_repair("repair-plan", "execution-bad-manifest", "node-a",
+        "object", value,
+        storage::ChunkMetadata{1, 1, value.chunks[1].checksum + 1U}, chunk).status,
+        RepairPublishStatus::invalid_manifest);
+    EXPECT_EQ(remote.get_chunk("object", value.generation_id, 1).data, chunk);
+    {
+        std::ofstream corrupt(local->store().chunks_directory() /
+            value.generation_id / "chunk_000001", std::ios::binary | std::ios::trunc);
+        corrupt.put('\0');
+    }
+    EXPECT_EQ(remote.publish_repair("repair-plan", "execution-corrupt", "node-a",
+        "object", value, value.chunks[1], chunk).status,
+        RepairPublishStatus::target_rejected);
+    server.stop();
+    thread.join();
+}
+
+TEST(StorageNodeProtocol, LostRepairResponseIsUnknownAndDurableRetryIsIdempotent) {
+    TempRoot root;
+    auto local = std::make_shared<LocalStorageNode>(
+        "node-a", root.path() / "store", 1024, 4);
+    const auto value = manifest();
+    const std::vector<std::byte> chunk{std::byte{5}};
+    {
+        StorageNodeServer server(local, root.path() / "journal", 0, false, true);
+        std::thread thread([&] { try { server.serve(); } catch (...) {} });
+        RemoteStorageNodeClient remote("node-a", server.port());
+        EXPECT_EQ(remote.publish_repair("repair-plan", "execution-lost", "node-a",
+            "object", value, value.chunks[1], chunk).status,
+            RepairPublishStatus::result_unknown);
+        thread.join();
+    }
+    EXPECT_EQ(local->get_chunk("object", value.generation_id, 1).data, chunk);
+    StorageNodeServer restarted(local, root.path() / "journal");
+    std::thread thread([&] { restarted.serve(); });
+    RemoteStorageNodeClient remote("node-a", restarted.port());
+    EXPECT_EQ(remote.publish_repair("repair-plan", "execution-lost", "node-a",
+        "object", value, value.chunks[1], chunk).status,
+        RepairPublishStatus::published);
+    restarted.stop();
+    thread.join();
+}
+
+TEST(StorageNodeProtocol, FailedRemotePublicationNeverExposesPartialReplica) {
+    TempRoot root;
+    auto local = std::make_shared<LocalStorageNode>(
+        "node-a", root.path() / "store", 1024, 4,
+        [](storage::PutFaultPoint point) {
+            return point == storage::PutFaultPoint::chunk_write;
+        });
+    StorageNodeServer server(local, root.path() / "journal");
+    std::thread thread([&] { server.serve(); });
+    RemoteStorageNodeClient remote("node-a", server.port());
+    const auto value = manifest();
+    EXPECT_EQ(remote.publish_repair("repair-plan", "execution-failed", "node-a",
+        "object", value, value.chunks[1], std::vector<std::byte>{std::byte{5}}).status,
+        RepairPublishStatus::publication_failure);
+    EXPECT_EQ(local->get_chunk("object", value.generation_id, 1).error,
+              storage::StoreError::not_found);
+    server.stop();
+    thread.join();
+}
+
+TEST(StorageNodeProtocol, RemoteDirectorySyncAmbiguityIsNeverReportedCommitted) {
+    TempRoot root;
+    unsigned directory_syncs{};
+    auto local = std::make_shared<LocalStorageNode>(
+        "node-a", root.path() / "store", 1024, 4,
+        [&](storage::PutFaultPoint point) {
+            return point == storage::PutFaultPoint::directory_sync &&
+                   ++directory_syncs == 4U;
+        });
+    StorageNodeServer server(local, root.path() / "journal");
+    std::thread thread([&] { server.serve(); });
+    RemoteStorageNodeClient remote("node-a", server.port());
+    const auto value = manifest();
+    const std::vector<std::byte> chunk{std::byte{5}};
+    EXPECT_EQ(remote.publish_repair("repair-plan", "execution-unknown", "node-a",
+        "object", value, value.chunks[1], chunk).status,
+        RepairPublishStatus::result_unknown);
+    EXPECT_EQ(local->get_chunk("object", value.generation_id, 1).data, chunk);
+    server.stop();
+    thread.join();
+}
+
+TEST(StorageNodeProtocol, CorruptDurableRepairJournalStopsRestart) {
+    TempRoot root;
+    const auto repairs = root.path() / "journal" / "repairs";
+    std::filesystem::create_directories(repairs);
+    {
+        std::ofstream output(repairs / "execution-corrupt", std::ios::trunc);
+        output << "not a repair record\n";
+    }
+    auto local = std::make_shared<LocalStorageNode>(
+        "node-a", root.path() / "store", 1024, 4);
+    EXPECT_THROW(StorageNodeServer(local, root.path() / "journal"),
+                 std::runtime_error);
 }
 
 TEST(StorageNodeProtocol, DuplicatePrepareCommitAndConflictAreDeterministic) {

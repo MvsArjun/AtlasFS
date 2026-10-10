@@ -38,6 +38,38 @@ struct GetChunkRequest {
     std::uint32_t chunk_index{};
 };
 
+struct RepairChunkRequest {
+    std::string plan_id;
+    std::string execution_id;
+    std::string target_node_id;
+    std::string object_id;
+    storage::ObjectManifest manifest;
+    storage::ChunkMetadata chunk;
+    std::vector<std::byte> data;
+
+    bool operator==(const RepairChunkRequest&) const = default;
+};
+
+enum class RepairResponseStatus : std::uint16_t {
+    published,
+    already_present_valid,
+    identity_mismatch,
+    target_rejected,
+    invalid_manifest,
+    checksum_mismatch,
+    publication_failure,
+    result_unknown,
+};
+
+struct RepairResponse {
+    RepairResponseStatus status{RepairResponseStatus::target_rejected};
+    std::string plan_id;
+    std::string execution_id;
+    std::uint32_t request_fingerprint{};
+
+    bool operator==(const RepairResponse&) const = default;
+};
+
 struct Response {
     storage::StoreError error{storage::StoreError::none};
     std::string operation_id;
@@ -53,6 +85,12 @@ struct Response {
 [[nodiscard]] std::optional<IdentityRequest> decode_identity(std::span<const std::byte> bytes);
 [[nodiscard]] std::vector<std::byte> encode_get_chunk(const GetChunkRequest& request);
 [[nodiscard]] std::optional<GetChunkRequest> decode_get_chunk(std::span<const std::byte> bytes);
+[[nodiscard]] std::vector<std::byte> encode_repair_chunk(const RepairChunkRequest& request);
+[[nodiscard]] std::optional<RepairChunkRequest> decode_repair_chunk(
+    std::span<const std::byte> bytes);
+[[nodiscard]] std::vector<std::byte> encode_repair_response(const RepairResponse& response);
+[[nodiscard]] std::optional<RepairResponse> decode_repair_response(
+    std::span<const std::byte> bytes);
 [[nodiscard]] std::vector<std::byte> encode_response(const Response& response);
 [[nodiscard]] std::optional<Response> decode_response(std::span<const std::byte> bytes);
 

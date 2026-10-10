@@ -131,7 +131,7 @@ bool valid_plan(const RepairPlan& value) {
     if (value.metadata_committed && (!value.verification_succeeded ||
                                      !value.publication_succeeded)) return false;
     if (value.state == RepairPlanState::completed && !value.metadata_committed) return false;
-    if (value.last_error > RepairExecutionError::catalog_durability_unknown) return false;
+    if (value.last_error > RepairExecutionError::remote_target_rejected) return false;
     if ((value.state == RepairPlanState::planned || value.state == RepairPlanState::approved ||
          value.state == RepairPlanState::executing || value.state == RepairPlanState::completed ||
          value.state == RepairPlanState::unrecoverable) &&
@@ -576,14 +576,46 @@ RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
     }
 
     if (existing.error != storage::StoreError::none) {
-        const auto transferred = target->second->repair_chunk(plan->object_id,
+        const auto published = target->second->publish_repair(
+            plan->plan_id, plan->execution_id, plan->target_node, plan->object_id,
             source_chunk.manifest, source_chunk.chunk, source_chunk.data);
-        if (transferred != storage::StoreError::none) {
+        if (published.status != replication::RepairPublishStatus::published &&
+            published.status != replication::RepairPublishStatus::already_present_valid) {
             plan->state = RepairPlanState::failed;
-            plan->last_error = RepairExecutionError::transfer_failure;
+            switch (published.status) {
+                case replication::RepairPublishStatus::result_unknown:
+                    plan->last_error = RepairExecutionError::remote_result_unknown;
+                    break;
+                case replication::RepairPublishStatus::identity_mismatch:
+                    plan->last_error = RepairExecutionError::remote_identity_mismatch;
+                    break;
+                case replication::RepairPublishStatus::connection_failure:
+                    plan->last_error = RepairExecutionError::remote_connection_failure;
+                    break;
+                case replication::RepairPublishStatus::timeout:
+                    plan->last_error = RepairExecutionError::remote_timeout;
+                    break;
+                case replication::RepairPublishStatus::malformed_response:
+                    plan->last_error = RepairExecutionError::remote_protocol_error;
+                    break;
+                case replication::RepairPublishStatus::checksum_mismatch:
+                    plan->last_error = RepairExecutionError::verification_failure;
+                    break;
+                case replication::RepairPublishStatus::publication_failure:
+                    plan->last_error = RepairExecutionError::target_publication_failure;
+                    break;
+                case replication::RepairPublishStatus::target_rejected:
+                case replication::RepairPublishStatus::invalid_manifest:
+                    plan->last_error = RepairExecutionError::remote_target_rejected;
+                    break;
+                case replication::RepairPublishStatus::published:
+                case replication::RepairPublishStatus::already_present_valid:
+                    break;
+            }
+            const auto error = plan->last_error;
             if (plans_.update(*plan) != RepairStoreError::none)
                 return {RepairExecutionError::persistence_failure, RepairPlanState::executing};
-            return {RepairExecutionError::transfer_failure, plan->state};
+            return {error, plan->state};
         }
     }
     plan->transfer_succeeded = true;
@@ -604,6 +636,14 @@ RepairExecutionResult RepairExecutor::execute(std::string_view plan_id_value,
         return {RepairExecutionError::persistence_failure, plan->state};
 
     auto desired_replicas = plan->observed_catalog_replicas;
+    if (desired_replicas.size() >= plan->replication_factor) {
+        const auto replace = std::find_if(desired_replicas.begin(), desired_replicas.end(),
+            [&](const auto& replica) {
+                return replica.state != metadata::CatalogReplicaState::present ||
+                    !eligible(member(replica.node_id));
+            });
+        if (replace != desired_replicas.end()) desired_replicas.erase(replace);
+    }
     desired_replicas.push_back({plan->target_node,
         metadata::CatalogReplicaState::present, source_chunk.chunk.checksum,
         membership.version});

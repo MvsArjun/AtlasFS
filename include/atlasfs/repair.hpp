@@ -24,7 +24,9 @@ enum class RepairExecutionError : std::uint16_t {
     generation_mismatch, chunk_identity_mismatch, integrity_failure,
     target_already_contains_chunk, transfer_failure, verification_failure,
     target_publication_failure, metadata_commit_failure, conflicting_repair,
-    persistence_failure, catalog_durability_unknown
+    persistence_failure, catalog_durability_unknown, remote_result_unknown,
+    remote_identity_mismatch, remote_connection_failure, remote_timeout,
+    remote_protocol_error, remote_target_rejected
 };
 
 enum class RepairPlanState : std::uint8_t {

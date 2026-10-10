@@ -5,15 +5,74 @@
 #include <fstream>
 #include <fcntl.h>
 #include <stdexcept>
+#include <system_error>
 #include <unistd.h>
 #include <utility>
 
 namespace atlasfs::replication {
 namespace snp = storage_node_protocol;
+namespace {
+
+snp::RepairResponseStatus wire_status(RepairPublishStatus status) {
+    switch (status) {
+        case RepairPublishStatus::published:
+            return snp::RepairResponseStatus::published;
+        case RepairPublishStatus::already_present_valid:
+            return snp::RepairResponseStatus::already_present_valid;
+        case RepairPublishStatus::identity_mismatch:
+            return snp::RepairResponseStatus::identity_mismatch;
+        case RepairPublishStatus::invalid_manifest:
+            return snp::RepairResponseStatus::invalid_manifest;
+        case RepairPublishStatus::checksum_mismatch:
+            return snp::RepairResponseStatus::checksum_mismatch;
+        case RepairPublishStatus::publication_failure:
+            return snp::RepairResponseStatus::publication_failure;
+        case RepairPublishStatus::result_unknown:
+            return snp::RepairResponseStatus::result_unknown;
+        case RepairPublishStatus::connection_failure:
+        case RepairPublishStatus::timeout:
+        case RepairPublishStatus::malformed_response:
+        case RepairPublishStatus::target_rejected:
+            return snp::RepairResponseStatus::target_rejected;
+    }
+    return snp::RepairResponseStatus::target_rejected;
+}
+
+RepairPublishResult client_status(snp::RepairResponseStatus status) {
+    switch (status) {
+        case snp::RepairResponseStatus::published:
+            return {RepairPublishStatus::published, storage::StoreError::none};
+        case snp::RepairResponseStatus::already_present_valid:
+            return {RepairPublishStatus::already_present_valid, storage::StoreError::none};
+        case snp::RepairResponseStatus::identity_mismatch:
+            return {RepairPublishStatus::identity_mismatch,
+                    storage::StoreError::operation_conflict};
+        case snp::RepairResponseStatus::target_rejected:
+            return {RepairPublishStatus::target_rejected,
+                    storage::StoreError::operation_conflict};
+        case snp::RepairResponseStatus::invalid_manifest:
+            return {RepairPublishStatus::invalid_manifest,
+                    storage::StoreError::corrupt_object};
+        case snp::RepairResponseStatus::checksum_mismatch:
+            return {RepairPublishStatus::checksum_mismatch,
+                    storage::StoreError::checksum_mismatch};
+        case snp::RepairResponseStatus::publication_failure:
+            return {RepairPublishStatus::publication_failure,
+                    storage::StoreError::filesystem_error};
+        case snp::RepairResponseStatus::result_unknown:
+            return {RepairPublishStatus::result_unknown,
+                    storage::StoreError::result_unknown};
+    }
+    return {RepairPublishStatus::malformed_response,
+            storage::StoreError::corrupt_object};
+}
+
+}  // namespace
 
 RemoteStorageNodeClient::RemoteStorageNodeClient(std::string node_id, std::uint16_t port)
     : node_id_(std::move(node_id)), client_(port) {
-    if (node_id_.empty()) throw std::invalid_argument("remote storage node requires id");
+    if (!metadata::NodeRegistry::valid_node_id(node_id_))
+        throw std::invalid_argument("remote storage node requires valid id");
 }
 
 std::string_view RemoteStorageNodeClient::id() const noexcept { return node_id_; }
@@ -118,14 +177,60 @@ OperationQueryResult RemoteStorageNodeClient::query_operation(
             response.fingerprint};
 }
 
+RepairPublishResult RemoteStorageNodeClient::publish_repair(
+    std::string_view plan_id, std::string_view execution_id,
+    std::string_view target_node_id, std::string_view object_id,
+    const storage::ObjectManifest& manifest, const storage::ChunkMetadata& chunk,
+    std::span<const std::byte> data) {
+    snp::RepairChunkRequest request{std::string(plan_id), std::string(execution_id),
+        std::string(target_node_id), std::string(object_id), manifest, chunk,
+        {data.begin(), data.end()}};
+    std::vector<std::byte> payload;
+    try {
+        payload = snp::encode_repair_chunk(request);
+    } catch (...) {
+        return {RepairPublishStatus::target_rejected,
+                storage::StoreError::corrupt_object};
+    }
+    const auto fingerprint = integrity::crc32c(payload);
+    const auto request_id = next_request_id_++;
+    try {
+        const auto response = client_.request({
+            protocol::MessageType::storage_repair_chunk_request, 0, request_id,
+            std::move(payload)});
+        if (response.type != protocol::MessageType::storage_repair_chunk_response) {
+            return {RepairPublishStatus::result_unknown,
+                    storage::StoreError::result_unknown};
+        }
+        const auto decoded = snp::decode_repair_response(response.payload);
+        if (!decoded || decoded->plan_id != plan_id ||
+            decoded->execution_id != execution_id ||
+            decoded->request_fingerprint != fingerprint) {
+            return {RepairPublishStatus::result_unknown,
+                    storage::StoreError::result_unknown};
+        }
+        return client_status(decoded->status);
+    } catch (...) {
+        // The request may have reached the node, so transport failure after send
+        // is deliberately ambiguous and is never retried here.
+        return {RepairPublishStatus::result_unknown,
+                storage::StoreError::result_unknown};
+    }
+}
+
 StorageNodeServer::StorageNodeServer(std::shared_ptr<StorageNode> node,
-    std::filesystem::path journal_root, std::uint16_t port, bool drop_commit_response_once)
-    : node_(std::move(node)), operations_directory_(std::move(journal_root) / "operations"),
+    std::filesystem::path journal_root, std::uint16_t port,
+    bool drop_commit_response_once, bool drop_repair_response_once)
+    : node_(std::move(node)), operations_directory_(journal_root / "operations"),
+      repairs_directory_(std::move(journal_root) / "repairs"),
       drop_commit_response_once_(drop_commit_response_once),
+      drop_repair_response_once_(drop_repair_response_once),
       server_(port, [this](const protocol::Message& request) { return handle(request); }) {
     if (!node_) throw std::invalid_argument("storage server requires node");
     std::filesystem::create_directories(operations_directory_);
+    std::filesystem::create_directories(repairs_directory_);
     load_records();
+    load_repair_records();
 }
 
 std::uint16_t StorageNodeServer::port() const noexcept { return server_.port(); }
@@ -153,6 +258,34 @@ void StorageNodeServer::load_records() {
     }
 }
 
+void StorageNodeServer::load_repair_records() {
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(repairs_directory_, error)) {
+        if (entry.path().extension() == ".tmp") continue;
+        std::ifstream input(entry.path());
+        unsigned status{};
+        RepairRecord record{};
+        const auto execution_id = entry.path().filename().string();
+        const bool parsed = static_cast<bool>(input >> status >> record.fingerprint >>
+            record.chunk_index >> record.plan_id >> record.object_id >>
+            record.generation_id);
+        input >> std::ws;
+        if (!entry.is_regular_file() || !parsed || !input.eof() ||
+            status > static_cast<unsigned>(snp::RepairResponseStatus::result_unknown) ||
+            !snp::valid_operation_id(execution_id) ||
+            !snp::valid_operation_id(record.plan_id) ||
+            !storage::ObjectStore::valid_object_id(record.object_id) ||
+            !storage::valid_generation_id(record.generation_id) ||
+            record.chunk_index >= storage::kMaxChunkCount) {
+            throw std::runtime_error("invalid durable repair publication record");
+        }
+        record.status = static_cast<snp::RepairResponseStatus>(status);
+        if (!repair_records_.emplace(execution_id, std::move(record)).second)
+            throw std::runtime_error("duplicate durable repair publication record");
+    }
+    if (error) throw std::system_error(error, "scan repair publication records");
+}
+
 bool StorageNodeServer::persist(std::string_view operation_id, const Record& record) {
     const auto temporary = operations_directory_ / (std::string(operation_id) + ".tmp");
     const auto final = operations_directory_ / std::string(operation_id);
@@ -163,7 +296,7 @@ bool StorageNodeServer::persist(std::string_view operation_id, const Record& rec
     output.flush();
     if (!output) return false;
     output.close();
-    const int file = ::open(temporary.c_str(), O_RDONLY | O_CLOEXEC);
+    const int file = ::open(temporary.c_str(), O_RDWR | O_CLOEXEC);
     if (file < 0 || ::fdatasync(file) != 0) {
         if (file >= 0) ::close(file);
         return false;
@@ -180,10 +313,99 @@ bool StorageNodeServer::persist(std::string_view operation_id, const Record& rec
     return ::close(directory) == 0;
 }
 
+bool StorageNodeServer::persist_repair(
+    std::string_view execution_id, const RepairRecord& record) {
+    const auto temporary = repairs_directory_ / (std::string(execution_id) + ".tmp");
+    const auto final = repairs_directory_ / std::string(execution_id);
+    std::ofstream output(temporary, std::ios::trunc);
+    output << static_cast<unsigned>(record.status) << ' ' << record.fingerprint << ' '
+           << record.chunk_index << ' ' << record.plan_id << ' ' << record.object_id
+           << ' ' << record.generation_id << '\n';
+    output.flush();
+    if (!output) return false;
+    output.close();
+    const int file = ::open(temporary.c_str(), O_RDWR | O_CLOEXEC);
+    if (file < 0 || ::fdatasync(file) != 0) {
+        if (file >= 0) ::close(file);
+        return false;
+    }
+    if (::close(file) != 0) return false;
+    std::error_code error;
+    std::filesystem::rename(temporary, final, error);
+    if (error) return false;
+    const int directory = ::open(repairs_directory_.c_str(),
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0 || ::fsync(directory) != 0) {
+        if (directory >= 0) ::close(directory);
+        return false;
+    }
+    return ::close(directory) == 0;
+}
+
 protocol::Message StorageNodeServer::handle(const protocol::Message& request) {
     auto reply = [&](protocol::MessageType type, snp::Response response) {
         return protocol::Message{type, 0, request.request_id, snp::encode_response(response)};
     };
+    auto repair_reply = [&](snp::RepairResponse response) {
+        return protocol::Message{protocol::MessageType::storage_repair_chunk_response,
+            0, request.request_id, snp::encode_repair_response(response)};
+    };
+    if (request.type == protocol::MessageType::storage_repair_chunk_request) {
+        const auto fingerprint = integrity::crc32c(request.payload);
+        const auto decoded = snp::decode_repair_chunk(request.payload);
+        if (!decoded) {
+            return repair_reply({snp::RepairResponseStatus::target_rejected,
+                                 "-", "-", fingerprint});
+        }
+        if (decoded->target_node_id != node_->id()) {
+            return repair_reply({snp::RepairResponseStatus::identity_mismatch,
+                decoded->plan_id, decoded->execution_id, fingerprint});
+        }
+        if (const auto found = repair_records_.find(decoded->execution_id);
+            found != repair_records_.end()) {
+            const auto& record = found->second;
+            const bool same = record.fingerprint == fingerprint &&
+                record.plan_id == decoded->plan_id &&
+                record.object_id == decoded->object_id &&
+                record.generation_id == decoded->manifest.generation_id &&
+                record.chunk_index == decoded->chunk.index;
+            auto status = same ? record.status
+                : snp::RepairResponseStatus::target_rejected;
+            if (same && (status == snp::RepairResponseStatus::published ||
+                         status == snp::RepairResponseStatus::already_present_valid)) {
+                const auto visible = node_->get_chunk(decoded->object_id,
+                    decoded->manifest.generation_id, decoded->chunk.index);
+                if (visible.error != storage::StoreError::none ||
+                    visible.manifest != decoded->manifest ||
+                    visible.chunk != decoded->chunk || visible.data != decoded->data) {
+                    status = snp::RepairResponseStatus::target_rejected;
+                }
+            }
+            return repair_reply({status, decoded->plan_id,
+                                 decoded->execution_id, fingerprint});
+        }
+        auto status = wire_status(node_->publish_repair(
+            decoded->plan_id, decoded->execution_id, decoded->target_node_id,
+            decoded->object_id, decoded->manifest, decoded->chunk, decoded->data).status);
+        RepairRecord record{status, fingerprint, decoded->chunk.index,
+            decoded->plan_id, decoded->object_id, decoded->manifest.generation_id};
+        if (!persist_repair(decoded->execution_id, record)) {
+            if (status == snp::RepairResponseStatus::published ||
+                status == snp::RepairResponseStatus::already_present_valid) {
+                status = snp::RepairResponseStatus::result_unknown;
+            }
+        } else {
+            repair_records_[decoded->execution_id] = record;
+        }
+        if (drop_repair_response_once_ &&
+            (status == snp::RepairResponseStatus::published ||
+             status == snp::RepairResponseStatus::already_present_valid)) {
+            drop_repair_response_once_ = false;
+            throw std::runtime_error("injected lost repair response");
+        }
+        return repair_reply({status, decoded->plan_id,
+                             decoded->execution_id, fingerprint});
+    }
     if (request.type == protocol::MessageType::storage_prepare_request) {
         const auto decoded = snp::decode_prepare(request.payload);
         if (!decoded) return reply(protocol::MessageType::storage_prepare_response,
