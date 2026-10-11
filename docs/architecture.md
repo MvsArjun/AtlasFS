@@ -523,8 +523,9 @@ catalog CAS. No storage, catalog, history, or recovery formats change.
 
 Contexts are immutable and credentials are per endpoint. Rotation or allowlist
 removal requires endpoint replacement and closure of existing connections; TLS
-session resumption and early data are disabled. Loopback listeners and sequential
-dispatch remain intentional limitations. Legacy plaintext constructors are
+session resumption and early data are disabled. Loopback listeners and serialized
+durable handlers remain intentional limitations; bounded connection I/O may run
+concurrently as described in Milestone 22. Legacy plaintext constructors are
 explicit insecure compatibility paths, not TLS fallback. The full threat model
 and deployment procedure are in [Milestone 18](milestone-18.md).
 

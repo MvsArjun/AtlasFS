@@ -1,0 +1,186 @@
+{
+  "profile": "admission",
+  "runner_class": "shared",
+  "runs": [
+    {
+      "case": "workers-1-mutex",
+      "round": 1,
+      "run_id": "627ae26e-ab8c-48c8-976d-05d7f675e4d7",
+      "file": "workers-1-mutex-1.json"
+    },
+    {
+      "case": "workers-1-fifo",
+      "round": 1,
+      "run_id": "f779632d-b29c-4189-b1c5-3106fc5899eb",
+      "file": "workers-1-fifo-1.json"
+    },
+    {
+      "case": "workers-2-mutex",
+      "round": 1,
+      "run_id": "9d7bda92-fbe3-4972-9dc7-9ec4dbb4b1e6",
+      "file": "workers-2-mutex-1.json"
+    },
+    {
+      "case": "workers-2-fifo",
+      "round": 1,
+      "run_id": "4b40d8e4-f4a7-40a4-a86b-1abf03a871b1",
+      "file": "workers-2-fifo-1.json"
+    },
+    {
+      "case": "workers-4-mutex",
+      "round": 1,
+      "run_id": "fd15386f-c3db-4371-a328-002a0aebf706",
+      "file": "workers-4-mutex-1.json"
+    },
+    {
+      "case": "workers-4-fifo",
+      "round": 1,
+      "run_id": "e5ba74a7-8049-4ae7-b8a1-00db94a1c015",
+      "file": "workers-4-fifo-1.json"
+    },
+    {
+      "case": "sustained-4-mutex",
+      "round": 1,
+      "run_id": "a0867788-1a86-463c-a1c8-2e96b798e8d8",
+      "file": "sustained-4-mutex-1.json"
+    },
+    {
+      "case": "sustained-4-fifo",
+      "round": 1,
+      "run_id": "1947b5ab-e264-4b7f-abd9-656a4ff89085",
+      "file": "sustained-4-fifo-1.json"
+    },
+    {
+      "case": "fault-mutex",
+      "round": 1,
+      "run_id": "7a16d3a0-1936-4e49-b0b7-f8018cccd781",
+      "file": "fault-mutex-1.json"
+    },
+    {
+      "case": "fault-fifo",
+      "round": 1,
+      "run_id": "4ee7000c-f860-4ff4-a0c6-c8f9ae89d921",
+      "file": "fault-fifo-1.json"
+    },
+    {
+      "case": "workers-1-fifo",
+      "round": 2,
+      "run_id": "513397ca-b094-45df-8d46-ef3c4f7a8c35",
+      "file": "workers-1-fifo-2.json"
+    },
+    {
+      "case": "workers-1-mutex",
+      "round": 2,
+      "run_id": "782f4f0e-a4f0-4a52-8fd7-a0324198183a",
+      "file": "workers-1-mutex-2.json"
+    },
+    {
+      "case": "workers-2-fifo",
+      "round": 2,
+      "run_id": "56290cf7-d6eb-4a87-9810-a0bf361e450e",
+      "file": "workers-2-fifo-2.json"
+    },
+    {
+      "case": "workers-2-mutex",
+      "round": 2,
+      "run_id": "ce0415d8-dbb0-4cbf-b3d5-aed36220e982",
+      "file": "workers-2-mutex-2.json"
+    },
+    {
+      "case": "workers-4-fifo",
+      "round": 2,
+      "run_id": "2fb5f134-7716-44a7-8c88-00c18762c348",
+      "file": "workers-4-fifo-2.json"
+    },
+    {
+      "case": "workers-4-mutex",
+      "round": 2,
+      "run_id": "764b47aa-2f12-488f-8e8c-767786edd0bf",
+      "file": "workers-4-mutex-2.json"
+    },
+    {
+      "case": "sustained-4-fifo",
+      "round": 2,
+      "run_id": "7d76e9fb-0d6d-43d4-b264-ed52a6973aa3",
+      "file": "sustained-4-fifo-2.json"
+    },
+    {
+      "case": "sustained-4-mutex",
+      "round": 2,
+      "run_id": "87f2c9e5-ad5b-4c49-8fd0-ec246388e75e",
+      "file": "sustained-4-mutex-2.json"
+    },
+    {
+      "case": "fault-fifo",
+      "round": 2,
+      "run_id": "7455aa93-4989-4e00-b8d2-05b03d11ad3b",
+      "file": "fault-fifo-2.json"
+    },
+    {
+      "case": "fault-mutex",
+      "round": 2,
+      "run_id": "fdd633d8-d44f-4802-9328-dddb8b419ed3",
+      "file": "fault-mutex-2.json"
+    },
+    {
+      "case": "workers-1-mutex",
+      "round": 3,
+      "run_id": "be39c6dd-2b1b-4288-9821-a2d4f408ce37",
+      "file": "workers-1-mutex-3.json"
+    },
+    {
+      "case": "workers-1-fifo",
+      "round": 3,
+      "run_id": "f8a5056d-b395-43fd-b823-35f33256e160",
+      "file": "workers-1-fifo-3.json"
+    },
+    {
+      "case": "workers-2-mutex",
+      "round": 3,
+      "run_id": "ce8b56d1-e6cc-4022-9f21-fa5d08e1c361",
+      "file": "workers-2-mutex-3.json"
+    },
+    {
+      "case": "workers-2-fifo",
+      "round": 3,
+      "run_id": "eec4eb80-808b-47ba-8655-376def5775db",
+      "file": "workers-2-fifo-3.json"
+    },
+    {
+      "case": "workers-4-mutex",
+      "round": 3,
+      "run_id": "65a6f2ac-a416-4969-a695-08ad604fd4e1",
+      "file": "workers-4-mutex-3.json"
+    },
+    {
+      "case": "workers-4-fifo",
+      "round": 3,
+      "run_id": "61b97f18-4397-42e5-bec3-0ad15151e960",
+      "file": "workers-4-fifo-3.json"
+    },
+    {
+      "case": "sustained-4-mutex",
+      "round": 3,
+      "run_id": "0cafd2c8-de3f-467d-a395-d2d6dbecba07",
+      "file": "sustained-4-mutex-3.json"
+    },
+    {
+      "case": "sustained-4-fifo",
+      "round": 3,
+      "run_id": "d68077af-8e6c-4559-9f2e-ce9fc93360c7",
+      "file": "sustained-4-fifo-3.json"
+    },
+    {
+      "case": "fault-mutex",
+      "round": 3,
+      "run_id": "6a4d82ae-2081-4fbe-9c20-98c1a0f05620",
+      "file": "fault-mutex-3.json"
+    },
+    {
+      "case": "fault-fifo",
+      "round": 3,
+      "run_id": "be1fdc7d-42b9-49f3-850e-b1654e77b1ab",
+      "file": "fault-fifo-3.json"
+    }
+  ]
+}

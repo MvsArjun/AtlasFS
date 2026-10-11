@@ -1,0 +1,222 @@
+{
+  "profile": "dispatch",
+  "runner_class": "shared",
+  "runs": [
+    {
+      "case": "dispatch-serial",
+      "round": 1,
+      "run_id": "16e1ff0a-352c-49c6-a600-ecfecd3b42b6",
+      "file": "dispatch-serial-1.json"
+    },
+    {
+      "case": "dispatch-bounded",
+      "round": 1,
+      "run_id": "16c2fdbe-c90a-4df2-8cb8-3e4c33d6f161",
+      "file": "dispatch-bounded-1.json"
+    },
+    {
+      "case": "dispatch-workers-1-serial",
+      "round": 1,
+      "run_id": "c3eefe65-f826-4cb7-b583-4616a72b63f6",
+      "file": "dispatch-workers-1-serial-1.json"
+    },
+    {
+      "case": "dispatch-workers-1-bounded",
+      "round": 1,
+      "run_id": "2b8849ac-6d21-44fc-8a1c-d6ef3bc6b224",
+      "file": "dispatch-workers-1-bounded-1.json"
+    },
+    {
+      "case": "dispatch-workers-2-serial",
+      "round": 1,
+      "run_id": "412f0f73-1d7c-4cfb-8546-bd6ee7923b9f",
+      "file": "dispatch-workers-2-serial-1.json"
+    },
+    {
+      "case": "dispatch-workers-2-bounded",
+      "round": 1,
+      "run_id": "b08ba4bd-0405-493f-a407-15528554194b",
+      "file": "dispatch-workers-2-bounded-1.json"
+    },
+    {
+      "case": "dispatch-workers-4-serial",
+      "round": 1,
+      "run_id": "6ad3263e-4000-45d5-80f4-dbc0b21c3a22",
+      "file": "dispatch-workers-4-serial-1.json"
+    },
+    {
+      "case": "dispatch-workers-4-bounded",
+      "round": 1,
+      "run_id": "91be9bb4-762b-43d8-a72b-e6a9d3cb67a6",
+      "file": "dispatch-workers-4-bounded-1.json"
+    },
+    {
+      "case": "dispatch-sustained-4-serial",
+      "round": 1,
+      "run_id": "4cf49a2f-bfb8-455d-a42f-861583555755",
+      "file": "dispatch-sustained-4-serial-1.json"
+    },
+    {
+      "case": "dispatch-sustained-4-bounded",
+      "round": 1,
+      "run_id": "13f027ef-c3fd-4497-aa09-7df46cc7b395",
+      "file": "dispatch-sustained-4-bounded-1.json"
+    },
+    {
+      "case": "dispatch-fault-serial",
+      "round": 1,
+      "run_id": "d3c8649d-cdd3-49da-bca3-eac82e9abfff",
+      "file": "dispatch-fault-serial-1.json"
+    },
+    {
+      "case": "dispatch-fault-bounded",
+      "round": 1,
+      "run_id": "4450d9b2-3572-48e1-915e-dd42b0d0f9a4",
+      "file": "dispatch-fault-bounded-1.json"
+    },
+    {
+      "case": "dispatch-bounded",
+      "round": 2,
+      "run_id": "74161bd1-c5bd-4b96-a788-96249b386053",
+      "file": "dispatch-bounded-2.json"
+    },
+    {
+      "case": "dispatch-serial",
+      "round": 2,
+      "run_id": "635bda86-26b7-4997-a40c-4a6b18d6f54c",
+      "file": "dispatch-serial-2.json"
+    },
+    {
+      "case": "dispatch-workers-1-bounded",
+      "round": 2,
+      "run_id": "09586aa7-208f-448f-8509-193425aa0ca7",
+      "file": "dispatch-workers-1-bounded-2.json"
+    },
+    {
+      "case": "dispatch-workers-1-serial",
+      "round": 2,
+      "run_id": "803b2a3d-b4cb-4c17-ba9d-a842905dcd9c",
+      "file": "dispatch-workers-1-serial-2.json"
+    },
+    {
+      "case": "dispatch-workers-2-bounded",
+      "round": 2,
+      "run_id": "ede5eb5e-0b47-4c5d-8107-87e6d3d46fb3",
+      "file": "dispatch-workers-2-bounded-2.json"
+    },
+    {
+      "case": "dispatch-workers-2-serial",
+      "round": 2,
+      "run_id": "2be8903a-dd9d-4750-8031-9ffd73a187a7",
+      "file": "dispatch-workers-2-serial-2.json"
+    },
+    {
+      "case": "dispatch-workers-4-bounded",
+      "round": 2,
+      "run_id": "1bd1dc0f-41eb-48f5-aedc-9d1d29875765",
+      "file": "dispatch-workers-4-bounded-2.json"
+    },
+    {
+      "case": "dispatch-workers-4-serial",
+      "round": 2,
+      "run_id": "2fc8c49c-2238-4289-867c-3031e60dc9c9",
+      "file": "dispatch-workers-4-serial-2.json"
+    },
+    {
+      "case": "dispatch-sustained-4-bounded",
+      "round": 2,
+      "run_id": "ab95169a-95d9-465a-ae2c-1a914e3d431d",
+      "file": "dispatch-sustained-4-bounded-2.json"
+    },
+    {
+      "case": "dispatch-sustained-4-serial",
+      "round": 2,
+      "run_id": "addc72af-b303-4d3e-a52b-ebf21fd9fc75",
+      "file": "dispatch-sustained-4-serial-2.json"
+    },
+    {
+      "case": "dispatch-fault-bounded",
+      "round": 2,
+      "run_id": "b145b8ee-6d1a-43ec-9e18-ea50dde9f963",
+      "file": "dispatch-fault-bounded-2.json"
+    },
+    {
+      "case": "dispatch-fault-serial",
+      "round": 2,
+      "run_id": "873047dd-517b-4caf-b086-3b8ba3d4c69c",
+      "file": "dispatch-fault-serial-2.json"
+    },
+    {
+      "case": "dispatch-serial",
+      "round": 3,
+      "run_id": "77ac58e5-d858-41ef-9ea7-46c9013a076e",
+      "file": "dispatch-serial-3.json"
+    },
+    {
+      "case": "dispatch-bounded",
+      "round": 3,
+      "run_id": "f524d55f-ea93-460d-8cc5-5529753164fa",
+      "file": "dispatch-bounded-3.json"
+    },
+    {
+      "case": "dispatch-workers-1-serial",
+      "round": 3,
+      "run_id": "9c2fd0ea-1472-4a92-9df7-f41743814b2d",
+      "file": "dispatch-workers-1-serial-3.json"
+    },
+    {
+      "case": "dispatch-workers-1-bounded",
+      "round": 3,
+      "run_id": "195176a6-fb50-40c2-bde3-6774f16e4d2b",
+      "file": "dispatch-workers-1-bounded-3.json"
+    },
+    {
+      "case": "dispatch-workers-2-serial",
+      "round": 3,
+      "run_id": "099977bb-6503-4c1a-bfd7-1224739ebe11",
+      "file": "dispatch-workers-2-serial-3.json"
+    },
+    {
+      "case": "dispatch-workers-2-bounded",
+      "round": 3,
+      "run_id": "02c5f033-3be7-44c1-b44b-b7f6823166eb",
+      "file": "dispatch-workers-2-bounded-3.json"
+    },
+    {
+      "case": "dispatch-workers-4-serial",
+      "round": 3,
+      "run_id": "36e64b61-1236-43c4-8c73-539361ea96b2",
+      "file": "dispatch-workers-4-serial-3.json"
+    },
+    {
+      "case": "dispatch-workers-4-bounded",
+      "round": 3,
+      "run_id": "c5a74959-4c78-40c2-99d1-a1c791e30e02",
+      "file": "dispatch-workers-4-bounded-3.json"
+    },
+    {
+      "case": "dispatch-sustained-4-serial",
+      "round": 3,
+      "run_id": "52739741-b787-4a47-85a0-2057a9fabaff",
+      "file": "dispatch-sustained-4-serial-3.json"
+    },
+    {
+      "case": "dispatch-sustained-4-bounded",
+      "round": 3,
+      "run_id": "59d505bf-e6f6-464c-86f9-50b95215bfe6",
+      "file": "dispatch-sustained-4-bounded-3.json"
+    },
+    {
+      "case": "dispatch-fault-serial",
+      "round": 3,
+      "run_id": "15d928b5-725a-4a14-8837-f405e474e32d",
+      "file": "dispatch-fault-serial-3.json"
+    },
+    {
+      "case": "dispatch-fault-bounded",
+      "round": 3,
+      "run_id": "9b0d9173-2db5-45ea-bb72-a09b695dd345",
+      "file": "dispatch-fault-bounded-3.json"
+    }
+  ]
+}

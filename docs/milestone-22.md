@@ -2,10 +2,17 @@
 
 ## Status and scope
 
-This document describes the implementation candidate and the reproduced
-Milestone 21 baseline. Final performance measurements, verification evidence,
-publication commit, and remote/CI confirmation are pending and must be recorded
-before marking this milestone complete.
+The implementation is published and verified. The starting Milestone 21 revision
+is `323872f75f5650d56e89bf6f919573cccc4a113d`; scheduling/dispatch implementation
+is `020c8fab50ad9e3f1e266e2b2f8c3578efca38fd`, final runtime hardening is
+`115415fe1d0c447c2dcdabce98dbb17e284265fa`, and corrected handoff-bound testing is
+`3eb679b2cd7b980e86512c91a57c18be337832cc`. Subsequent delivery changes retain
+results/documentation only. No published history was rewritten.
+
+FIFO fairness, bounded overload and independent connection progress are
+demonstrated, and correctness/security/recovery checks pass. The requested
+universal throughput non-regression criterion is not established: small read/RPC
+costs and variable repair/mixed stalls are reported explicitly below.
 
 AtlasFS retains one authoritative coordinator, the existing epoch guard, and
 the existing catalog CAS boundary. This change does not introduce consensus,
@@ -289,7 +296,7 @@ Use `controlled` only on an operator-controlled exclusive Linux runner. Hosted
 workflow results must remain labeled `shared`. No ratio between different CPU
 or VM fingerprints is valid optimization evidence.
 
-## Final evidence pending
+## Verification history and investigated failures
 
 The first hardened-code CI attempt
 [38162648935](https://github.com/MvsArjun/AtlasFS/actions/runs/38162648935)
@@ -300,7 +307,8 @@ race. The corrected bound is waiting ≤ min(configured capacity, worker count),
 and active handler plus waiting callers ≤ worker count. The independent assertion
 that handler concurrency is one remains unchanged. This is a test/documentation
 correction, not relaxation of queue capacity or authority serialization. Final
-CI must pass the corrected test before completion.
+CI passed the corrected test in the full normal and sanitizer suites and repeated
+normal integrations, as recorded below.
 
 The initial implementation `020c8fab50ad9e3f1e266e2b2f8c3578efca38fd`
 passed [Linux verification](https://github.com/MvsArjun/AtlasFS/actions/runs/38114978604):
@@ -320,8 +328,8 @@ Counts were identical: 2,400 file syncs, 2,400 directory syncs and 13,256,680
 written bytes per mixed round. In the two slow FIFO rounds, sync wait grew
 approximately 0.90→1.31 s and 0.94→1.24 s, accounting for most of the extra
 0.42/0.47 s wall time. Hosted filesystem variation is a plausible contributor,
-not a proven dismissal of the observed regression. Follow-up measurements are
-required after targeted FIFO wakeups and final endpoint hardening.
+not a proven dismissal of the observed regression. The follow-up measurements
+after targeted FIFO wakeups and final endpoint hardening are recorded below.
 
 Initial three-round [dispatch measurements](https://github.com/MvsArjun/AtlasFS/actions/runs/38115005101)
 on fingerprint `b78ff2ba8010ed1c02bbea6f7573983212914cd35ffd7f4d5a1b4ace9e275a56`
@@ -343,12 +351,147 @@ sanitizer results.
 The combined TLS/epoch/repair/recovery/scheduling repeat selected 77 tests;
 all ten repetitions passed (770 executions, 88.37 s).
 
-Before completion, record the final implementation commit, normal/ASan/UBSan/
-TSan counts and timings, Cppcheck, production builds, repeated integration tests,
-fresh-clone verification, smoke outcomes, paired admission/dispatch measurements,
-raw-report provenance, normal push/remote SHA confirmation, and completed CI.
-Interpret throughput regressions and queue/CPU/RSS tradeoffs explicitly rather
-than assuming more workers improve throughput.
+The hardened local suite passed 365/365 (43.79 s), with 40 additions to M21:
+16 admission, 17 dispatch and seven fenced/durable scheduling tests. All 420
+targeted repeated executions passed, along with 40 extra response-limit repeats
+and 50 corrected isolated-state/handler-serialization repeats. The earlier
+770 combined TLS/epoch/repair/recovery/scheduling executions also passed.
+Cppcheck 2.21 passed 25 source/benchmark translation units; production-only
+Release with benchmarks enabled built successfully. Both final smoke modes
+validated 27 workloads/81 cycles, and all 14 Python tooling tests passed.
+An independent remote fresh clone of the hardened runtime passed 365/365
+(43.66 s), valid smoke and all 14 tooling tests with a clean source checkout.
+Fast-forwarding that independent checkout to the corrected handoff-bound test
+revision also passed 365/365 (42.88 s).
+
+[Corrected Linux CI 38162957314](https://github.com/MvsArjun/AtlasFS/actions/runs/38162957314)
+at `3eb679b2cd7b980e86512c91a57c18be337832cc` completed successfully:
+
+| Check | Actual result |
+| --- | --- |
+| Normal Debug | 365/365, 7.08 s |
+| ASan/UBSan, leak detection enabled | 365/365, 43.43 s |
+| TSan, halt on error | 365/365, 22.37 s |
+| Instrumented and disabled smoke, each matrix job | 27 workloads/81 cycles each |
+| Python tooling, each matrix job | 14/14 |
+| TLS repair repeats | 7 × 10 = 70 executions |
+| Epoch/repair/recovery repeats | 31 × 10 = 310 executions |
+| Admission/dispatch/integration repeats | 42 × 10 = 420 executions |
+| Normal Cppcheck and production-only Release + benchmarks | Passed |
+
+The failed earlier CI attempt remains recorded above. It was investigated and
+corrected; it is not counted as a passing sanitizer run. A clean sanitizer run
+does not prove fairness, real-time bounds or deadlock freedom.
+
+## Final paired Linux observations
+
+Full paired JSON, comparison CSVs, summary tables and artifact provenance are
+retained in [benchmarks/results/m22](../benchmarks/results/m22/README.md).
+Each paired experiment used one clean Release binary, identical build flags,
+seed, work volume, limits, warmups and instrumentation, and three alternating
+rounds. All values below are medians of per-round values except explicitly
+labeled maximum waits (the maximum across all measured rounds).
+
+The final source-tree checksum is
+`5677661cfb33a60b467a5316a5c28e26eb7a0a0509877465f5716725a8e77ebf`.
+Admission/dispatch reports identify runtime commit `115415f`; the default
+characterization identifies `3eb679b`, whose change was tests/documentation only.
+Source/build metadata was preserved rather than relabeling earlier measurements.
+
+### FIFO versus mutex, serial server held constant
+
+[Admission run 38162678128](https://github.com/MvsArjun/AtlasFS/actions/runs/38162678128)
+completed 30 reports/24,384 measured cycles, including 3,840 deliberately rejected
+capacity-zero attempts. Unexpected errors and timeouts were zero. Its shared
+runner fingerprint is
+`ec6696a00ab35046df0c1cae4f42e5f3f55c614c45938afd67a24d7eefaa1c7d`:
+EPYC 7763, two CPUs, 8,323,969,024 bytes memory; Ubuntu 24.04.5,
+kernel 6.17.0-1022-azure, GCC 13.3, CMake 3.31.6, Ninja 1.13.2,
+OpenSSL 3.0.13, Release `-O3 -DNDEBUG`, warm-cache loopback TLS.
+
+| Read workers | Mutex → FIFO ops/s | Queue p99 ms | End-to-end p99 ms |
+| --- | ---: | ---: | ---: |
+| 1 | 447.631 → 447.957 | 0.000381 → 0.000862 | 2.485 → 2.437 |
+| 2 | 437.023 → 434.588 | 178.803 → 2.583 | 181.185 → 4.872 |
+| 4 | 437.542 → 431.378 | 180.394 → 10.236 | 182.643 → 13.198 |
+
+Read-throughput changes were +0.07%, -0.56%, and -1.41%; this is fairness
+improvement with small measured handoff overhead, not a throughput scaling
+claim or proof of zero regression. Four-worker typical end-to-end p50/p95 rose
+2.258/2.379 → 9.095/10.576 ms as waiting callers stopped being bypassed.
+Queue p50/p95 rose 0.000221/0.002525 → 6.834/8.321 ms while the extreme tail
+shrank. All other p50/p95 values remain in the retained summary CSV.
+
+For the 400-cycle four-worker sustained read batch, ops/s were
+443.428→438.089 (-1.20%), but maximum queue wait fell
+903.938→7.716 ms. Its mutex p99 was only 0.002916 ms: three starved workers
+among 400 operations can be invisible to p99. For sustained mixed work,
+ops/s were 133.466→136.094 (+1.97%), end-to-end p99
+38.475→36.827 ms, and maximum queue wait 3,049.131→41.303 ms.
+This does not retroactively erase the initial mixed-throughput regression on
+a different fingerprint, nor prove the wakeup change alone caused the difference.
+
+Read CPU time for 80 cycles was 0.194577→0.195305 s (one worker),
+0.200657→0.200729 s (two), and 0.198529→0.200742 s (four).
+Process CPU utilization stayed about 109% (approximately 1.09 of two exposed
+cores), and median process peak RSS was 19,423,232 bytes for both policies.
+RSS is a whole-process high-water observation, not a per-operation allocation
+bound or committed/physical filesystem footprint.
+
+### Serial versus bounded dispatch, FIFO held constant
+
+[Dispatch run 38162680828](https://github.com/MvsArjun/AtlasFS/actions/runs/38162680828)
+completed 36 reports/24,528 cycles, including the same 3,840 deliberate overload
+attempts, with zero unexpected errors or timeouts. Its different shared runner
+fingerprint is
+`c349ed44a59e634c5ef189b63523f6842ed7b42a50b3a773089412d312933a58`:
+EPYC 9V45, two CPUs, 8,323,969,024 memory bytes; the same OS/kernel/toolchain,
+Release flags, filesystem policy and loopback methodology. Ratios below are
+internal to this job; admission and dispatch fingerprints are never divided.
+
+| Independent authenticated connection | Serial → bounded p50 ms | p95/p99 ms |
+| --- | ---: | ---: |
+| First connection idle | 201.521 → 2.096 | 202.176 → 2.212 |
+| First connection partial frame | 201.525 → 2.068 | 201.599 → 2.164 |
+
+The 200 ms server deadline deliberately reveals full-connection blocking.
+Both variants succeeded; bounded mode admitted two independent slots, serial
+mode peaked at one. Twelve measured cycles per round make p95 and p99 both
+the maximum sample: this is not precise production-tail estimation.
+
+Distributed read ops/s for 1/2/4 workers were
+810.456→791.739 (-2.31%), 784.560→788.161 (+0.46%), and
+781.337→798.792 (+2.23%). Sustained read was 794.151→798.170 (+0.51%);
+sustained mixed was 165.690→166.899 (+0.73%). Established-query RPC
+p50/p99 with the four-worker configuration was 0.053620/0.115393→
+0.055273/0.107812 ms; throughput 18,214.318→17,534.331/s (-3.73%).
+The tiny-RPC handler gate has measurable overhead and is not advertised as free.
+The sustained mixed maximum queue wait also worsened 97.027→568.050 ms;
+filesystem/durable-handler stalls remain possible even with FIFO admission.
+Bounded connection dispatch does not bound active filesystem service time.
+
+Remote repair/publication/verification/catalog-CAS was 165.273→155.013/s
+(-6.21%), p50 5.836→5.880 ms and p99 10.426→10.899 ms. Individual bounded
+rounds were 155.013, 121.036 and 167.747/s, versus serial 165.273, 165.903
+and 164.407/s. The slow second bounded round spent 118.43 ms in syncs versus
+73.76 ms for serial, closely matching its 44.69 ms extra wall time. Variation
+is explicitly retained; no universal repair throughput non-regression is proven.
+Four-worker read CPU time was 0.109477→0.107032 s; process CPU stayed about
+107%. Median peak RSS was 19,324,928→19,193,856 bytes, a small whole-process
+observation rather than evidence of lower intrinsic dispatch memory needs.
+
+### Default candidate characterization
+
+[Characterization run 38162994312](https://github.com/MvsArjun/AtlasFS/actions/runs/38162994312)
+completed 39 validated reports/11,160 measured cycles, including 960 deliberate
+capacity-zero overload attempts, with zero unexpected errors and timeouts.
+It uses the admission fingerprint `ec6696a0…`,
+not the reproduced M21 fingerprint `b78ff2ba…`. Default FIFO/bounded read
+ops/s were 445.017/433.960/428.326 for 1/2/4 workers; queue p99
+0.000932/2.441548/8.008566 ms and end-to-end p99
+2.655420/4.753834/10.314191 ms. No speedup ratio against the separately
+reproduced M21 job is claimed. Characterization includes local counter overhead,
+chunk/replication variants, retained startup state and verified recovery cycles.
 
 Remaining design limits include single-handler execution, shared-client
 serialization, no handler preemption or rollback, bounded but finite connection
