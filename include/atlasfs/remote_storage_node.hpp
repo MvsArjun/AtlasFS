@@ -13,10 +13,14 @@
 
 namespace atlasfs::replication {
 
-class RemoteStorageNodeClient final : public StorageNode {
+class RemoteStorageNodeClient final : public StorageNode, public epoch::Participant {
 public:
     RemoteStorageNodeClient(std::string node_id, std::uint16_t port);
     RemoteStorageNodeClient(std::string node_id, std::uint16_t port, net::TlsConfig config);
+    RemoteStorageNodeClient(std::string node_id, std::uint16_t port, net::TlsConfig config, epoch::Token token);
+    [[nodiscard]] std::optional<epoch::Token> epoch_token() const override { return epoch_; }
+    epoch::Result activate_epoch(const epoch::Token& expected, const epoch::Token& desired) override;
+    epoch::Result query_epoch() const override;
     [[nodiscard]] std::string_view id() const noexcept override;
     [[nodiscard]] storage::StoreError prepare(std::string_view, std::string_view,
         const storage::ObjectManifest&, std::span<const std::uint32_t>,
@@ -49,6 +53,7 @@ private:
     std::string node_id_;
     mutable net::TcpClient client_;
     mutable std::uint64_t next_request_id_{1};
+    std::optional<epoch::Token> epoch_;
 };
 
 class StorageNodeServer {
@@ -59,7 +64,9 @@ public:
     StorageNodeServer(std::shared_ptr<StorageNode> node, std::filesystem::path journal_root,
                      net::TlsConfig config, std::uint16_t port = 0,
                      bool drop_commit_response_once = false,
-                     bool drop_repair_response_once = false);
+                     bool drop_repair_response_once = false,
+                     std::shared_ptr<epoch::Store> fence = {},
+                     bool drop_epoch_response_once = false);
     [[nodiscard]] std::uint16_t port() const noexcept;
     void serve();
     void stop() noexcept;
@@ -71,6 +78,7 @@ private:
         std::uint32_t probe_chunk{};
         std::string object_id;
         std::string generation_id;
+        std::optional<epoch::Token> epoch;
     };
     struct RepairRecord {
         storage_node_protocol::RepairResponseStatus status{
@@ -80,8 +88,11 @@ private:
         std::string plan_id;
         std::string object_id;
         std::string generation_id;
+        std::optional<epoch::Token> epoch;
     };
-    [[nodiscard]] protocol::Message handle(const protocol::Message& request);
+    [[nodiscard]] protocol::Message handle(const protocol::Message& request,
+        std::optional<epoch::Token> request_epoch = std::nullopt);
+    [[nodiscard]] protocol::Message handle_authenticated(const protocol::Message&, const net::PeerPolicy&);
     void load_records();
     void load_repair_records();
     [[nodiscard]] bool persist(std::string_view operation_id, const Record& record);
@@ -94,6 +105,8 @@ private:
     std::map<std::string, RepairRecord, std::less<>> repair_records_;
     bool drop_commit_response_once_{};
     bool drop_repair_response_once_{};
+    std::shared_ptr<epoch::Store> fence_;
+    bool drop_epoch_response_once_{};
     net::TcpServer server_;
 };
 

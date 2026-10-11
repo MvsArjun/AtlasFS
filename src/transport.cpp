@@ -191,6 +191,8 @@ bool authorize_storage(const PeerPolicy& peer, std::string_view target,
         case protocol::MessageType::storage_delete_request:
         case protocol::MessageType::storage_query_request:
         case protocol::MessageType::storage_repair_chunk_request: return true;
+        case protocol::MessageType::epoch_query_request: return true;
+        case protocol::MessageType::epoch_activate_request: return peer.may_activate_epoch;
         default: return false;
     }
 }

@@ -917,8 +917,8 @@ protected:
     class Running {
     public:
         Running(std::shared_ptr<replication::StorageNode> node, const std::filesystem::path& journal,
-                net::TlsConfig config, bool drop = false)
-            : server(std::move(node), journal, std::move(config), 0, false, drop),
+                net::TlsConfig config, bool drop = false, std::shared_ptr<epoch::Store> fence = {})
+            : server(std::move(node), journal, std::move(config), 0, false, drop, std::move(fence)),
               thread([this] { try { server.serve(); } catch (...) { error = std::current_exception(); } }) {}
         ~Running() { stop(); }
         void stop() { server.stop(); if (thread.joinable()) thread.join(); }
@@ -1099,6 +1099,117 @@ TEST_F(TlsRepair, StoragePeerMayReadButEveryCoordinatorRpcIsDeniedBeforeDispatch
     EXPECT_TRUE(std::filesystem::is_empty(root.path() / "journal" / "repairs"));
     EXPECT_TRUE(std::filesystem::is_empty(root.path() / "journal" / "operations"));
     EXPECT_EQ(local_target->get_chunk("object", "generation-1", 0).error, storage::StoreError::not_found);
+}
+class EpochRepair : public TlsRepair {
+protected:
+    const epoch::Token token{"repair-domain", 1, "coordinator", "activation-1"};
+    const epoch::Token successor{"repair-domain", 2, "coordinator", "activation-2"};
+    std::shared_ptr<epoch::Store> authority;
+    std::shared_ptr<epoch::Store> target_fence;
+    EpochRepair() {
+        std::filesystem::create_directories(root.path() / "coordinator");
+        epoch::Store::provision(root.path() / "coordinator" / "epoch", token);
+        authority = std::make_shared<epoch::Store>(root.path() / "coordinator" / "epoch", token);
+        std::filesystem::create_directory(root.path() / "target-journal");
+        epoch::Store::provision(root.path() / "target-journal" / "epoch", token);
+        target_fence = std::make_shared<epoch::Store>(root.path() / "target-journal" / "epoch", token);
+        target.peers.begin()->second.may_activate_epoch = true;
+    }
+};
+TEST_F(EpochRepair, FourNodePlacementWithFencedRemoteTargetPreservesHistory) {
+    metadata::DurableReplicaCatalog catalog(root.path(), authority, token);
+    ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+    metadata::CoordinatorOperationStore history(root.path());
+    ASSERT_EQ(history.create(metadata::make_coordinator_operation(fixture.placement, "history", 77)),
+              metadata::CoordinatorRecordError::none);
+    const auto before = metadata::encode_coordinator_operation(*history.get("history"));
+    auto local_source = source();
+    auto local_target = std::make_shared<replication::LocalStorageNode>("d", root.path() / "target", 1024, 1);
+    Running running(local_target, root.path() / "target-journal", target, false, target_fence);
+    auto remote = std::make_shared<replication::RemoteStorageNodeClient>("d", running.server.port(), coordinator, token);
+    const auto plan = execution_plan(fixture, catalog);
+    RepairPlanStore plans(root.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+    RepairExecutor executor(plans, catalog, {local_source, remote});
+    ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+    EXPECT_EQ(executor.execute(plan.plan_id, fixture.placement, fixture.members).state, RepairPlanState::completed);
+    EXPECT_EQ(catalog.version(), 2U);
+    EXPECT_EQ(plans.get(plan.plan_id)->execution_epoch, token);
+    EXPECT_EQ(metadata::encode_coordinator_operation(*history.get("history")), before);
+}
+class EpochRepairCrash : public EpochRepair, public ::testing::WithParamInterface<RepairExecutionFaultPoint> {};
+TEST_P(EpochRepairCrash, SameEpochRestartRecoversOriginalIdentityAndEvidence) {
+    metadata::DurableReplicaCatalog catalog(root.path(), authority, token);
+    ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+    auto local_source = source();
+    auto local_target = std::make_shared<replication::LocalStorageNode>("d", root.path() / "target", 1024, 1);
+    Running running(local_target, root.path() / "target-journal", target, false, target_fence);
+    auto remote = std::make_shared<replication::RemoteStorageNodeClient>("d", running.server.port(), coordinator, token);
+    const auto plan = execution_plan(fixture, catalog);
+    RepairPlanStore plans(root.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+    RepairExecutor interrupted(plans, catalog, {local_source, remote}, [&](auto point) { return point == GetParam(); });
+    ASSERT_EQ(interrupted.approve(plan.plan_id), RepairStoreError::none);
+    ASSERT_EQ(interrupted.execute(plan.plan_id, fixture.placement, fixture.members).error, RepairExecutionError::recovery_interrupted);
+    const auto durable = plans.get(plan.plan_id); ASSERT_TRUE(durable);
+    ASSERT_EQ(durable->execution_epoch, token);
+    const auto encoded = encode_repair_plan(*durable);
+    EXPECT_EQ(std::to_integer<unsigned>(encoded[5]), 4U);
+    EXPECT_EQ(decode_repair_plan(encoded), durable);
+    RepairPlanStore restarted_plans(root.path());
+    metadata::DurableReplicaCatalog restarted_catalog(root.path(), authority, token);
+    RepairExecutor recovery(restarted_plans, restarted_catalog, {local_source, remote});
+    EXPECT_EQ(recovery.reconcile(plan.plan_id, fixture.placement, fixture.members).state, RepairPlanState::completed);
+    EXPECT_EQ(restarted_plans.get(plan.plan_id)->execution_id, durable->execution_id);
+    EXPECT_EQ(restarted_plans.get(plan.plan_id)->execution_epoch, token);
+    EXPECT_EQ(restarted_catalog.version(), 2U);
+}
+TEST_P(EpochRepairCrash, SupersededEpochCannotReplayOrCompleteBeforeOrAfterCas) {
+    metadata::DurableReplicaCatalog catalog(root.path(), authority, token);
+    ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+    auto local_source = source();
+    auto local_target = std::make_shared<replication::LocalStorageNode>("d", root.path() / "target", 1024, 1);
+    Running running(local_target, root.path() / "target-journal", target, false, target_fence);
+    auto remote = std::make_shared<replication::RemoteStorageNodeClient>("d", running.server.port(), coordinator, token);
+    const auto plan = execution_plan(fixture, catalog);
+    RepairPlanStore plans(root.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+    RepairExecutor interrupted(plans, catalog, {local_source, remote}, [&](auto point) { return point == GetParam(); });
+    ASSERT_EQ(interrupted.approve(plan.plan_id), RepairStoreError::none);
+    ASSERT_EQ(interrupted.execute(plan.plan_id, fixture.placement, fixture.members).error, RepairExecutionError::recovery_interrupted);
+    const auto durable = plans.get(plan.plan_id); ASSERT_TRUE(durable);
+    const auto before = catalog.snapshot();
+    epoch::Coordinator activation(*authority, {remote});
+    ASSERT_EQ(activation.activate(successor.coordinator, successor.activation).token, successor);
+    EXPECT_EQ(interrupted.reconcile(plan.plan_id, fixture.placement, fixture.members).error, RepairExecutionError::stale_epoch);
+    EXPECT_EQ(catalog.snapshot(), before);
+    metadata::DurableReplicaCatalog current(root.path(), authority, successor);
+    RepairPlanStore restarted_plans(root.path());
+    RepairExecutor replacement(restarted_plans, current, {local_source, remote});
+    EXPECT_EQ(replacement.reconcile(plan.plan_id, fixture.placement, fixture.members).error, RepairExecutionError::stale_epoch);
+    EXPECT_EQ(restarted_plans.get(plan.plan_id), durable);
+    EXPECT_EQ(current.snapshot(), before);
+    EXPECT_EQ(remote->publish_repair(plan.plan_id, durable->execution_id, "d", "object", fixture.manifest,
+        fixture.manifest.chunks[0], fixture.data).status, replication::RepairPublishStatus::stale_epoch);
+    auto adopted = *durable; adopted.execution_epoch = successor;
+    EXPECT_EQ(restarted_plans.update(adopted), RepairStoreError::conflict);
+    if (GetParam() == RepairExecutionFaultPoint::after_executing_persist)
+        EXPECT_EQ(local_target->get_chunk("object", "generation-1", 0).error, storage::StoreError::not_found);
+    else EXPECT_EQ(local_target->get_chunk("object", "generation-1", 0).data, fixture.data);
+}
+INSTANTIATE_TEST_SUITE_P(CrashWindows, EpochRepairCrash, ::testing::Values(
+    RepairExecutionFaultPoint::after_executing_persist,
+    RepairExecutionFaultPoint::after_publication_persist,
+    RepairExecutionFaultPoint::after_catalog_commit));
+TEST_F(EpochRepair, UnfencedOldRepairCannotBeAdoptedIntoFencedCatalog) {
+    metadata::DurableReplicaCatalog catalog(root.path(), authority, token);
+    ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+    auto plan = execution_plan(fixture, catalog);
+    RepairPlanStore plans(root.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+    plan.state = RepairPlanState::approved; ASSERT_EQ(plans.update(plan), RepairStoreError::none);
+    plan.state = RepairPlanState::executing; plan.execution_id = "legacy-execution";
+    ASSERT_EQ(plans.update(plan), RepairStoreError::none);
+    RepairExecutor executor(plans, catalog, {source()});
+    EXPECT_EQ(executor.reconcile(plan.plan_id, fixture.placement, fixture.members).error, RepairExecutionError::stale_epoch);
+    EXPECT_EQ(plans.get(plan.plan_id)->execution_id, "legacy-execution");
+    EXPECT_FALSE(plans.get(plan.plan_id)->metadata_committed);
 }
 }  // namespace
 }  // namespace atlasfs::repair

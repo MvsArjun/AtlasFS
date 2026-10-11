@@ -41,6 +41,9 @@ jobs:
       - name: Repeat authenticated repair integration tests
         if: matrix.mode == 'normal'
         run: ctest --test-dir build -R TlsRepair --repeat until-fail:10 --output-on-failure --timeout 60
+      - name: Repeat epoch activation and recovery integration tests
+        if: matrix.mode == 'normal'
+        run: ctest --test-dir build -R 'EpochActivation|EpochRpc|EpochRepair|EpochCatalog' --repeat until-fail:10 --output-on-failure --timeout 60
       - name: Production-only build
         if: matrix.mode == 'normal'
         run: cmake -S . -B build-production -G Ninja -DBUILD_TESTING=OFF -DCMAKE_CXX_COMPILER=g++-13 && cmake --build build-production --parallel 4

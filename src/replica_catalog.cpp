@@ -308,9 +308,25 @@ std::optional<ReplicaCatalogSnapshot> decode_replica_catalog(
 DurableReplicaCatalog::DurableReplicaCatalog(
     std::filesystem::path root,
     ReplicaCatalogFaultInjector fault_injector)
+    : DurableReplicaCatalog(std::move(root), std::move(fault_injector), {}, std::nullopt) {}
+
+DurableReplicaCatalog::DurableReplicaCatalog(std::filesystem::path root,
+    std::shared_ptr<epoch::Store> authority, epoch::Token session, ReplicaCatalogFaultInjector fault)
+    : DurableReplicaCatalog(std::move(root), std::move(fault), std::move(authority), std::move(session)) {}
+
+DurableReplicaCatalog::DurableReplicaCatalog(std::filesystem::path root,
+    ReplicaCatalogFaultInjector fault_injector, std::shared_ptr<epoch::Store> authority,
+    std::optional<epoch::Token> session)
     : directory_(std::move(root) / "coordinator" / "replicas"),
       record_path_(directory_ / "catalog"),
-      fault_injector_(std::move(fault_injector)) {
+      fault_injector_(std::move(fault_injector)), authority_(std::move(authority)), session_(std::move(session)) {
+    const auto epoch_path = directory_.parent_path() / "epoch";
+    if (authority_) {
+        if (!session_ || !epoch::valid_token(*session_) || authority_->directory() != std::filesystem::canonical(epoch_path))
+            throw std::invalid_argument("invalid catalog epoch authority");
+    } else if (std::filesystem::exists(epoch_path) || std::filesystem::exists(directory_.parent_path() / "epoch.enrolled")) {
+        throw std::invalid_argument("enrolled catalog requires epoch session");
+    }
     std::error_code error;
     std::vector<std::filesystem::path> missing_directories;
     for (auto path = directory_; !path.empty();) {
@@ -381,6 +397,8 @@ ReplicaCatalogError DurableReplicaCatalog::upsert(
     if (!valid_payload(identity, chunk, replicas)) {
         return ReplicaCatalogError::invalid_record;
     }
+    std::unique_ptr<epoch::Guard> guard;
+    try { guard = authorize_epoch(); } catch (const epoch::Error&) { return ReplicaCatalogError::epoch_rejected; }
     const std::scoped_lock lock(mutex_);
     if (durability_unknown_) {
         return ReplicaCatalogError::durability_unknown;
@@ -417,6 +435,8 @@ ReplicaCatalogError DurableReplicaCatalog::erase(const ChunkIdentity& identity) 
     if (!valid_identity(identity)) {
         return ReplicaCatalogError::invalid_record;
     }
+    std::unique_ptr<epoch::Guard> guard;
+    try { guard = authorize_epoch(); } catch (const epoch::Error&) { return ReplicaCatalogError::epoch_rejected; }
     const std::scoped_lock lock(mutex_);
     if (durability_unknown_) {
         return ReplicaCatalogError::durability_unknown;
@@ -440,6 +460,10 @@ ReplicaCatalogCasResult DurableReplicaCatalog::compare_exchange(
     if (!valid_identity(request.identity) ||
         request.expected_catalog_version == 0) {
         return {ReplicaCatalogCasStatus::invalid_request, 0, std::nullopt};
+    }
+    std::unique_ptr<epoch::Guard> guard;
+    try { guard = authorize_epoch(); } catch (const epoch::Error&) {
+        return {ReplicaCatalogCasStatus::epoch_rejected, 0, std::nullopt};
     }
     const std::scoped_lock lock(mutex_);
     auto result = [&](ReplicaCatalogCasStatus status) {
@@ -495,6 +519,8 @@ ReplicaCatalogCasResult DurableReplicaCatalog::compare_exchange(
         case ReplicaCatalogError::conflict:
         case ReplicaCatalogError::not_found:
             return result(ReplicaCatalogCasStatus::persistence_error);
+        case ReplicaCatalogError::epoch_rejected:
+            return result(ReplicaCatalogCasStatus::epoch_rejected);
     }
     return result(ReplicaCatalogCasStatus::persistence_error);
 }
@@ -506,6 +532,14 @@ std::optional<ReplicaCatalogRecord> DurableReplicaCatalog::get(
     return found == snapshot_.records.end() || found->identity != identity
                ? std::optional<ReplicaCatalogRecord>{}
                : std::optional<ReplicaCatalogRecord>{*found};
+}
+
+std::unique_ptr<epoch::Guard> DurableReplicaCatalog::authorize_epoch() const {
+    if (authority_) return authority_->authorize(*session_);
+    if (std::filesystem::exists(directory_.parent_path() / "epoch") ||
+        std::filesystem::exists(directory_.parent_path() / "epoch.enrolled"))
+        throw epoch::Error(epoch::Status::unauthorized);
+    return {};
 }
 
 std::vector<ReplicaCatalogRecord> DurableReplicaCatalog::list() const {

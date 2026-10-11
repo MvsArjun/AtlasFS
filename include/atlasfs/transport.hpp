@@ -23,6 +23,7 @@ struct PeerIdentity {
 struct PeerPolicy {
     PeerIdentity identity;
     std::set<std::string, std::less<>> targets;
+    bool may_activate_epoch{};
 };
 struct TlsConfig {
     std::filesystem::path certificate_file;

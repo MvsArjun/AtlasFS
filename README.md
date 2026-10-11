@@ -55,7 +55,8 @@ data and never rewrites historical operation records.
 
 Approved plans may be executed explicitly through `RepairExecutor`. Execution is
 locally serialized, revalidates membership, health, generation, chunk, and exact
-catalog evidence immediately before transfer, and journals progress in ARPL v3.
+catalog evidence immediately before transfer, and journals progress in ARPL v3
+(v4 for epoch-bound execution).
 Local and remote targets use the same repair-publisher boundary. Remote requests
 bind plan, execution, target-node, object, generation, manifest, chunk, and
 integrity evidence without accepting filesystem paths. Targets stage, sync,
@@ -144,6 +145,19 @@ docs/             Engineering decisions and protocol specification
 ```
 
 ## Current scope
+
+Milestone 19 adds durable coordinator-epoch fencing under explicit,
+operator-controlled activation. TLS-authorized nodes persist an exact successor
+token; every mutating storage RPC checks that token through publication, and
+catalog mutations and repair execution hold the matching local authority guard.
+Pending/partial activation blocks coordinator work until every configured node
+confirms the exact token. Existing TLS sessions do not retain stale mutation
+authority. Same-epoch repair recovery preserves execution IDs and fingerprints;
+new epochs cannot adopt old executions. This is **not consensus, automatic
+failover, or safe multi-coordinator operation**. Provisioning and replacement
+require quiescing existing writers, the complete participant set, persistent
+enrollment state, and independent high-water checkpoints. See
+[Milestone 19](docs/milestone-19.md) for APIs, migration, and failure semantics.
 
 Milestone 18 adds explicit mutual-TLS constructors for `TcpClient`, `TcpServer`,
 `RemoteStorageNodeClient`, and `StorageNodeServer`. TLS 1.3 authenticates certificate

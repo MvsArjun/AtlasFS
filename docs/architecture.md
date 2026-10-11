@@ -463,3 +463,44 @@ session resumption and early data are disabled. Loopback listeners and sequentia
 dispatch remain intentional limitations. Legacy plaintext constructors are
 explicit insecure compatibility paths, not TLS fallback. The full threat model
 and deployment procedure are in [Milestone 18](milestone-18.md).
+
+## Coordinator epoch fencing (Milestone 19)
+
+`epoch::Store` persists one authority namespace's current token and, at the
+coordinator, its pending successor and complete participant IDs. `epoch::Coordinator`
+durably records intent before authenticated activation RPCs and activates local
+work only after every participant confirms the identical token. Reconciliation
+only queries; explicit `resume_activation` retries the original activation, not
+application work. Partial activation and uncertain persistence remain unresolved.
+No daemon startup, heartbeat, membership update, or certificate issuance elects
+or activates a coordinator.
+
+Storage dispatch follows TLS authentication -> role/target authorization ->
+epoch/owner validation -> canonical payload decoding -> protected mutation and
+durable journal -> response. The epoch guard remains held through node publication
+and journal persistence; each request on a persistent socket is checked again.
+GET_CHUNK and QUERY_OPERATION remain read-only under existing TLS policy.
+PREPARE, COMMIT, ABORT, DELETE and REPAIR_CHUNK all require an epoch on enrolled
+nodes. Activation requires a separately granted `may_activate_epoch` policy and
+the proposed owner must match the authenticated coordinator identity.
+
+A fenced `DurableReplicaCatalog` uses `root/coordinator/epoch` and a fixed session
+token. Its upsert, erase and CAS hold a guard through publication. `RepairExecutor`
+holds that same authority through publication -> verification -> catalog CAS ->
+completion, with safe nested guards. ARPL v4 binds the original epoch on the
+approved-to-executing transition. Recovery under a different epoch is rejected
+without changing the plan or historical operations, including after a successful
+CAS. A physically published replica alone never becomes authoritative.
+
+Within a process, recursive guards serialize threads; a stable advisory lock
+coordinates epoch changes with other cooperating processes. Cross-process lock
+contention fails closed rather than waiting indefinitely. Each guard reloads
+persistent state, so an obsolete catalog process cannot mutate after activation.
+These mechanisms do not merge independently loaded catalog snapshots or authorize
+concurrent catalog owners. Local storage APIs and raw journal APIs remain trusted
+implementation interfaces, not an authenticated multi-coordinator service.
+Operators must stop/quiesce previous writers and configure the complete node set.
+Uncontacted nodes retain their old high-water mark during a partition; only
+coordinator pending-state gating and this quiescence requirement prevent unsafe
+global work. Independent roots, arbitrary failover and consensus remain out of
+scope. See [Milestone 19](milestone-19.md) for persistence and operator recovery.

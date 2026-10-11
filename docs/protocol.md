@@ -205,3 +205,65 @@ uses the original execution ID and fingerprint, not a new operation identity.
 Legacy plaintext endpoints remain explicitly available for local development and
 are not secure deployments. See [Milestone 18](milestone-18.md) for migration,
 configuration, revocation, and residual application-level replay risks.
+
+### Epoch envelope and activation (Milestone 19)
+
+ATFS framing and TLS 1.3 are unchanged. Enrolled secure storage endpoints require
+the following version-3 payload envelope for PREPARE, COMMIT, ABORT, DELETE and
+REPAIR_CHUNK; their existing message type numbers are unchanged. All integers are
+unsigned big-endian, strings are length-prefixed ASCII, and no trailing bytes or
+nonzero reserved fields are accepted:
+
+```text
+u16 version=3 | u16 reserved=0 | u16 token_bytes | token
+u32 canonical_payload_bytes | unchanged storage-v2 canonical payload
+token := u16 authority_bytes | authority | u64 epoch
+         u16 coordinator_bytes | coordinator | u16 activation_bytes | activation
+```
+
+Authority, coordinator and activation IDs each contain 1–96 ASCII letters,
+digits, `_` or `-`; the encoded token is at most 302 bytes. Epoch zero is allowed
+only as a provisioning/activation predecessor with empty owner and activation;
+it never authorizes a mutation. Request frames remain bounded to 16 MiB, and
+outbound canonical payloads reserve 320 bytes for envelope overhead. Fingerprints
+are still CRC-32C of the original canonical v2 payload, not the envelope.
+GET_CHUNK and QUERY_OPERATION retain v2 payloads and existing role authorization.
+
+| Type | Number | Payload after version/reserved prefix |
+| --- | ---: | --- |
+| epoch_activate_request | 214 | length-prefixed expected token, desired token |
+| epoch_activate_response | 215 | status and optional token |
+| epoch_query_request | 216 | empty |
+| epoch_query_response | 217 | status and optional token |
+| epoch_error_response | 218 | status and optional token |
+
+Each token above has a u16 byte length. Results contain a u16 status followed by
+the u16 token length (zero means absent). Status values 0–5 are accepted, stale,
+conflict, unauthorized, unresolved and invalid. Accepted results always include
+a token. No response implies global authority: activation must confirm the
+exact desired token at every configured participant and durably commit local
+coordinator intent. Wrong, malformed, lost or uncertain responses remain unknown;
+clients never automatically retry application work.
+
+Activation requires an authenticated coordinator, target allowlist membership,
+explicit `may_activate_epoch=true`, and a desired owner matching the TLS identity.
+Nodes durably CAS the exact predecessor to its immediate successor, acknowledge
+only after synchronization, and return idempotent success only for the exact
+token. Query requires coordinator role and target authorization but not activation
+permission. Mutation authorization matches the full active token and TLS owner
+per request; failures produce a bounded epoch_error_response before dispatch.
+Local mutation APIs expose stale_epoch/epoch_unresolved; catalog APIs reject
+epoch-unavailable mutations without advancing versions.
+
+Epoch state uses `AEPC` binary version 1: magic u32, version u16, reserved u16,
+current token, pending flag u16, optional proposed token, participant count u32,
+sorted u16-length-prefixed participant IDs, then CRC-32C u32 over preceding bytes.
+Records are bounded to 1 MiB and 4096 participants. The synchronized enrollment
+marker contains an initial AEPC record; the stable lock file is never replaced.
+Storage operation/repair records append `EPOCH3 authority number coordinator
+activation token_crc32c` to their existing text fields, retaining canonical request
+fingerprints and original execution identity. Fenced malformed records fail startup.
+Legacy records remain readable but cannot be mutated/replayed as a new epoch's
+operations. ARPL v4 extends v3 with u16 token length and token before its existing
+record checksum. ARPL v1–v3 stay readable; older binaries must not open enrolled
+roots or v4 journals. There is no negotiation or downgrade to unfenced mutations.

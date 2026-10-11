@@ -27,6 +27,8 @@ enum class StoreError {
     operation_conflict,
     invalid_operation_state,
     result_unknown,
+    stale_epoch,
+    epoch_unresolved,
 };
 
 enum class PutFaultPoint {

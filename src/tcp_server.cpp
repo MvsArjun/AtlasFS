@@ -52,6 +52,11 @@ protocol::Message echo_response(const protocol::Message& request) {
         case protocol::MessageType::storage_query_response:
         case protocol::MessageType::storage_repair_chunk_request:
         case protocol::MessageType::storage_repair_chunk_response:
+        case protocol::MessageType::epoch_activate_request:
+        case protocol::MessageType::epoch_activate_response:
+        case protocol::MessageType::epoch_query_request:
+        case protocol::MessageType::epoch_query_response:
+        case protocol::MessageType::epoch_error_response:
             return {protocol::MessageType::error_response, 0, request.request_id,
                     to_bytes("unexpected response message")};
     }

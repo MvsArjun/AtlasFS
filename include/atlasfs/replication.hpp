@@ -3,6 +3,7 @@
 #include "atlasfs/coordinator.hpp"
 #include "atlasfs/object_store.hpp"
 #include "atlasfs/operation.hpp"
+#include "atlasfs/epoch.hpp"
 
 #include <filesystem>
 #include <map>
@@ -70,6 +71,8 @@ enum class RepairPublishStatus {
     checksum_mismatch,
     publication_failure,
     result_unknown,
+    stale_epoch,
+    epoch_unresolved,
 };
 
 struct RepairPublishResult {
@@ -81,6 +84,7 @@ class StorageNode {
 public:
     virtual ~StorageNode() = default;
     [[nodiscard]] virtual std::string_view id() const noexcept = 0;
+    [[nodiscard]] virtual std::optional<epoch::Token> epoch_token() const { return std::nullopt; }
     [[nodiscard]] virtual storage::StoreError prepare(
         std::string_view operation_id, std::string_view object_id,
         const storage::ObjectManifest& manifest,

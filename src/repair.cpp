@@ -132,7 +132,8 @@ bool valid_plan(const RepairPlan& value) {
     if (value.metadata_committed && (!value.verification_succeeded ||
                                      !value.publication_succeeded)) return false;
     if (value.state == RepairPlanState::completed && !value.metadata_committed) return false;
-    if (value.last_error > RepairExecutionError::recovery_interrupted) return false;
+    if (value.last_error > RepairExecutionError::epoch_unresolved) return false;
+    if (value.execution_epoch && (!epoch::valid_token(*value.execution_epoch) || value.execution_id.empty())) return false;
     if ((value.state == RepairPlanState::planned || value.state == RepairPlanState::approved ||
          value.state == RepairPlanState::executing || value.state == RepairPlanState::completed ||
          value.state == RepairPlanState::unrecoverable) &&
@@ -272,7 +273,8 @@ PlanValidation RepairPlanner::validate(const RepairPlan& repair,
 
 std::vector<std::byte> encode_repair_plan(const RepairPlan& value) {
     if (!valid_plan(value)) throw std::invalid_argument("invalid repair plan");
-    std::vector<std::byte> out; append(out, kMagic); append(out, kVersion); append(out, std::uint16_t{0});
+    std::vector<std::byte> out; append(out, kMagic);
+    append(out, value.execution_epoch ? std::uint16_t{4} : kVersion); append(out, std::uint16_t{0});
     append(out, static_cast<std::uint8_t>(value.state)); append(out, static_cast<std::uint8_t>(value.reason));
     append(out, std::uint16_t{0}); append_string(out, value.plan_id); append_string(out, value.object_id);
     append_string(out, value.generation_id); append_string(out, value.source_node);
@@ -297,6 +299,11 @@ std::vector<std::byte> encode_repair_plan(const RepairPlan& value) {
         append(out, replica.integrity_checksum);
         append(out, replica.evidence_version);
     }
+    if (value.execution_epoch) {
+        const auto token = epoch::encode_token(*value.execution_epoch);
+        append(out, static_cast<std::uint16_t>(token.size()));
+        out.insert(out.end(), token.begin(), token.end());
+    }
     append(out, atlasfs::integrity::crc32c(out));
     if (out.size() > kMaxRecordSize) throw std::length_error("repair plan too large");
     return out;
@@ -310,7 +317,7 @@ std::optional<RepairPlan> decode_repair_plan(std::span<const std::byte> encoded)
     std::uint8_t state{}, reason{}, flags{}, reserved8{}; std::uint16_t execution_error{};
     RepairPlan value;
     if (!take(body, at, magic) || magic != kMagic || !take(body, at, version) ||
-        (version != 1 && version != 2 && version != kVersion) ||
+        (version != 1 && version != 2 && version != kVersion && version != 4) ||
         !take(body, at, reserved) || reserved != 0 || !take(body, at, state) || !take(body, at, reason) ||
         !take(body, at, reserved) || reserved != 0 ||
         !take_string(body, at, storage_node_protocol::kMaxOperationIdSize, value.plan_id) ||
@@ -335,7 +342,7 @@ std::optional<RepairPlan> decode_repair_plan(std::span<const std::byte> encoded)
     for (std::uint32_t i = 0; i < count; ++i) { std::string node;
         if (!take_string(body, at, metadata::kMaxNodeIdSize, node)) return std::nullopt;
         value.observed_replicas.push_back(std::move(node)); }
-    if (version == 3) {
+    if (version >= 3) {
         std::uint32_t catalog_count{};
         if (!take(body, at, value.catalog_version) || !take(body, at, catalog_count) ||
             catalog_count > metadata::kMaxCatalogReplicasPerChunk)
@@ -354,6 +361,12 @@ std::optional<RepairPlan> decode_repair_plan(std::span<const std::byte> encoded)
             replica.state = static_cast<metadata::CatalogReplicaState>(catalog_state);
             value.observed_catalog_replicas.push_back(std::move(replica));
         }
+    }
+    if (version == 4) {
+        std::uint16_t length{};
+        if (!take(body, at, length) || length > 302 || body.size() - at < length) return std::nullopt;
+        value.execution_epoch = epoch::decode_token(body.subspan(at, length)); at += length;
+        if (!value.execution_epoch || !epoch::valid_token(*value.execution_epoch)) return std::nullopt;
     }
     if ((version == 1 && static_cast<unsigned>(state) > 3U) ||
         at != body.size() || !valid_plan(value)) return std::nullopt;
@@ -387,6 +400,10 @@ RepairStoreError RepairPlanStore::update(const RepairPlan& value) {
     const auto found = plans_.find(value.plan_id);
     if (found == plans_.end()) return RepairStoreError::conflict;
     const auto& old = found->second;
+    if ((old.execution_epoch && old.execution_epoch != value.execution_epoch) ||
+        (!old.execution_epoch && value.execution_epoch &&
+         !(old.state == RepairPlanState::approved && value.state == RepairPlanState::executing)))
+        return RepairStoreError::conflict;
     if (old.object_id != value.object_id || old.generation_id != value.generation_id ||
         old.chunk_index != value.chunk_index || old.source_node != value.source_node ||
         old.target_node != value.target_node || old.membership_version != value.membership_version ||
@@ -469,6 +486,9 @@ RepairExecutor::RepairExecutor(RepairPlanStore& plans,
 }
 
 RepairStoreError RepairExecutor::approve(std::string_view plan_id_value) {
+    const std::scoped_lock lock(execution_mutex_);
+    std::unique_ptr<epoch::Guard> guard;
+    try { guard = catalog_.authorize_epoch(); } catch (const epoch::Error&) { return RepairStoreError::conflict; }
     auto plan = plans_.get(plan_id_value);
     if (!plan || plan->state != RepairPlanState::planned || plan->source_node.empty() ||
         plan->target_node.empty() || plan->catalog_version == 0)
@@ -478,6 +498,9 @@ RepairStoreError RepairExecutor::approve(std::string_view plan_id_value) {
 }
 
 RepairStoreError RepairExecutor::cancel(std::string_view plan_id_value) {
+    const std::scoped_lock lock(execution_mutex_);
+    std::unique_ptr<epoch::Guard> guard;
+    try { guard = catalog_.authorize_epoch(); } catch (const epoch::Error&) { return RepairStoreError::conflict; }
     auto plan = plans_.get(plan_id_value);
     if (!plan || (plan->state != RepairPlanState::planned &&
                   plan->state != RepairPlanState::approved)) return RepairStoreError::conflict;
@@ -502,6 +525,14 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
     bool recovering) {
     auto plan = plans_.get(plan_id_value);
     if (!plan) return {RepairExecutionError::plan_not_found, RepairPlanState::planned};
+    std::unique_ptr<epoch::Guard> epoch_guard;
+    try { epoch_guard = catalog_.authorize_epoch(); } catch (const epoch::Error& error) {
+        return {error.status() == epoch::Status::unresolved ? RepairExecutionError::epoch_unresolved :
+            RepairExecutionError::stale_epoch, plan->state};
+    }
+    if ((recovering && plan->execution_epoch != catalog_.epoch_session()) ||
+        (plan->execution_epoch && plan->execution_epoch != catalog_.epoch_session()))
+        return {RepairExecutionError::stale_epoch, plan->state};
     if (plan->state == RepairPlanState::completed)
         return {RepairExecutionError::already_completed, plan->state};
     if (plan->state == RepairPlanState::cancelled)
@@ -652,6 +683,8 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
     const auto target = nodes_.find(plan->target_node);
     if (source == nodes_.end()) return stale(RepairExecutionError::source_unavailable);
     if (target == nodes_.end()) return stale(RepairExecutionError::target_unavailable);
+    if (target->second->epoch_token() && target->second->epoch_token() != catalog_.epoch_session())
+        return stale(RepairExecutionError::stale_epoch);
 
     const auto source_chunk = source->second->get_chunk(
         plan->object_id, plan->generation_id, plan->chunk_index);
@@ -687,6 +720,7 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
     if (!recovering) {
         plan->state = RepairPlanState::executing;
         plan->execution_id = execution_id(plan->plan_id);
+        plan->execution_epoch = catalog_.epoch_session();
         if (plans_.update(*plan) != RepairStoreError::none)
             return {RepairExecutionError::persistence_failure, RepairPlanState::approved};
     }
@@ -717,6 +751,12 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
             switch (published.status) {
                 case replication::RepairPublishStatus::result_unknown:
                     plan->last_error = RepairExecutionError::remote_result_unknown;
+                    break;
+                case replication::RepairPublishStatus::stale_epoch:
+                    plan->last_error = RepairExecutionError::stale_epoch;
+                    break;
+                case replication::RepairPublishStatus::epoch_unresolved:
+                    plan->last_error = RepairExecutionError::epoch_unresolved;
                     break;
                 case replication::RepairPublishStatus::identity_mismatch:
                     plan->last_error = RepairExecutionError::remote_identity_mismatch;

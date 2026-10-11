@@ -1,6 +1,7 @@
 #pragma once
 
 #include "atlasfs/coordinator.hpp"
+#include "atlasfs/epoch.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -59,6 +60,7 @@ enum class ReplicaCatalogError {
     persistence_error,
     version_exhausted,
     durability_unknown,
+    epoch_rejected,
 };
 
 enum class ReplicaCatalogCasStatus {
@@ -70,6 +72,7 @@ enum class ReplicaCatalogCasStatus {
     persistence_error,
     version_exhausted,
     durability_unknown,
+    epoch_rejected,
 };
 
 struct ReplicaCatalogCompareExchange {
@@ -104,6 +107,11 @@ public:
     explicit DurableReplicaCatalog(
         std::filesystem::path root,
         ReplicaCatalogFaultInjector fault_injector = {});
+    DurableReplicaCatalog(std::filesystem::path root, std::shared_ptr<epoch::Store> authority,
+        epoch::Token session, ReplicaCatalogFaultInjector fault_injector = {});
+    std::shared_ptr<epoch::Store> epoch_authority() const noexcept { return authority_; }
+    const std::optional<epoch::Token>& epoch_session() const noexcept { return session_; }
+    std::unique_ptr<epoch::Guard> authorize_epoch() const;
 
     [[nodiscard]] ReplicaCatalogError upsert(
         ChunkIdentity identity,
@@ -122,6 +130,8 @@ public:
     [[nodiscard]] const std::filesystem::path& record_path() const noexcept;
 
 private:
+    DurableReplicaCatalog(std::filesystem::path root, ReplicaCatalogFaultInjector fault,
+        std::shared_ptr<epoch::Store> authority, std::optional<epoch::Token> session);
     [[nodiscard]] ReplicaCatalogError publish(ReplicaCatalogSnapshot candidate);
 
     ReplicaCatalogSnapshot snapshot_;
@@ -130,6 +140,8 @@ private:
     ReplicaCatalogFaultInjector fault_injector_;
     bool durability_unknown_{};
     mutable std::mutex mutex_;
+    std::shared_ptr<epoch::Store> authority_;
+    std::optional<epoch::Token> session_;
 };
 
 }  // namespace atlasfs::metadata

@@ -36,6 +36,11 @@ enum class MessageType : std::uint16_t {
     storage_query_response = 211,
     storage_repair_chunk_request = 212,
     storage_repair_chunk_response = 213,
+    epoch_activate_request = 214,
+    epoch_activate_response = 215,
+    epoch_query_request = 216,
+    epoch_query_response = 217,
+    epoch_error_response = 218,
 };
 
 struct Message {

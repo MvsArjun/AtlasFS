@@ -53,6 +53,11 @@ bool is_known_type(std::uint16_t raw_type) {
         case MessageType::storage_query_response:
         case MessageType::storage_repair_chunk_request:
         case MessageType::storage_repair_chunk_response:
+        case MessageType::epoch_activate_request:
+        case MessageType::epoch_activate_response:
+        case MessageType::epoch_query_request:
+        case MessageType::epoch_query_response:
+        case MessageType::epoch_error_response:
             return true;
     }
     return false;

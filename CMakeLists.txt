@@ -24,6 +24,7 @@ add_library(atlasfs_protocol
 add_library(AtlasFS::protocol ALIAS atlasfs_protocol)
 
 add_library(atlasfs_storage
+    src/epoch.cpp
     src/checksum.cpp
     src/manifest.cpp
     src/object_protocol.cpp
@@ -42,6 +43,7 @@ add_library(atlasfs_metadata
 add_library(AtlasFS::metadata ALIAS atlasfs_metadata)
 
 add_library(atlasfs_replication
+    src/epoch_protocol.cpp
     src/coordinator_operation.cpp
     src/recovery.cpp
     src/replication.cpp
@@ -136,6 +138,8 @@ if(BUILD_TESTING)
     add_executable(atlasfs_tls_transport_tests tests/tls_transport_test.cpp)
     target_link_libraries(atlasfs_tls_transport_tests
         PRIVATE AtlasFS::replication GTest::gtest_main Threads::Threads)
+    add_executable(atlasfs_epoch_tests tests/epoch_test.cpp)
+    target_link_libraries(atlasfs_epoch_tests PRIVATE AtlasFS::replication GTest::gtest_main Threads::Threads)
     add_executable(atlasfs_tcp_transport_tests tests/tcp_transport_test.cpp)
     target_link_libraries(atlasfs_tcp_transport_tests
         PRIVATE AtlasFS::net GTest::gtest_main Threads::Threads)
@@ -175,6 +179,7 @@ if(BUILD_TESTING)
         target_compile_options(atlasfs_protocol_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(atlasfs_tcp_transport_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(atlasfs_tls_transport_tests PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(atlasfs_epoch_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(atlasfs_storage_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(atlasfs_storage_integration_tests
             PRIVATE -Wall -Wextra -Wpedantic)
@@ -186,6 +191,7 @@ if(BUILD_TESTING)
     gtest_discover_tests(atlasfs_protocol_tests)
     gtest_discover_tests(atlasfs_tcp_transport_tests)
     gtest_discover_tests(atlasfs_tls_transport_tests)
+    gtest_discover_tests(atlasfs_epoch_tests)
     gtest_discover_tests(atlasfs_storage_tests)
     gtest_discover_tests(atlasfs_storage_integration_tests)
     gtest_discover_tests(atlasfs_metadata_tests)

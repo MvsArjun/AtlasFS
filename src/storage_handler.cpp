@@ -27,6 +27,8 @@ object_protocol::Status to_status(StoreError error) {
         case StoreError::operation_conflict:
         case StoreError::invalid_operation_state:
         case StoreError::result_unknown:
+        case StoreError::stale_epoch:
+        case StoreError::epoch_unresolved:
             return object_protocol::Status::filesystem_error;
     }
     return object_protocol::Status::filesystem_error;
@@ -100,6 +102,11 @@ protocol::Message StorageRequestHandler::operator()(const protocol::Message& req
         case protocol::MessageType::storage_query_response:
         case protocol::MessageType::storage_repair_chunk_request:
         case protocol::MessageType::storage_repair_chunk_response:
+        case protocol::MessageType::epoch_activate_request:
+        case protocol::MessageType::epoch_activate_response:
+        case protocol::MessageType::epoch_query_request:
+        case protocol::MessageType::epoch_query_response:
+        case protocol::MessageType::epoch_error_response:
             return status_response(protocol::MessageType::error_response, request.request_id,
                                    object_protocol::Status::invalid_request);
     }

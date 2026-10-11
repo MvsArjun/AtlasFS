@@ -27,7 +27,7 @@ enum class RepairExecutionError : std::uint16_t {
     persistence_failure, catalog_durability_unknown, remote_result_unknown,
     remote_identity_mismatch, remote_connection_failure, remote_timeout,
     remote_protocol_error, remote_target_rejected, not_reconcilable,
-    recovery_interrupted
+    recovery_interrupted, stale_epoch, epoch_unresolved
 };
 
 enum class RepairPlanState : std::uint8_t {
@@ -60,6 +60,7 @@ struct RepairPlan {
     RepairExecutionError last_error{RepairExecutionError::none};
     std::uint64_t catalog_version{};
     std::vector<metadata::CatalogReplica> observed_catalog_replicas;
+    std::optional<epoch::Token> execution_epoch;
     bool operator==(const RepairPlan&) const = default;
 };
 

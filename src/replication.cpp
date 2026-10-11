@@ -199,6 +199,10 @@ RepairPublishResult LocalStorageNode::publish_repair(
     }
     const auto error = store_.publish_repair_chunk(object_id, manifest, chunk, data);
     switch (error) {
+        case storage::StoreError::stale_epoch:
+            return {RepairPublishStatus::stale_epoch, error};
+        case storage::StoreError::epoch_unresolved:
+            return {RepairPublishStatus::epoch_unresolved, error};
         case storage::StoreError::none:
             return {RepairPublishStatus::published, error};
         case storage::StoreError::result_unknown:
