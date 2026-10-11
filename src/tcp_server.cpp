@@ -172,6 +172,7 @@ void TcpServer::stop() noexcept {
 void TcpServer::handle_connection(Socket& connection) {
     protocol::StreamParser parser(max_payload_size_);
     std::array<std::byte, 8192> buffer{};
+    if (tls_ && tls_->tcp_nodelay()) set_tcp_nodelay(connection.get(), true);
     auto stream = tls_ ? tls_->accept(connection.get()) : plaintext_stream(connection.get());
     const auto timeout = tls_ ? tls_->timeout() : std::chrono::seconds(5);
     auto deadline = std::chrono::steady_clock::now() + timeout;

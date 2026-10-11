@@ -23,6 +23,7 @@ std::string utc_time() {
 struct Config {
     std::size_t iterations{30}, objects{32}, bytes{65536}, warmup{3};
     bool instrumentation{true};
+    bool nodelay{false};
     std::uint32_t chunk{16384}, replicas{2}, nodes{4}, workers{1};
     std::uint64_t seed{42};
     std::string suite{"all"}, output, label;
@@ -47,7 +48,7 @@ Config parse(int argc, char** argv) {
         const std::string key = argv[n];
         if (key == "--help") {
             std::cout << "--iterations N --objects N --bytes N --chunk N --replicas N --nodes N --workers N --seed N\n"
-                         "--suite all|local|distributed|fault|startup --warmup N --metrics on|off --output file.json --label environment-label\n";
+                         "--suite all|local|distributed|fault|startup --warmup N --metrics on|off --tcp-nodelay on|off --output file.json --label environment-label\n";
             std::exit(0);
         }
         if (n + 1 >= argc) throw std::invalid_argument("option requires a value");
@@ -56,6 +57,7 @@ Config parse(int argc, char** argv) {
         else if (key == "--label") c.label = value;
         else if (key == "--suite") c.suite = value;
         else if (key == "--metrics") { if (value != "on" && value != "off") throw std::invalid_argument("metrics must be on or off"); c.instrumentation = value == "on"; }
+        else if (key == "--tcp-nodelay") { if (value != "on" && value != "off") throw std::invalid_argument("tcp-nodelay must be on or off"); c.nodelay = value == "on"; }
         else if (key == "--seed") c.seed = number(value);
         else {
             const auto v = number(value);
@@ -87,7 +89,7 @@ double cpu_seconds() {
 std::map<std::string, std::uint64_t> process_io() {
     std::map<std::string, std::uint64_t> result;
 #ifdef __linux__
-    // Whole process, including sockets and metric proc reads; not per-object I/O.
+    // Eligible process file/library I/O and metric proc reads; not socket traffic.
     std::ifstream input("/proc/self/io"); std::string key; std::uint64_t value{};
     while (input >> key >> value) { if (key.ends_with(':')) key.pop_back(); result.emplace(key, value); }
 #endif
@@ -213,7 +215,7 @@ public:
         });
     }
     void distributed() {
-        bench::Cluster cluster(config.nodes, config.chunk);
+        bench::Cluster cluster(config.nodes, config.chunk, config.nodelay);
         const auto data = bench::payload(config.bytes, config.seed);
         metadata::MetadataCoordinator placement(std::make_unique<metadata::RendezvousPlacement>(), config.replicas);
         for (const auto& node : cluster.nodes) bench::require(placement.register_node(bench::member(node.id)) == metadata::CoordinatorError::none, "register");
@@ -279,7 +281,7 @@ public:
         });
     }
     void repair(bool recover, repair::RepairExecutionFaultPoint point) {
-        bench::Cluster cluster(1, config.chunk);
+        bench::Cluster cluster(1, config.chunk, config.nodelay);
         auto source = std::make_shared<replication::LocalStorageNode>("a", cluster.root() / "source",
             object_protocol::kMaxObjectDataSize, config.chunk);
         const auto data = bench::payload(std::min<std::size_t>(config.bytes, config.chunk), config.seed);
@@ -345,6 +347,7 @@ public:
             << ",\"nodes\":" << config.nodes << ",\"replicas\":" << config.replicas << ",\"workers\":" << config.workers
             << ",\"suite\":" << quote(config.suite) << ",\"label\":" << quote(config.label)
             << ",\"warmup_per_workload\":" << config.warmup << ",\"instrumentation\":" << (config.instrumentation ? "true" : "false")
+            << ",\"tcp_nodelay\":" << (config.nodelay ? "true" : "false")
             << ",\"compiler\":" << quote(__VERSION__) << ",\"openssl\":" << quote(OpenSSL_version(OPENSSL_VERSION))
             << ",\"build_type\":" << quote(ATLASFS_BENCH_BUILD_TYPE) << ",\"source_commit\":" << quote(ATLASFS_BENCH_COMMIT)
             << ",\"checksum_source_sha256\":" << quote(ATLASFS_BENCH_CHECKSUM_HASH)
@@ -431,7 +434,7 @@ public:
 void Harness::startup() {
     bench::require(config.objects * ((config.bytes + config.chunk - 1) / config.chunk) <= 65536,
                    "startup retained chunk/plan count exceeds accounting bound");
-    bench::Cluster cluster(1, config.chunk);
+    bench::Cluster cluster(1, config.chunk, config.nodelay);
     auto source = std::make_shared<replication::LocalStorageNode>("a", cluster.root() / "retained",
         object_protocol::kMaxObjectDataSize, config.chunk);
     const auto data = bench::payload(config.bytes, config.seed);
@@ -481,7 +484,7 @@ void Harness::faults() {
                        repair::RepairExecutionFaultPoint::after_publication_persist,
                        repair::RepairExecutionFaultPoint::after_catalog_commit}) repair(true, point);
     {
-        bench::Cluster cluster(1, config.chunk);
+        bench::Cluster cluster(1, config.chunk, config.nodelay);
         const auto data = bench::payload(std::min<std::size_t>(config.bytes, config.chunk), config.seed);
         measure("lost_repair_response_restart_exact_replay", config.iterations, data.size(), 1, 1, cluster.root(), [&](auto n) {
             cluster.restart(0, config.chunk, true);
@@ -498,7 +501,7 @@ void Harness::faults() {
         });
     }
     {
-        bench::Cluster cluster(1, config.chunk);
+        bench::Cluster cluster(1, config.chunk, config.nodelay);
         const auto data = bench::payload(std::min<std::size_t>(config.bytes, config.chunk), config.seed);
         measure("repair_transport_outage_exact_explicit_replay", config.iterations, data.size(), 1, 1, cluster.root(), [&](auto n) {
             const auto value = bench::manifest(data, config.chunk, "outage-gen-" + std::to_string(n));
@@ -517,7 +520,7 @@ void Harness::faults() {
         });
     }
     {
-        bench::Cluster cluster(2, config.chunk);
+        bench::Cluster cluster(2, config.chunk, config.nodelay);
         const auto data = bench::payload(config.bytes, config.seed);
         const auto plan = bench::placement("restart-object", bench::manifest(data, config.chunk, "restart-generation"), {"node-0", "node-1"});
         { replication::ReplicaManager manager(cluster.clients());

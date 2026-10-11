@@ -117,7 +117,8 @@ Cleanup counts apply to tracked files, not empty directories.
 
 On Linux, per-row `/proc/self/io` deltas report rchar/wchar, syscall counts,
 read_bytes/write_bytes and cancelled_write_bytes. These cover the entire process
-and its waited-for children, sockets, libraries and metric reads; they cannot be
+and its waited-for children, eligible file/library syscalls and metric reads;
+they are not socket-traffic counters and cannot be
 attributed exactly to one object or node. rchar/wchar are not physical disk bytes.
 Block-layer counters are cache/filesystem dependent; cancelled writes are kept
 separate, not silently subtracted. Unsupported/inaccessible proc metrics are null.
@@ -208,7 +209,7 @@ workflow uploads all repeated JSON, overhead CSVs, index and compact summaries.
 Actual final counts, run links and source revisions are recorded in the delivery
 report; workflow configuration is not evidence of success.
 
-Fifteen new instrumentation regressions cover concurrent totals, saturation,
+Sixteen new instrumentation regressions cover concurrent totals, saturation,
 snapshot/reset/scopes, timer lifetime, disabled I/O, errno, plaintext layer totals,
 encrypted BIO traffic, deadlines, successful/failing temporary publication,
 destination replacement, restart cleanup, lost-response idempotence, capacity

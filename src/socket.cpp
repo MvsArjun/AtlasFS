@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
@@ -57,6 +58,13 @@ void Socket::reset(int descriptor) noexcept {
         ::close(descriptor_);
     }
     descriptor_ = descriptor;
+}
+
+void set_tcp_nodelay(int descriptor, bool enabled) {
+    const int value = enabled ? 1 : 0;
+    if (::setsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value)) != 0)
+        throw_system_error("setsockopt TCP_NODELAY");
+    if (enabled) metrics::add(metrics::Counter::nodelay_connections);
 }
 
 Socket connect_loopback(std::uint16_t port, std::chrono::milliseconds timeout) {

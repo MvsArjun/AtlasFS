@@ -10,7 +10,7 @@ on:
       profile:
         description: Short correctness smoke or repeated characterization
         type: choice
-        options: [smoke, characterize]
+        options: [smoke, characterize, transport]
         default: smoke
 permissions:
   contents: read
@@ -44,6 +44,12 @@ jobs:
           done
       - name: Summary report
         run: python3 benchmarks/summarize.py build-benchmark/results
+      - name: Same-runner transport comparisons
+        if: inputs.profile == 'transport'
+        run: |
+          for round in 1 2 3; do
+            python3 benchmarks/compare.py --allow-transport-change build-benchmark/results/nodelay-off-$round.json build-benchmark/results/nodelay-on-$round.json > build-benchmark/results/transport-$round.csv
+          done
       - name: Upload traceable results
         if: always()
         uses: actions/upload-artifact@v4

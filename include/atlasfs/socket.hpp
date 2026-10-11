@@ -30,5 +30,6 @@ private:
 [[nodiscard]] Socket connect_loopback(std::uint16_t port,
     std::chrono::milliseconds timeout = std::chrono::seconds(5));
 void send_all(int descriptor, std::span<const std::byte> bytes);
+void set_tcp_nodelay(int descriptor, bool enabled);
 
 }  // namespace atlasfs::net

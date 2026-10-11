@@ -304,4 +304,5 @@ std::unique_ptr<ByteStream> TlsContext::accept(int descriptor) const {
     return std::make_unique<SecureStream>(impl_->context.get(), descriptor, impl_->config, nullptr);
 }
 std::chrono::milliseconds TlsContext::timeout() const noexcept { return impl_->config.timeout; }
+bool TlsContext::tcp_nodelay() const noexcept { return impl_->config.tcp_nodelay; }
 } // namespace atlasfs::net

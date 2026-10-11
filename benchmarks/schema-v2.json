@@ -12,6 +12,7 @@
     "started_utc": {"type": "string"},
     "run_id": {"type": "string"},
     "instrumentation": {"type": "boolean"},
+    "tcp_nodelay": {"type": "boolean"},
     "warmup_per_workload": {"type": "integer", "minimum": 0},
     "results": {
       "type": "array", "minItems": 1,

@@ -25,7 +25,7 @@ constexpr std::array<std::string_view, counter_count> names{
     "startup_calls", "startup_ns", "startup_entries",
     "publication_calls", "publication_ns", "verification_calls", "verification_ns",
     "cas_calls", "cas_ns", "completion_calls", "completion_ns",
-    "queue_calls", "queue_ns", "rpc_calls", "rpc_ns", "rpc_failures"
+    "queue_calls", "queue_ns", "rpc_calls", "rpc_ns", "rpc_failures", "tcp_nodelay_connections"
 };
 bool within(std::string_view path, std::string_view root) noexcept {
     return path == root || (path.starts_with(root) && path.size() > root.size() && path[root.size()] == '/');

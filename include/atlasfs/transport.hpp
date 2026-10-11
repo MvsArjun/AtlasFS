@@ -33,6 +33,8 @@ struct TlsConfig {
     PeerIdentity local_identity;
     std::map<std::string, PeerPolicy, std::less<>> peers;
     std::chrono::milliseconds timeout{std::chrono::seconds(5)};
+    // TCP endpoints only; direct ByteStream use may also use Unix sockets.
+    bool tcp_nodelay{false};
 };
 class TransportError : public std::runtime_error {
 public:
@@ -62,6 +64,7 @@ public:
         const PeerIdentity& expected) const;
     [[nodiscard]] std::unique_ptr<ByteStream> accept(int descriptor) const;
     [[nodiscard]] std::chrono::milliseconds timeout() const noexcept;
+    [[nodiscard]] bool tcp_nodelay() const noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

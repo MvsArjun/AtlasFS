@@ -29,7 +29,7 @@ enum class Counter : std::size_t {
     startup_calls, startup_ns, startup_entries,
     publication_calls, publication_ns, verification_calls, verification_ns,
     cas_calls, cas_ns, completion_calls, completion_ns,
-    queue_calls, queue_ns, rpc_calls, rpc_ns, rpc_failures, count
+    queue_calls, queue_ns, rpc_calls, rpc_ns, rpc_failures, nodelay_connections, count
 };
 inline constexpr std::size_t counter_count = static_cast<std::size_t>(Counter::count);
 [[nodiscard]] std::string_view name(Counter counter) noexcept;

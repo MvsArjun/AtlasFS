@@ -95,7 +95,8 @@ public:
     net::TlsConfig coordinator{temporary.config({"coordinator", net::PeerRole::coordinator})};
     std::shared_ptr<epoch::Store> authority;
     std::vector<SecureNode> nodes;
-    Cluster(std::uint32_t count, std::uint32_t chunk) {
+    Cluster(std::uint32_t count, std::uint32_t chunk, bool nodelay = false) {
+        coordinator.tcp_nodelay = nodelay;
         std::filesystem::create_directory(root() / "coordinator");
         epoch::Store::provision(root() / "coordinator" / "epoch", token);
         authority = std::make_shared<epoch::Store>(root() / "coordinator" / "epoch", token);
@@ -109,6 +110,7 @@ public:
             node.local = std::make_shared<replication::LocalStorageNode>(node.id, node.data_root,
                 object_protocol::kMaxObjectDataSize, chunk);
             node.tls = temporary.config({node.id, net::PeerRole::storage});
+            node.tls.tcp_nodelay = nodelay;
             test::Certificates::allow(node.tls, coordinator.local_identity, {node.id});
             node.tls.peers.begin()->second.may_activate_epoch = true;
             test::Certificates::allow(coordinator, node.tls.local_identity, {node.id});

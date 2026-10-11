@@ -7,6 +7,8 @@
 #include <limits>
 #include <thread>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 namespace atlasfs::metrics {
 namespace {
@@ -96,6 +98,7 @@ TEST(Metrics, TlsCountsEncryptedSocketTrafficAndHandshakeSeparately) {
     test::Certificates certificates;
     auto server_config = certificates.config({"d", net::PeerRole::storage});
     auto client_config = certificates.config({"coordinator", net::PeerRole::coordinator});
+    server_config.tcp_nodelay = client_config.tcp_nodelay = true;
     test::Certificates::allow(server_config, client_config.local_identity);
     test::Certificates::allow(client_config, server_config.local_identity);
     auto collector = std::make_shared<Collector>(); Scope scope(collector);
@@ -106,11 +109,26 @@ TEST(Metrics, TlsCountsEncryptedSocketTrafficAndHandshakeSeparately) {
     client.close(); serving.stop(); EXPECT_FALSE(serving.failure);
     const auto result = collector->snapshot();
     EXPECT_EQ(result.get(Counter::tls_handshakes), 2U); EXPECT_GT(result.get(Counter::tls_handshake_ns), 0U);
+    EXPECT_EQ(result.get(Counter::nodelay_connections), 2U);
     EXPECT_EQ(result.get(Counter::tls_sent), 2 * (request.payload.size() + protocol::kHeaderSize));
     EXPECT_EQ(result.get(Counter::tls_received), result.get(Counter::tls_sent));
     EXPECT_GT(result.get(Counter::socket_sent), result.get(Counter::tls_sent));
     EXPECT_EQ(result.get(Counter::socket_sent), result.get(Counter::socket_received));
     EXPECT_EQ(result.get(Counter::payload_sent), 2 * request.payload.size());
+}
+TEST(Metrics, TcpNodelayOptionCanBeEnabledAndDisabledWithoutChangingPlaintextDefaults) {
+    auto collector = std::make_shared<Collector>(); Scope scope(collector);
+    net::Socket socket(::socket(AF_INET, SOCK_STREAM, 0)); ASSERT_TRUE(socket.valid());
+    auto option = [&] {
+        int value = -1; socklen_t size = sizeof(value);
+        EXPECT_EQ(::getsockopt(socket.get(), IPPROTO_TCP, TCP_NODELAY, &value, &size), 0);
+        return value;
+    };
+    EXPECT_EQ(option(), 0);
+    net::set_tcp_nodelay(socket.get(), true); EXPECT_EQ(option(), 1);
+    net::set_tcp_nodelay(socket.get(), false); EXPECT_EQ(option(), 0);
+    EXPECT_EQ(collector->snapshot().get(Counter::nodelay_connections), 1U);
+    EXPECT_THROW(net::set_tcp_nodelay(-1, true), std::system_error);
 }
 TEST(Metrics, ExpiredDeadlineIsObservedWithoutChangingTimeoutBehavior) {
     int descriptors[2]; ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, descriptors), 0);

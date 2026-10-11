@@ -15,6 +15,7 @@ TcpClient::TcpClient(std::uint16_t port, std::chrono::milliseconds timeout)
 TcpClient::TcpClient(std::uint16_t port, TlsConfig config, const PeerIdentity& expected_peer)
     : tls_(std::make_shared<TlsContext>(std::move(config))), timeout_(tls_->timeout()) {
     socket_ = connect_loopback(port, timeout_);
+    if (tls_->tcp_nodelay()) set_tcp_nodelay(socket_.get(), true);
     stream_ = tls_->connect(socket_.get(), expected_peer);
 }
 

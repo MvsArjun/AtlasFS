@@ -51,6 +51,12 @@ class BenchmarkTools(unittest.TestCase):
         value["results"][0]["additional_disk_peak_bytes"] = None
         self.check(value, expected=0)
 
+    def test_transport_change_requires_explicit_comparison(self):
+        value = copy.deepcopy(REPORT)
+        value["tcp_nodelay"] = not REPORT.get("tcp_nodelay", False)
+        self.check(value, "compare.py", (str(SOURCE.resolve()),))
+        self.check(value, "compare.py", ("--allow-transport-change", str(SOURCE.resolve())), expected=0)
+
 
 if __name__ == "__main__":
     unittest.main()

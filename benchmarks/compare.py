@@ -6,6 +6,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("before")
 parser.add_argument("after")
 parser.add_argument("--allow-instrumentation-change", action="store_true", help="Explicit overhead comparison; never an implementation speedup claim")
+parser.add_argument("--allow-transport-change", action="store_true", help="Explicit TCP_NODELAY A/B comparison")
 args = parser.parse_args()
 with open(args.before, encoding="utf-8") as source:
     before = json.load(source)
@@ -16,6 +17,8 @@ for field in ("schema", "seed", "iterations", "objects", "bytes", "chunk", "node
     if before.get(field) != after.get(field):
         parser.error(f"incompatible configuration: {field}")
 if before["schema"] == 2:
+    if before.get("tcp_nodelay", False) != after.get("tcp_nodelay", False) and not args.allow_transport_change:
+        parser.error("TCP_NODELAY differs: request an explicit transport comparison")
     for field in ("warmup_per_workload", "compile_flags"):
         if before.get(field) != after.get(field):
             parser.error(f"incompatible configuration: {field}")

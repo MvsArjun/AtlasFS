@@ -61,7 +61,7 @@ def main():
     parser.add_argument("--executable", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--runner-class", choices=("shared", "controlled", "manual-uncontrolled"), default="manual-uncontrolled")
-    parser.add_argument("--profile", choices=("smoke", "characterize"), default="smoke")
+    parser.add_argument("--profile", choices=("smoke", "characterize", "transport"), default="smoke")
     parser.add_argument("--rounds", type=int, default=3)
     args = parser.parse_args()
     if platform.system() != "Linux":
@@ -72,6 +72,8 @@ def main():
     info = environment(args.runner_class)
     common = ["--seed", "42", "--label", args.runner_class + ":" + info["machine_fingerprint"]]
     cases = [("smoke", ["--iterations", "3", "--objects", "3", "--bytes", "4096", "--chunk", "1024", "--workers", "2", "--warmup", "1"])]
+    if args.profile == "transport":
+        cases = [("nodelay-" + mode, ["--suite", "distributed", "--iterations", "40", "--objects", "16", "--bytes", "65536", "--chunk", "16384", "--nodes", "4", "--replicas", "2", "--workers", "1", "--warmup", "4", "--tcp-nodelay", mode]) for mode in ("off", "on")]
     if args.profile == "characterize":
         cases = []
         for mode in ("off", "on"):
@@ -89,7 +91,7 @@ def main():
     for round_number in range(1, args.rounds + 1):
         # Alternate paired collector order to expose, not hide, order/cache noise.
         ordered = list(cases)
-        if args.profile == "characterize" and round_number % 2 == 0:
+        if args.profile in ("characterize", "transport") and round_number % 2 == 0:
             ordered[0], ordered[1] = ordered[1], ordered[0]
         for case, parameters in ordered:
             target = args.output_dir / f"{case}-{round_number}.json"
