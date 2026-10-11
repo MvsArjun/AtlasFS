@@ -200,8 +200,10 @@ int open(const char* path, int flags, mode_t mode) noexcept {
     errno = saved; return fd;
 }
 int close(int fd) noexcept {
-    const int result = ::close(fd); const int saved = errno;
+    // Retire the observation before releasing the kernel descriptor. Another
+    // attached thread may reuse the same integer as soon as ::close returns.
     if (auto* collector = current()) collector->closed(fd);
+    const int result = ::close(fd); const int saved = errno;
     errno = saved; return result;
 }
 ssize_t read(int fd, void* bytes, std::size_t size) noexcept {
@@ -228,7 +230,10 @@ bool remove(const std::filesystem::path& path, std::error_code& error) {
 }
 std::uintmax_t remove_all(const std::filesystem::path& path, std::error_code& error) {
     const auto result = std::filesystem::remove_all(path, error);
-    if (!error) if (auto* collector = current()) collector->removed(path);
+    if (auto* collector = current()) {
+        if (!error) collector->removed(path);
+        else collector->invalidate_accounting(); // Recursive deletion can fail after partial progress.
+    }
     return result;
 }
 int unlink(const char* path) noexcept {

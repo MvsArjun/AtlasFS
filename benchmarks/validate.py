@@ -64,10 +64,12 @@ for path in args.files:
             counters = row["io_counters"]
             if data["instrumentation"]:
                 assert counters and not counters["saturated"], (path, name, "counters")
-                assert counters["accounting_complete"], (path, name, "accounting bound reached")
                 assert counters["framed_sent_bytes"] == counters["serialized_payload_sent_bytes"] + 24 * counters["frames_sent"], (path, name, "framing")
-                assert row["temporary_peak_bytes"] >= row["temporary_residual_bytes"], (path, name, "temporary peak")
-                assert row["additional_disk_peak_bytes"] >= max(0, row["disk_file_bytes"] - row["disk_baseline_bytes"]), (path, name, "disk peak")
+                if counters["accounting_complete"]:
+                    assert row["temporary_peak_bytes"] >= row["temporary_residual_bytes"], (path, name, "temporary peak")
+                    assert row["additional_disk_peak_bytes"] >= max(0, row["disk_file_bytes"] - row["disk_baseline_bytes"]), (path, name, "disk peak")
+                else:
+                    assert row["temporary_peak_bytes"] is None and row["additional_disk_peak_bytes"] is None, (path, name, "unavailable accounting must have null peaks")
                 assert all(isinstance(value, (int, bool)) and value >= 0 for value in counters.values()), (path, name, "counter type")
             else:
                 assert counters is None and row["temporary_peak_bytes"] is None and row["additional_disk_peak_bytes"] is None, (path, name, "disabled")

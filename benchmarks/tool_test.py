@@ -43,6 +43,14 @@ class BenchmarkTools(unittest.TestCase):
         value["seed"] += 1
         self.check(value, "compare.py", (str(SOURCE.resolve()),))
 
+    def test_unavailable_accounting_requires_null_peaks(self):
+        value = copy.deepcopy(REPORT)
+        value["results"][0]["io_counters"]["accounting_complete"] = False
+        self.check(value)
+        value["results"][0]["temporary_peak_bytes"] = None
+        value["results"][0]["additional_disk_peak_bytes"] = None
+        self.check(value, expected=0)
+
 
 if __name__ == "__main__":
     unittest.main()

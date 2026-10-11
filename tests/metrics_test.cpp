@@ -206,5 +206,23 @@ TEST(Metrics, PathAccountingIsBoundedAndReportsIncompleteInsteadOfInventingPeaks
     EXPECT_EQ(io::close(fd), 0);
     EXPECT_THROW(Collector(Collector::capacity + 1), std::invalid_argument);
 }
+TEST(Metrics, ConcurrentFileLifecyclesKeepAccountingWhenDescriptorsAreReused) {
+    test::Certificates temporary; auto collector = std::make_shared<Collector>(); Scope scope(collector);
+    collector->begin_files(temporary.root()); const auto data = bench::payload(64, 42);
+    std::vector<std::thread> workers;
+    for (unsigned n = 0; n < 8; ++n) workers.emplace_back([&, n] {
+        Scope worker_scope(collector);
+        for (unsigned k = 0; k < 64; ++k) {
+            const auto path = temporary.root() / ("worker-" + std::to_string(n) + '-' + std::to_string(k));
+            const int fd = io::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+            EXPECT_GE(fd, 0);
+            if (fd >= 0) { EXPECT_EQ(io::write(fd, data.data(), data.size()), 64); EXPECT_EQ(io::close(fd), 0); }
+        }
+    });
+    for (auto& worker : workers) worker.join();
+    const auto result = collector->snapshot(); EXPECT_TRUE(result.accounting_complete);
+    EXPECT_EQ(result.get(Counter::file_write_bytes), 32768U);
+    EXPECT_EQ(result.disk_current, apparent(temporary.root())); EXPECT_EQ(result.disk_current, 32768U);
+}
 }
 } // namespace atlasfs::metrics

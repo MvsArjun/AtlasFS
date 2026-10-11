@@ -208,10 +208,16 @@ workflow uploads all repeated JSON, overhead CSVs, index and compact summaries.
 Actual final counts, run links and source revisions are recorded in the delivery
 report; workflow configuration is not evidence of success.
 
-Fourteen new instrumentation regressions cover concurrent totals, saturation,
+Fifteen new instrumentation regressions cover concurrent totals, saturation,
 snapshot/reset/scopes, timer lifetime, disabled I/O, errno, plaintext layer totals,
 encrypted BIO traffic, deadlines, successful/failing temporary publication,
-destination replacement, restart cleanup, lost-response idempotence and capacity.
+destination replacement, restart cleanup, lost-response idempotence, capacity
+and concurrent file lifecycles with descriptor reuse. Ownership review identified
+that retiring descriptor tracking after kernel close could erase a newly reused
+descriptor's observation. Tracking now retires before close. Five stress rounds
+did not reproduce the race before the fix; the ordering argument, not a claimed
+observed failure, motivated it. Recursive-cleanup errors invalidate accounting
+because deletion may have made partial progress.
 All original checksum/durability/TLS/epoch/repair/CAS tests remain intact.
 
 ## Findings and remaining scope
