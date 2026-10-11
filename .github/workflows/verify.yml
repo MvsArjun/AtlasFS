@@ -26,7 +26,7 @@ jobs:
             asan-ubsan) flags='-fsanitize=address,undefined -fno-omit-frame-pointer' ;;
             tsan) flags='-fsanitize=thread -fno-omit-frame-pointer -fno-pie -no-pie' ;;
           esac
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=g++-13 "-DCMAKE_CXX_FLAGS=$flags"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DATLASFS_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER=g++-13 "-DCMAKE_CXX_FLAGS=$flags"
       - name: Build
         run: cmake --build build --parallel 4
       - name: Test
@@ -37,7 +37,16 @@ jobs:
         run: ctest --test-dir build --output-on-failure --timeout 60
       - name: Static analysis
         if: matrix.mode == 'normal'
-        run: cppcheck --enable=warning,performance,portability --std=c++20 --inline-suppr --suppress=missingIncludeSystem --error-exitcode=1 -I include src
+        run: cppcheck --enable=warning,performance,portability --std=c++20 --inline-suppr --suppress=missingIncludeSystem --error-exitcode=1 -I include src benchmarks
+      - name: Benchmark correctness smoke (no timing thresholds)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          ./build/atlasfs_bench --iterations 3 --objects 3 --bytes 4096 --chunk 1024 --workers 2 --output build/benchmark-smoke.json
+          python3 benchmarks/validate.py build/benchmark-smoke.json
+          python3 -c 'import subprocess; assert subprocess.run(["./build/atlasfs_bench", "--iterations", "0"]).returncode==2'
       - name: Repeat authenticated repair integration tests
         if: matrix.mode == 'normal'
         run: ctest --test-dir build -R TlsRepair --repeat until-fail:10 --output-on-failure --timeout 60
@@ -52,4 +61,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: diagnostics-${{ matrix.mode }}
-          path: build/Testing/Temporary/
+          path: |
+            build/Testing/Temporary/
+            build/benchmark-smoke.json

@@ -131,6 +131,29 @@ The project enables `-Wall -Wextra -Wpedantic` on GCC and Clang. See
 [`docs/architecture.md`](docs/architecture.md) and
 [`docs/protocol.md`](docs/protocol.md) for the current design and its boundaries.
 
+## Benchmarks and stress verification
+
+Benchmarks are opt-in standalone executables, not timing gates in CTest. They use
+real durable local/replicated operations and ephemeral mutual-TLS identities on
+loopback; they do not need production credentials. Build and run a Release sample:
+
+```sh
+cmake -S . -B build-bench -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF -DATLASFS_BUILD_BENCHMARKS=ON
+cmake --build build-bench --parallel 4
+./build-bench/atlasfs_bench --iterations 40 --objects 40 --bytes 65536 \
+  --chunk 16384 --nodes 4 --replicas 2 --workers 1 --seed 42 --output results.json
+python3 benchmarks/compare.py before.json after.json
+```
+
+Use `--suite local|distributed|fault|all` and `--help` for bounded parameters.
+JSON includes throughput, p50/p95/p99 latency, CPU time, reported peak RSS, disk
+file bytes, known rejections/unknown outcomes, and recovery timing. Worker requests
+queue through **one serialized coordinator**; they do not imply parallel node
+dispatch or multiple authorities. Long runs are separate from short deterministic
+`Stress*` regressions in CTest. See [Milestone 20](docs/milestone-20.md) for measured
+baselines, limitations, fault coverage, and reproduction instructions.
+
 ## Repository layout
 
 The GitHub Actions workflow uses Ubuntu 24.04 and GCC 13 with separate normal,

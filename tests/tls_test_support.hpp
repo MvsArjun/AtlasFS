@@ -36,7 +36,7 @@ public:
     Certificates& operator=(const Certificates&) = delete;
     const std::filesystem::path& root() const { return root_; }
     net::TlsConfig config(net::PeerIdentity identity, bool expired = false,
-                          Certificates* issuer = nullptr, std::string uri = {},
+                          Certificates* issuer = nullptr, const std::string& uri = {},
                           bool invalid_signature = false) {
         if (!issuer) issuer = this;
         const auto serial = ++serial_;
