@@ -1,8 +1,8 @@
 # AtlasFS
 
 AtlasFS is a C++20/Linux object-storage systems project. The current milestone
-provides a documented binary wire format, incremental stream parser, blocking
-POSIX TCP transport, and persistent single-node PUT, GET, and DELETE operations.
+provides a documented binary wire format, incremental stream parser, bounded
+POSIX TCP/OpenSSL mutual TLS transport, and persistent single-node PUT, GET, and DELETE operations.
 Objects survive server restarts and are verified with CRC-32C before being
 returned. Storage splits every logical object into configurable chunks (1 MiB by
 default), protects each chunk and the whole object, and commits through a durable
@@ -105,7 +105,8 @@ deliberately deferred.
 
 Prerequisites: CMake 3.20+, a C++20 compiler, Git, and network access on the first
 configure (CMake fetches the pinned GoogleTest release). The filesystem and
-networking implementation requires a POSIX environment.
+networking implementation requires a POSIX environment and OpenSSL 3.0+ development
+headers/libraries. On Ubuntu: `sudo apt-get install g++ cmake ninja-build git libssl-dev openssl`.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
@@ -119,7 +120,7 @@ MinGW shells target the native Windows API and are not suitable here):
 
 ```sh
 pacman -Syu
-pacman -S --needed gcc cmake ninja git
+pacman -S --needed gcc cmake ninja git openssl-devel
 cmake -S . -B build-msys -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build-msys --parallel
 ctest --test-dir build-msys --output-on-failure
@@ -144,6 +145,15 @@ docs/             Engineering decisions and protocol specification
 
 ## Current scope
 
+Milestone 18 adds explicit mutual-TLS constructors for `TcpClient`, `TcpServer`,
+`RemoteStorageNodeClient`, and `StorageNodeServer`. TLS 1.3 authenticates certificate
+chains and exact SAN URI role/node identities; a separate allowlist authorizes
+storage operations for specific targets before dispatch. Secure endpoints never
+fall back to plaintext. Existing constructors remain **insecure development-only**
+compatibility paths: deployments must choose the TLS overload on both sides and
+close/remove plaintext listeners. See [Milestone 18](docs/milestone-18.md) for
+configuration, issuance, CRLs, credential rotation, failure behavior, and limits.
+
 Object identifiers contain only ASCII letters, digits, `.`, `_`, and `-`, are at
 most 255 bytes, and cannot be `.` or `..`. Objects are limited to slightly below
 16 MiB so complete requests and responses remain inside the framing limit. The
@@ -156,5 +166,5 @@ transfers one bounded logical object per PUT or GET.
 Node membership, plans, and replication orchestration are in-process and
 single-threaded. Storage roots, chunks, manifests, and current replica metadata
 are durable and independent. Multiple catalog writers, automatic repair,
-consensus, transport authentication, and production concurrency remain
+consensus, automatic credential management, and production concurrency remain
 deliberately out of scope.

@@ -16,6 +16,7 @@ namespace atlasfs::replication {
 class RemoteStorageNodeClient final : public StorageNode {
 public:
     RemoteStorageNodeClient(std::string node_id, std::uint16_t port);
+    RemoteStorageNodeClient(std::string node_id, std::uint16_t port, net::TlsConfig config);
     [[nodiscard]] std::string_view id() const noexcept override;
     [[nodiscard]] storage::StoreError prepare(std::string_view, std::string_view,
         const storage::ObjectManifest&, std::span<const std::uint32_t>,
@@ -54,6 +55,10 @@ class StorageNodeServer {
 public:
     StorageNodeServer(std::shared_ptr<StorageNode> node, std::filesystem::path journal_root,
                      std::uint16_t port = 0, bool drop_commit_response_once = false,
+                     bool drop_repair_response_once = false);
+    StorageNodeServer(std::shared_ptr<StorageNode> node, std::filesystem::path journal_root,
+                     net::TlsConfig config, std::uint16_t port = 0,
+                     bool drop_commit_response_once = false,
                      bool drop_repair_response_once = false);
     [[nodiscard]] std::uint16_t port() const noexcept;
     void serve();

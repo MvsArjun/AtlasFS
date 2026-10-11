@@ -2,6 +2,7 @@
 #include "atlasfs/checksum.hpp"
 #include "atlasfs/coordinator_operation.hpp"
 #include "atlasfs/remote_storage_node.hpp"
+#include "tls_test_support.hpp"
 
 #include <gtest/gtest.h>
 
@@ -900,6 +901,204 @@ TEST(RepairExecutor, RemoteReplicaRemainsPhysicalWhenCatalogCasConflicts) {
     ASSERT_TRUE(durable);
     EXPECT_TRUE(durable->publication_succeeded);
     EXPECT_FALSE(durable->metadata_committed);
+}
+class TlsRepair : public ::testing::Test {
+protected:
+    TempRoot root;
+    ExecutionFixture fixture;
+    test::Certificates certificates;
+    net::TlsConfig coordinator{certificates.config({"coordinator", net::PeerRole::coordinator})};
+    net::TlsConfig target{certificates.config({"d", net::PeerRole::storage})};
+    TlsRepair() {
+        test::Certificates::allow(coordinator, {"d", net::PeerRole::storage});
+        test::Certificates::allow(coordinator, {"a", net::PeerRole::storage}, {"a"});
+        test::Certificates::allow(target, coordinator.local_identity);
+    }
+    class Running {
+    public:
+        Running(std::shared_ptr<replication::StorageNode> node, const std::filesystem::path& journal,
+                net::TlsConfig config, bool drop = false)
+            : server(std::move(node), journal, std::move(config), 0, false, drop),
+              thread([this] { try { server.serve(); } catch (...) { error = std::current_exception(); } }) {}
+        ~Running() { stop(); }
+        void stop() { server.stop(); if (thread.joinable()) thread.join(); }
+        replication::StorageNodeServer server;
+        std::exception_ptr error;
+        std::thread thread;
+    };
+    std::shared_ptr<replication::LocalStorageNode> source() {
+        auto result = std::make_shared<replication::LocalStorageNode>("a", root.path() / "source", 1024, 1);
+        const auto status = result->publish_repair("seed-plan", "seed-execution", "a", "object",
+            fixture.manifest, fixture.manifest.chunks[0], fixture.data).status;
+        if (status != replication::RepairPublishStatus::published &&
+            status != replication::RepairPublishStatus::already_present_valid)
+            throw std::runtime_error("test source publication failed");
+        return result;
+    }
+};
+TEST_F(TlsRepair, MultiNodeAuthenticatedTransferCommitsCatalogWithoutChangingHistory) {
+    metadata::DurableReplicaCatalog catalog(root.path());
+    ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+    metadata::CoordinatorOperationStore history(root.path());
+    ASSERT_EQ(history.create(metadata::make_coordinator_operation(fixture.placement, "history", 77)),
+              metadata::CoordinatorRecordError::none);
+    const auto before = metadata::encode_coordinator_operation(*history.get("history"));
+    auto local_source = source();
+    auto source_config = certificates.config({"a", net::PeerRole::storage});
+    test::Certificates::allow(source_config, coordinator.local_identity, {"a"});
+    Running source_server(local_source, root.path() / "source-journal", source_config);
+    auto remote_source = std::make_shared<replication::RemoteStorageNodeClient>("a", source_server.server.port(), coordinator);
+    auto local_target = std::make_shared<replication::LocalStorageNode>("d", root.path() / "target", 1024, 1);
+    Running target_server(local_target, root.path() / "target-journal", target);
+    auto remote_target = std::make_shared<replication::RemoteStorageNodeClient>("d", target_server.server.port(), coordinator);
+    const auto plan = execution_plan(fixture, catalog);
+    RepairPlanStore plans(root.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+    RepairExecutor executor(plans, catalog, {remote_source, remote_target});
+    ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+    const auto result = executor.execute(plan.plan_id, fixture.placement, fixture.members);
+    EXPECT_EQ(result.error, RepairExecutionError::none);
+    EXPECT_EQ(result.state, RepairPlanState::completed);
+    EXPECT_EQ(local_target->get_chunk("object", "generation-1", 0).data, fixture.data);
+    EXPECT_EQ(catalog.version(), 2U);
+    EXPECT_EQ(metadata::encode_coordinator_operation(*history.get("history")), before);
+    EXPECT_TRUE(plans.get(plan.plan_id)->metadata_committed);
+}
+TEST_F(TlsRepair, LostResponseReconnectAndDurableReplayUseOriginalExecutionIdentity) {
+    metadata::DurableReplicaCatalog catalog(root.path());
+    ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+    auto local_source = source();
+    auto local_target = std::make_shared<replication::LocalStorageNode>("d", root.path() / "target", 1024, 1);
+    Running first(local_target, root.path() / "target-journal", target, true);
+    auto remote = std::make_shared<replication::RemoteStorageNodeClient>("d", first.server.port(), coordinator);
+    const auto plan = execution_plan(fixture, catalog);
+    RepairPlanStore plans(root.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+    RepairExecutor executor(plans, catalog, {local_source, remote});
+    ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+    const auto before = catalog.snapshot();
+    const auto result = executor.execute(plan.plan_id, fixture.placement, fixture.members);
+    first.stop();
+    EXPECT_EQ(result.error, RepairExecutionError::remote_result_unknown);
+    EXPECT_EQ(catalog.snapshot(), before);
+    ASSERT_TRUE(plans.get(plan.plan_id));
+    const auto execution = plans.get(plan.plan_id)->execution_id;
+    EXPECT_FALSE(plans.get(plan.plan_id)->metadata_committed);
+    EXPECT_EQ(local_target->get_chunk("object", "generation-1", 0).data, fixture.data);
+
+    RepairPlanStore restarted_plans(root.path());
+    metadata::DurableReplicaCatalog restarted_catalog(root.path());
+    Running restarted(local_target, root.path() / "target-journal", target);
+    auto reconnected = std::make_shared<replication::RemoteStorageNodeClient>("d", restarted.server.port(), coordinator);
+    RepairExecutor recovery(restarted_plans, restarted_catalog, {local_source, reconnected});
+    const auto reconciled = recovery.reconcile(plan.plan_id, fixture.placement, fixture.members);
+    EXPECT_EQ(reconciled.error, RepairExecutionError::none);
+    EXPECT_EQ(reconciled.state, RepairPlanState::completed);
+    EXPECT_EQ(restarted_plans.get(plan.plan_id)->execution_id, execution);
+    EXPECT_EQ(restarted_catalog.version(), 2U);
+    const auto duplicate = reconnected->publish_repair(plan.plan_id, execution, "d", "object",
+        fixture.manifest, fixture.manifest.chunks[0], fixture.data);
+    // Exact journal replay returns the original recorded publication result.
+    EXPECT_EQ(duplicate.status, replication::RepairPublishStatus::published);
+    EXPECT_EQ(restarted_catalog.version(), 2U);
+    auto changed_manifest = fixture.manifest;
+    changed_manifest.generation_id = "other-generation";
+    EXPECT_EQ(reconnected->publish_repair(plan.plan_id, execution, "d", "object",
+        changed_manifest, changed_manifest.chunks[0], fixture.data).status,
+        replication::RepairPublishStatus::target_rejected);
+}
+TEST_F(TlsRepair, CatalogCasConflictAfterTlsPublicationDoesNotCompleteRepair) {
+    metadata::DurableReplicaCatalog catalog(root.path());
+    ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+    const auto initial = catalog.get(fixture.placement.chunks[0].identity);
+    ASSERT_TRUE(initial);
+    auto competing = initial->replicas;
+    competing.push_back({"e", metadata::CatalogReplicaState::present, fixture.checksum, fixture.members.version});
+    auto local_source = source();
+    auto local_target = std::make_shared<FakeRepairNode>("d");
+    local_target->after_repair = [&] {
+        static_cast<void>(catalog.compare_exchange({initial->identity, initial->catalog_version,
+                                                   initial->replicas, competing}));
+    };
+    Running running(local_target, root.path() / "target-journal", target);
+    auto remote = std::make_shared<replication::RemoteStorageNodeClient>("d", running.server.port(), coordinator);
+    const auto plan = execution_plan(fixture, catalog);
+    RepairPlanStore plans(root.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+    RepairExecutor executor(plans, catalog, {local_source, remote});
+    ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+    const auto result = executor.execute(plan.plan_id, fixture.placement, fixture.members);
+    running.stop();
+    EXPECT_EQ(result.error, RepairExecutionError::conflicting_repair);
+    EXPECT_EQ(result.state, RepairPlanState::stale);
+    EXPECT_TRUE(local_target->chunk_);
+    EXPECT_EQ(catalog.get(initial->identity)->replicas, competing);
+    EXPECT_FALSE(plans.get(plan.plan_id)->metadata_committed);
+}
+TEST_F(TlsRepair, StorageRoleAndWrongTargetCannotPublishOrAcquireAuthority) {
+    auto local_source = source();
+    for (bool storage_role : {true, false}) {
+        TempRoot attempt;
+        auto config = certificates.config({storage_role ? "peer" : "coordinator", storage_role ?
+            net::PeerRole::storage : net::PeerRole::coordinator});
+        test::Certificates::allow(config, target.local_identity);
+        auto policy = target;
+        policy.peers.clear();
+        test::Certificates::allow(policy, config.local_identity, storage_role ?
+            std::set<std::string, std::less<>>{"d"} : std::set<std::string, std::less<>>{"other"});
+        metadata::DurableReplicaCatalog catalog(attempt.path());
+        ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+        const auto before = catalog.snapshot();
+        auto local_target = std::make_shared<replication::LocalStorageNode>("d", attempt.path() / "target", 1024, 1);
+        Running running(local_target, attempt.path() / "journal", policy);
+        auto remote = std::make_shared<replication::RemoteStorageNodeClient>("d", running.server.port(), config);
+        const auto plan = execution_plan(fixture, catalog);
+        RepairPlanStore plans(attempt.path()); ASSERT_EQ(plans.create(plan), RepairStoreError::none);
+        RepairExecutor executor(plans, catalog, {local_source, remote});
+        ASSERT_EQ(executor.approve(plan.plan_id), RepairStoreError::none);
+        EXPECT_NE(executor.execute(plan.plan_id, fixture.placement, fixture.members).state, RepairPlanState::completed);
+        EXPECT_FALSE(plans.get(plan.plan_id)->metadata_committed);
+        EXPECT_EQ(catalog.snapshot(), before);
+        EXPECT_EQ(local_target->get_chunk("object", "generation-1", 0).error, storage::StoreError::not_found);
+        EXPECT_TRUE(std::filesystem::is_empty(attempt.path() / "journal" / "repairs"));
+        EXPECT_TRUE(std::filesystem::is_empty(attempt.path() / "journal" / "operations"));
+    }
+}
+TEST_F(TlsRepair, WrongClaimedTargetIsRejectedBeforePublication) {
+    auto local_target = std::make_shared<replication::LocalStorageNode>("d", root.path() / "target", 1024, 1);
+    Running running(local_target, root.path() / "journal", target);
+    replication::RemoteStorageNodeClient remote("d", running.server.port(), coordinator);
+    EXPECT_EQ(remote.publish_repair("plan", "execution", "other", "object", fixture.manifest,
+        fixture.manifest.chunks[0], fixture.data).status, replication::RepairPublishStatus::identity_mismatch);
+    EXPECT_EQ(local_target->get_chunk("object", "generation-1", 0).error, storage::StoreError::not_found);
+    EXPECT_TRUE(std::filesystem::is_empty(root.path() / "journal" / "repairs"));
+}
+TEST_F(TlsRepair, StorageEndpointMustMatchItsCertificateIdentity) {
+    auto local_target = std::make_shared<replication::LocalStorageNode>("other", root.path() / "target", 1024, 1);
+    EXPECT_THROW(replication::StorageNodeServer(local_target, root.path() / "journal", target), std::invalid_argument);
+    EXPECT_FALSE(std::filesystem::exists(root.path() / "journal"));
+}
+TEST_F(TlsRepair, StoragePeerMayReadButEveryCoordinatorRpcIsDeniedBeforeDispatch) {
+    auto config = certificates.config({"peer", net::PeerRole::storage});
+    test::Certificates::allow(config, target.local_identity);
+    test::Certificates::allow(target, config.local_identity);
+    auto local_target = std::make_shared<replication::LocalStorageNode>("d", root.path() / "target", 1024, 1);
+    Running running(local_target, root.path() / "journal", target);
+    net::TcpClient client(running.server.port(), config, target.local_identity);
+    namespace snp = storage_node_protocol;
+    using Type = protocol::MessageType;
+    std::uint64_t request_id = 1;
+    const auto identity = snp::encode_identity({"operation", "object", "generation-1"});
+    for (auto type : {Type::storage_commit_request, Type::storage_abort_request,
+                      Type::storage_delete_request, Type::storage_query_request})
+        EXPECT_EQ(client.request({type, 0, request_id++, identity}).type, Type::error_response);
+    EXPECT_EQ(client.request({Type::storage_prepare_request, 0, request_id++, snp::encode_prepare(
+        {"operation", "object", fixture.manifest, {0}, fixture.data})}).type, Type::error_response);
+    EXPECT_EQ(client.request({Type::storage_repair_chunk_request, 0, request_id++, snp::encode_repair_chunk(
+        {"plan", "execution", "d", "object", fixture.manifest, fixture.manifest.chunks[0], fixture.data})}).type,
+        Type::error_response);
+    EXPECT_EQ(client.request({Type::storage_get_chunk_request, 0, request_id++, snp::encode_get_chunk(
+        {"object", "generation-1", 0})}).type, Type::storage_get_chunk_response);
+    EXPECT_TRUE(std::filesystem::is_empty(root.path() / "journal" / "repairs"));
+    EXPECT_TRUE(std::filesystem::is_empty(root.path() / "journal" / "operations"));
+    EXPECT_EQ(local_target->get_chunk("object", "generation-1", 0).error, storage::StoreError::not_found);
 }
 }  // namespace
 }  // namespace atlasfs::repair

@@ -16,6 +16,7 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+find_package(OpenSSL 3.0 REQUIRED)
 
 add_library(atlasfs_protocol
     src/protocol.cpp
@@ -50,6 +51,7 @@ add_library(atlasfs_replication
 add_library(AtlasFS::replication ALIAS atlasfs_replication)
 
 add_library(atlasfs_net
+    src/transport.cpp
     src/socket.cpp
     src/tcp_client.cpp
     src/tcp_server.cpp
@@ -65,7 +67,7 @@ target_include_directories(atlasfs_net
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(atlasfs_net PUBLIC AtlasFS::protocol)
+target_link_libraries(atlasfs_net PUBLIC AtlasFS::protocol OpenSSL::SSL OpenSSL::Crypto)
 
 target_include_directories(atlasfs_storage
     PUBLIC
@@ -131,6 +133,9 @@ if(BUILD_TESTING)
     target_link_libraries(atlasfs_protocol_tests PRIVATE AtlasFS::protocol GTest::gtest_main)
 
     find_package(Threads REQUIRED)
+    add_executable(atlasfs_tls_transport_tests tests/tls_transport_test.cpp)
+    target_link_libraries(atlasfs_tls_transport_tests
+        PRIVATE AtlasFS::replication GTest::gtest_main Threads::Threads)
     add_executable(atlasfs_tcp_transport_tests tests/tcp_transport_test.cpp)
     target_link_libraries(atlasfs_tcp_transport_tests
         PRIVATE AtlasFS::net GTest::gtest_main Threads::Threads)
@@ -169,6 +174,7 @@ if(BUILD_TESTING)
     else()
         target_compile_options(atlasfs_protocol_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(atlasfs_tcp_transport_tests PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(atlasfs_tls_transport_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(atlasfs_storage_tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(atlasfs_storage_integration_tests
             PRIVATE -Wall -Wextra -Wpedantic)
@@ -179,6 +185,7 @@ if(BUILD_TESTING)
     include(GoogleTest)
     gtest_discover_tests(atlasfs_protocol_tests)
     gtest_discover_tests(atlasfs_tcp_transport_tests)
+    gtest_discover_tests(atlasfs_tls_transport_tests)
     gtest_discover_tests(atlasfs_storage_tests)
     gtest_discover_tests(atlasfs_storage_integration_tests)
     gtest_discover_tests(atlasfs_metadata_tests)

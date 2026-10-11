@@ -100,6 +100,14 @@ TcpServer::~TcpServer() {
     stop();
 }
 
+TcpServer::TcpServer(TlsConfig config, std::uint16_t port,
+                     AuthenticatedRequestHandler handler, std::uint32_t max_payload_size)
+    : TcpServer(port, echo_response, max_payload_size) {
+    if (!handler) throw std::invalid_argument("TLS server requires an authenticated handler");
+    tls_ = std::make_shared<TlsContext>(std::move(config));
+    authenticated_handler_ = std::move(handler);
+}
+
 std::uint16_t TcpServer::port() const noexcept {
     return port_;
 }
@@ -121,6 +129,10 @@ void TcpServer::serve() {
         set_active_descriptor(descriptor);
         try {
             handle_connection(connection);
+        } catch (const TransportError&) {
+            clear_active_descriptor(descriptor);
+            if (stopping_.load()) return;
+            continue;
         } catch (const std::system_error&) {
             clear_active_descriptor(descriptor);
             if (stopping_.load()) {
@@ -154,28 +166,25 @@ void TcpServer::stop() noexcept {
 void TcpServer::handle_connection(Socket& connection) {
     protocol::StreamParser parser(max_payload_size_);
     std::array<std::byte, 8192> buffer{};
+    auto stream = tls_ ? tls_->accept(connection.get()) : plaintext_stream(connection.get());
+    const auto timeout = tls_ ? tls_->timeout() : std::chrono::seconds(5);
+    auto deadline = std::chrono::steady_clock::now() + timeout;
 
     while (!stopping_.load()) {
-        const auto received = ::recv(connection.get(), buffer.data(), buffer.size(), 0);
+        const auto received = stream->read(buffer, deadline);
         if (received > 0) {
             auto result = parser.feed(
                 std::span<const std::byte>(buffer).first(static_cast<std::size_t>(received)));
             for (const auto& request : result.messages) {
-                send_all(connection.get(), protocol::encode(handler_(request)));
+                const auto response = tls_ ? authenticated_handler_(request, *stream->peer())
+                                           : handler_(request);
+                stream->write_all(protocol::encode(response), deadline);
+                deadline = std::chrono::steady_clock::now() + timeout;
             }
             if (result.error != protocol::ParseError::none) {
                 return;
             }
             continue;
-        }
-        if (received < 0 && errno == EINTR) {
-            continue;
-        }
-        if (received < 0) {
-            if (stopping_.load()) {
-                return;
-            }
-            throw_system_error("recv");
         }
         return;
     }

@@ -425,7 +425,41 @@ durable operation records. Object data and manifests remain durable.
 
 ## Intended evolution
 
-The next dependency is authenticated coordinator-to-node transport and durable
-operator-facing audit/reporting around recovery decisions. Consensus,
+Authenticated coordinator-to-node transport is available through explicit TLS
+endpoint configuration. The next dependency is durable operator-facing
+audit/reporting around recovery decisions. Consensus,
 cross-process catalog writers, automatic retries, automatic repair, and automatic
 operation recovery remain deferred.
+
+## Authenticated transport (Milestone 18)
+
+`ByteStream` wraps sockets without changing ATFS framing. Plain and OpenSSL TLS
+implementations share absolute monotonic I/O deadlines. TCP connect and TLS
+handshake have separate bounded deadlines; a client request shares one deadline
+for write plus complete response. A server keeps one frame deadline across
+partial reads, then starts the next only after a complete response. Cryptography,
+chain validation, validity periods, certificate purposes, and optional CRL
+validation are provided by OpenSSL, not AtlasFS.
+
+TLS requires a peer certificate and an exact, single SAN URI configured in the
+local peer allowlist. The local certificate must match the endpoint's configured
+role/ID. Remote clients additionally bind the peer to the intended storage ID;
+storage servers bind their certificate identity to the underlying node. URI roles
+cannot be reassigned by policy or by a request payload. The storage server checks
+role and permitted target before decoding or dispatching mutations: coordinators
+may invoke storage RPCs, while storage peers may only read permitted chunks.
+Generic object RPCs are not authorized on the secure storage-node endpoint.
+Generic `TcpServer` TLS users must supply their own authenticated handler policy.
+
+TLS rejection closes that connection without dispatch and the server continues
+accepting. Client transport failure closes the unusable stream without retry.
+Repair responses retain execution IDs and fingerprints; ambiguous outcomes remain
+unknown and physical bytes become authoritative only after verification and
+catalog CAS. No storage, catalog, history, or recovery formats change.
+
+Contexts are immutable and credentials are per endpoint. Rotation or allowlist
+removal requires endpoint replacement and closure of existing connections; TLS
+session resumption and early data are disabled. Loopback listeners and sequential
+dispatch remain intentional limitations. Legacy plaintext constructors are
+explicit insecure compatibility paths, not TLS fallback. The full threat model
+and deployment procedure are in [Milestone 18](milestone-18.md).

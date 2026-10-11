@@ -2,6 +2,7 @@
 
 #include "atlasfs/protocol.hpp"
 #include "atlasfs/socket.hpp"
+#include "atlasfs/transport.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -11,6 +12,8 @@
 namespace atlasfs::net {
 
 using RequestHandler = std::function<protocol::Message(const protocol::Message&)>;
+using AuthenticatedRequestHandler =
+    std::function<protocol::Message(const protocol::Message&, const PeerPolicy&)>;
 
 [[nodiscard]] protocol::Message echo_response(const protocol::Message& request);
 
@@ -20,6 +23,8 @@ public:
         std::uint16_t port = 0,
         RequestHandler handler = echo_response,
         std::uint32_t max_payload_size = protocol::kDefaultMaxPayloadSize);
+    TcpServer(TlsConfig config, std::uint16_t port, AuthenticatedRequestHandler handler,
+              std::uint32_t max_payload_size = protocol::kDefaultMaxPayloadSize);
     ~TcpServer();
 
     TcpServer(const TcpServer&) = delete;
@@ -39,6 +44,8 @@ private:
     Socket listener_;
     std::uint16_t port_{};
     RequestHandler handler_;
+    std::shared_ptr<TlsContext> tls_;
+    AuthenticatedRequestHandler authenticated_handler_;
     std::uint32_t max_payload_size_;
     std::atomic_bool stopping_{false};
     std::mutex active_mutex_;

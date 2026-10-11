@@ -1,8 +1,10 @@
 #include "atlasfs/socket.hpp"
+#include "atlasfs/transport.hpp"
 
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdexcept>
 #include <string>
@@ -55,7 +57,9 @@ void Socket::reset(int descriptor) noexcept {
     descriptor_ = descriptor;
 }
 
-Socket connect_loopback(std::uint16_t port) {
+Socket connect_loopback(std::uint16_t port, std::chrono::milliseconds timeout) {
+    if (timeout.count() <= 0 || timeout > std::chrono::minutes(5))
+        throw std::invalid_argument("invalid connection timeout");
     Socket socket(::socket(AF_INET, SOCK_STREAM, 0));
     if (!socket.valid()) {
         throw_system_error("socket");
@@ -66,14 +70,22 @@ Socket connect_loopback(std::uint16_t port) {
     address.sin_port = htons(port);
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    int result;
-    do {
-        result = ::connect(socket.get(), reinterpret_cast<const sockaddr*>(&address),
-                           sizeof(address));
-    } while (result < 0 && errno == EINTR);
+    const int flags = ::fcntl(socket.get(), F_GETFL, 0);
+    make_nonblocking(socket.get());
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const int result = ::connect(socket.get(), reinterpret_cast<const sockaddr*>(&address),
+                                sizeof(address));
     if (result < 0) {
-        throw_system_error("connect");
+        if (errno != EINPROGRESS && errno != EINTR) throw_system_error("connect");
+        wait_socket(socket.get(), true, deadline);
+        int error = 0;
+        socklen_t length = sizeof(error);
+        if (::getsockopt(socket.get(), SOL_SOCKET, SO_ERROR, &error, &length) != 0)
+            throw_system_error("getsockopt(connect)");
+        if (error != 0) throw std::system_error(error, std::generic_category(), "connect");
     }
+    // Preserve the raw-socket compatibility API; stream users make it nonblocking.
+    if (::fcntl(socket.get(), F_SETFL, flags) != 0) throw_system_error("fcntl(connect)");
     return socket;
 }
 

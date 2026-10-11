@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <span>
 
@@ -26,7 +27,8 @@ private:
     int descriptor_{-1};
 };
 
-[[nodiscard]] Socket connect_loopback(std::uint16_t port);
+[[nodiscard]] Socket connect_loopback(std::uint16_t port,
+    std::chrono::milliseconds timeout = std::chrono::seconds(5));
 void send_all(int descriptor, std::span<const std::byte> bytes);
 
 }  // namespace atlasfs::net

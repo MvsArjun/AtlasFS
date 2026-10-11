@@ -170,6 +170,38 @@ identical physical bytes. A successful
 physical response still does not make the replica authoritative; only the
 subsequent coordinator catalog CAS does.
 
-The current trust boundary is the existing coordinator-to-storage-node channel
-and validated node identity. AtlasFS does not yet provide cryptographic peer
-authentication or encrypted transport.
+### Authenticated transport envelope (Milestone 18)
+
+Explicit TLS endpoints exchange TLS 1.3 records from the first byte, with mutual
+certificate authentication and no plaintext negotiation or downgrade. Within the
+authenticated stream, ATFS framing and storage protocol version 2 are unchanged.
+Plaintext peers and TLS versions below 1.3 are rejected. No new application fields
+or security claims in payloads are trusted as authentication.
+
+Certificates must contain exactly one URI SAN, either
+`urn:atlasfs:coordinator:<id>` or `urn:atlasfs:storage:<id>`. Chain validation,
+validity periods, TLS certificate purposes, and configured CRLs are checked by
+OpenSSL. CN and DNS SANs do not establish AtlasFS identity. URI-to-role/ID mappings
+must be canonical, explicitly allowlisted, and bound to the expected storage ID
+on clients. A TLS storage endpoint must match its underlying storage-node ID.
+
+Before storage request decoding, the server requires the authenticated peer's
+target allowlist to contain its local node ID. Coordinators may PREPARE, COMMIT,
+ABORT, GET_CHUNK, DELETE, QUERY_OPERATION, and REPAIR_CHUNK. Storage-role peers may
+only GET_CHUNK. Other types, including generic object operations and response
+frames used as requests, are denied. REPAIR_CHUNK's claimed target must also match
+the server; successful authentication cannot override that check.
+
+Policy denial returns a bounded empty `error_response` with the original request
+ID and does not touch application journals or data. Certificate or identity
+failure closes the transport before dispatch. Existing repair clients conservatively
+classify an unexpected response as `result_unknown`, never as publication success.
+Deadlines bound connect, handshake, complete-frame reads, and writes. Certificate
+chains are limited to depth eight and handshake certificate lists to 64 KiB;
+application payloads retain the existing bounded parser limits. No automatic
+retry occurs. Reconnect authenticates current credentials, and duplicate replay
+uses the original execution ID and fingerprint, not a new operation identity.
+
+Legacy plaintext endpoints remain explicitly available for local development and
+are not secure deployments. See [Milestone 18](milestone-18.md) for migration,
+configuration, revocation, and residual application-level replay risks.

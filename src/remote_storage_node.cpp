@@ -13,6 +13,12 @@ namespace atlasfs::replication {
 namespace snp = storage_node_protocol;
 namespace {
 
+net::TlsConfig storage_tls(const std::shared_ptr<StorageNode>& node, net::TlsConfig&& config) {
+    if (!node || config.local_identity != net::PeerIdentity{std::string(node->id()), net::PeerRole::storage})
+        throw std::invalid_argument("TLS storage endpoint identity mismatch");
+    return std::move(config);
+}
+
 snp::RepairResponseStatus wire_status(RepairPublishStatus status) {
     switch (status) {
         case RepairPublishStatus::published:
@@ -76,6 +82,14 @@ RemoteStorageNodeClient::RemoteStorageNodeClient(std::string node_id, std::uint1
 }
 
 std::string_view RemoteStorageNodeClient::id() const noexcept { return node_id_; }
+
+RemoteStorageNodeClient::RemoteStorageNodeClient(std::string node_id, std::uint16_t port,
+                                               net::TlsConfig config)
+    : node_id_(std::move(node_id)),
+      client_(port, std::move(config), {node_id_, net::PeerRole::storage}) {
+    if (!metadata::NodeRegistry::valid_node_id(node_id_))
+        throw std::invalid_argument("remote storage node requires valid id");
+}
 
 snp::Response RemoteStorageNodeClient::exchange(protocol::MessageType request_type,
     protocol::MessageType response_type, std::vector<std::byte> payload, bool commit) const {
@@ -234,6 +248,25 @@ StorageNodeServer::StorageNodeServer(std::shared_ptr<StorageNode> node,
 }
 
 std::uint16_t StorageNodeServer::port() const noexcept { return server_.port(); }
+StorageNodeServer::StorageNodeServer(std::shared_ptr<StorageNode> node,
+    std::filesystem::path journal_root, net::TlsConfig config, std::uint16_t port,
+    bool drop_commit_response_once, bool drop_repair_response_once)
+    : node_(std::move(node)), operations_directory_(journal_root / "operations"),
+      repairs_directory_(std::move(journal_root) / "repairs"),
+      drop_commit_response_once_(drop_commit_response_once),
+      drop_repair_response_once_(drop_repair_response_once),
+      server_(storage_tls(node_, std::move(config)), port,
+          [this](const protocol::Message& request, const net::PeerPolicy& peer) {
+              if (!net::authorize_storage(peer, node_->id(), request.type))
+                  return protocol::Message{protocol::MessageType::error_response, 0,
+                      request.request_id, {}};
+              return handle(request);
+          }) {
+    std::filesystem::create_directories(operations_directory_);
+    std::filesystem::create_directories(repairs_directory_);
+    load_records();
+    load_repair_records();
+}
 void StorageNodeServer::serve() { server_.serve(); }
 void StorageNodeServer::stop() noexcept { server_.stop(); }
 
