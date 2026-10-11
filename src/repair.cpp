@@ -510,14 +510,16 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
         (plan->last_error == RepairExecutionError::remote_result_unknown ||
          plan->last_error == RepairExecutionError::catalog_durability_unknown ||
          plan->last_error == RepairExecutionError::metadata_commit_failure);
-    const bool replay_unknown_publication = recoverable_failure &&
-        plan->last_error == RepairExecutionError::remote_result_unknown;
     if (recovering) {
         if (plan->state != RepairPlanState::executing && !recoverable_failure)
             return {RepairExecutionError::not_reconcilable, plan->state};
     } else if (plan->state != RepairPlanState::approved) {
         return {RepairExecutionError::not_approved, plan->state};
     }
+    // A visible post-rename snapshot is not confirmed durable in a poisoned
+    // catalog process. Only restart can establish which snapshot survived.
+    if (catalog_.durability_unknown())
+        return {RepairExecutionError::catalog_durability_unknown, plan->state};
     if (recoverable_failure) {
         plan->state = RepairPlanState::executing;
         plan->last_error = RepairExecutionError::none;
@@ -576,11 +578,41 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
             record->replicas = plan->observed_catalog_replicas;
             if (planner_.validate(*plan, placement, membership, evidence_snapshot) ==
                     PlanValidation::current) {
-                const auto current = catalog_.get(identity);
+                const auto current = std::find_if(catalog_snapshot.records.begin(),
+                    catalog_snapshot.records.end(), [&](const auto& value) {
+                        return value.identity == identity;
+                    });
                 if (plan->catalog_version != std::numeric_limits<std::uint64_t>::max() &&
                     catalog_snapshot.catalog_version == plan->catalog_version + 1U &&
-                    current && current->catalog_version == plan->catalog_version + 1U &&
+                    current != catalog_snapshot.records.end() &&
+                    current->catalog_version == plan->catalog_version + 1U &&
                     current->replicas == desired_replicas) {
+                    if (!plan->publication_succeeded || !plan->verification_succeeded)
+                        return {RepairExecutionError::not_reconcilable, plan->state};
+                    const auto target = nodes_.find(plan->target_node);
+                    if (target == nodes_.end())
+                        return {RepairExecutionError::target_unavailable, plan->state};
+                    const auto visible = target->second->get_chunk(plan->object_id,
+                        plan->generation_id, plan->chunk_index);
+                    if (visible.error != storage::StoreError::none)
+                        return {RepairExecutionError::target_unavailable, plan->state};
+                    storage::ObjectManifest expected{placement.object_size,
+                        placement.chunk_size, placement.object_checksum,
+                        placement.generation_id, {}};
+                    for (const auto& chunk : placement.chunks)
+                        expected.chunks.push_back(chunk.chunk);
+                    std::sort(expected.chunks.begin(), expected.chunks.end(),
+                        [](const auto& left, const auto& right) {
+                            return left.index < right.index;
+                        });
+                    if (visible.manifest != expected || visible.chunk != chunk_it->chunk ||
+                        visible.data.size() != chunk_it->chunk.length ||
+                        integrity::crc32c(visible.data) != chunk_it->chunk.checksum)
+                        return {RepairExecutionError::verification_failure, plan->state};
+                    if (catalog_.durability_unknown())
+                        return {RepairExecutionError::catalog_durability_unknown, plan->state};
+                    if (catalog_.snapshot() != catalog_snapshot)
+                        return {RepairExecutionError::conflicting_repair, plan->state};
                     auto& placement_replicas = placement.chunks[static_cast<std::size_t>(
                         std::distance(placement.chunks.begin(), chunk_it))].replica_node_ids;
                     placement_replicas.clear();
@@ -673,7 +705,9 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
         return {RepairExecutionError::stale, plan->state};
     }
 
-    if (existing.error != storage::StoreError::none || replay_unknown_publication) {
+    // Replay every interrupted execution through the publisher, including when
+    // bytes are visible. Presence cannot resolve an unknown durable journal.
+    if (existing.error != storage::StoreError::none || recovering) {
         const auto published = target->second->publish_repair(
             plan->plan_id, plan->execution_id, plan->target_node, plan->object_id,
             source_chunk.manifest, source_chunk.chunk, source_chunk.data);
@@ -720,7 +754,8 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
     plan->publication_succeeded = true;
     const auto verified = target->second->get_chunk(
         plan->object_id, plan->generation_id, plan->chunk_index);
-    if (verified.error != storage::StoreError::none || verified.chunk != source_chunk.chunk ||
+    if (verified.error != storage::StoreError::none ||
+        verified.manifest != expected_manifest || verified.chunk != source_chunk.chunk ||
         verified.data != source_chunk.data ||
         integrity::crc32c(verified.data) != source_chunk.chunk.checksum) {
         plan->state = RepairPlanState::failed;

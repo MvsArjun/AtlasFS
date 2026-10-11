@@ -243,6 +243,33 @@ TEST(StorageNodeProtocol, CorruptDurableRepairJournalStopsRestart) {
                  std::runtime_error);
 }
 
+TEST(StorageNodeProtocol, SuccessfulJournalCannotHideMissingGenerationAfterRestart) {
+    TempRoot root;
+    const auto value = manifest();
+    const std::vector<std::byte> chunk{std::byte{5}};
+    {
+        auto local = std::make_shared<LocalStorageNode>(
+            "node-a", root.path() / "store", 1024, 4);
+        StorageNodeServer server(local, root.path() / "journal");
+        std::thread thread([&] { server.serve(); });
+        RemoteStorageNodeClient remote("node-a", server.port());
+        EXPECT_EQ(remote.publish_repair("repair-plan", "execution-missing", "node-a",
+            "object", value, value.chunks[1], chunk).status,
+            RepairPublishStatus::published);
+        server.stop(); thread.join();
+        std::filesystem::remove_all(local->store().chunks_directory() / value.generation_id);
+    }
+    auto local = std::make_shared<LocalStorageNode>(
+        "node-a", root.path() / "store", 1024, 4);
+    StorageNodeServer server(local, root.path() / "journal");
+    std::thread thread([&] { server.serve(); });
+    RemoteStorageNodeClient remote("node-a", server.port());
+    EXPECT_EQ(remote.publish_repair("repair-plan", "execution-missing", "node-a",
+        "object", value, value.chunks[1], chunk).status,
+        RepairPublishStatus::target_rejected);
+    server.stop(); thread.join();
+}
+
 TEST(StorageNodeProtocol, DuplicatePrepareCommitAndConflictAreDeterministic) {
     TempRoot root;
     auto local = std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4);

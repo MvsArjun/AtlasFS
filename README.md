@@ -77,6 +77,14 @@ one exact transition the plan would have committed, reconciliation finishes the
 durable plan without copying again; any other catalog or membership change marks
 the plan stale. Startup itself still performs no repair action.
 
+Reconciliation replays every interrupted pre-CAS execution through the publisher,
+even when bytes already exist, so repeated coordinator crashes cannot erase a
+target journal's unknown outcome. The post-CAS completion path requires durable
+publication and verification evidence and freshly verifies the target's manifest,
+chunk length, and checksum. Missing or corrupt data leaves completion pending;
+it does not undo the existing catalog transition. A catalog process with unknown
+durability rejects reconciliation until restart establishes the surviving state.
+
 An authoritative current-replica catalog abstraction is now durable in the
 separate `coordinator/replicas/catalog` snapshot. Its strict, versioned `ARPC` format
 records generation-aware chunk identity and metadata together with sorted replica
@@ -122,6 +130,10 @@ The project enables `-Wall -Wextra -Wpedantic` on GCC and Clang. See
 [`docs/protocol.md`](docs/protocol.md) for the current design and its boundaries.
 
 ## Repository layout
+
+The GitHub Actions workflow uses Ubuntu 24.04 and GCC 13 with separate normal,
+ASan/UBSan, and TSan jobs, serial CTest, and uploaded diagnostics. A workflow file
+is not evidence that CI or sanitizers passed; inspect the actual run result.
 
 ```text
 include/atlasfs/  Public C++ interfaces

@@ -357,14 +357,21 @@ the original membership version, complete health evidence, placement identity,
 and catalog evidence; it never replans, changes source or target, or generates a
 new execution ID. For a lost remote response it replays the exact publication,
 allowing the target's durable fingerprint journal to return the prior result.
-For an interrupted EXECUTING record it verifies any existing target bytes before
-continuing.
+Every interrupted pre-CAS execution invokes the publisher with the original
+execution identity, even when bytes exist. This prevents a second crash after
+clearing a FAILED result from bypassing the target's unknown journal state.
 
 The catalog is handled as a three-way decision. If it still equals the plan's
 original evidence, execution may continue with the original compare-and-swap. If
 its global version is exactly the next version and the affected record equals
 the exact replica set the plan would have committed, the coordinator recognizes
 that its pre-crash CAS succeeded and durably completes the plan without copying.
+This path requires recorded publication and verification evidence plus a fresh
+target read checking the full manifest, chunk metadata, length, and CRC. Missing,
+corrupt, or unavailable targets leave the durable plan pending and retain the
+existing catalog authority; no replacement is published automatically. A poisoned
+catalog process returns unknown durability before any reconciliation mutation;
+restart is required.
 Every other catalog state is stale. This deliberately rejects even apparently
 compatible later catalog versions because another writer may have acted after
 the repair. Physical publication remains distinct from authoritative catalog

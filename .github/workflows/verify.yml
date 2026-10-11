@@ -1,0 +1,44 @@
+name: AtlasFS verification
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [normal, asan-ubsan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y g++-13 cmake ninja-build cppcheck
+      - name: Configure
+        shell: bash
+        run: |
+          flags=''
+          case '${{ matrix.mode }}' in
+            asan-ubsan) flags='-fsanitize=address,undefined -fno-omit-frame-pointer' ;;
+            tsan) flags='-fsanitize=thread -fno-omit-frame-pointer -fno-pie -no-pie' ;;
+          esac
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=g++-13 "-DCMAKE_CXX_FLAGS=$flags"
+      - name: Build
+        run: cmake --build build --parallel 4
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build --output-on-failure --timeout 60
+      - name: Static analysis
+        if: matrix.mode == 'normal'
+        run: cppcheck --enable=warning,performance,portability --std=c++20 --inline-suppr --suppress=missingIncludeSystem --error-exitcode=1 -I include src
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ matrix.mode }}
+          path: build/Testing/Temporary/

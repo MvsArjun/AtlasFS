@@ -162,7 +162,11 @@ or lost response is conservatively reported as an unknown result. The client
 does not retry automatically. An explicit coordinator reconciliation may replay
 the byte-equivalent request with the same plan and execution IDs; the durable
 target journal then returns the recorded result or rejects a conflicting reuse.
-This recovery behavior adds no wire fields or message types. A successful
+This recovery behavior adds no wire fields or message types. A duplicate whose
+generation directory disappeared is rejected despite its successful journal
+entry. A journaled unknown result remains unknown on replay. All interrupted
+pre-CAS executions pass through this boundary, even when GET_CHUNK returns
+identical physical bytes. A successful
 physical response still does not make the replica authoritative; only the
 subsequent coordinator catalog CAS does.
 
