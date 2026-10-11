@@ -1,4 +1,5 @@
 #include "atlasfs/membership.hpp"
+#include "atlasfs/metrics.hpp"
 
 #include "atlasfs/checksum.hpp"
 
@@ -70,7 +71,7 @@ MembershipError map_error(RegistryError error) {
     }
     return MembershipError::invalid_node;
 }
-bool sync_fd(int fd) { int result; do { result = ::fsync(fd); } while (result < 0 && errno == EINTR); return result == 0; }
+bool sync_fd(int fd) { int result; do { result = metrics::io::fsync(fd); } while (result < 0 && errno == EINTR); return result == 0; }
 }
 
 std::vector<std::byte> encode_membership(const MembershipSnapshot& snapshot) {
@@ -127,6 +128,7 @@ DurableMembership::DurableMembership(std::filesystem::path root, FailureDetector
     if (!std::filesystem::exists(record_path_)) return;
     std::ifstream input(record_path_, std::ios::binary); std::vector<std::byte> bytes;
     for (char value; input.get(value);) bytes.push_back(static_cast<std::byte>(value));
+    metrics::io::observed_read(bytes.size());
     const auto snapshot = decode_membership(bytes);
     if (!snapshot || registry_.restore(snapshot->nodes, snapshot->version) != RegistryError::none)
         throw std::runtime_error("invalid durable membership record");
@@ -139,28 +141,28 @@ MembershipError DurableMembership::publish(const NodeRegistry& candidate) {
     if (fault_injector_ && fault_injector_(MembershipFaultPoint::record_creation))
         return MembershipError::persistence_error;
     const auto temporary = directory_ / "registry.tmp";
-    int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    int fd = metrics::io::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) return MembershipError::persistence_error;
     bool okay = !(fault_injector_ && fault_injector_(MembershipFaultPoint::record_write));
     std::size_t offset = 0;
     while (okay && offset < bytes.size()) {
-        const auto written = ::write(fd, bytes.data() + offset, bytes.size() - offset);
+        const auto written = metrics::io::write(fd, bytes.data() + offset, bytes.size() - offset);
         if (written > 0) offset += static_cast<std::size_t>(written);
         else if (written < 0 && errno == EINTR) continue; else okay = false;
     }
     if (fault_injector_ && fault_injector_(MembershipFaultPoint::record_sync)) okay = false;
     if (okay) okay = sync_fd(fd);
-    if (::close(fd) != 0) okay = false;
+    if (metrics::io::close(fd) != 0) okay = false;
     if (!okay) return MembershipError::persistence_error;
     if (fault_injector_ && fault_injector_(MembershipFaultPoint::record_rename))
         return MembershipError::persistence_error;
-    std::error_code error; std::filesystem::rename(temporary, record_path_, error);
+    std::error_code error; metrics::io::rename(temporary, record_path_, error);
     if (error) return MembershipError::persistence_error;
     if (fault_injector_ && fault_injector_(MembershipFaultPoint::directory_sync))
         return MembershipError::persistence_error;
-    const int directory = ::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const int directory = metrics::io::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory < 0) return MembershipError::persistence_error;
-    const bool synced = sync_fd(directory); const bool closed = ::close(directory) == 0;
+    const bool synced = sync_fd(directory); const bool closed = metrics::io::close(directory) == 0;
     return synced && closed ? MembershipError::none : MembershipError::persistence_error;
 }
 

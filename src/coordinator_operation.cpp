@@ -1,4 +1,5 @@
 #include "atlasfs/coordinator_operation.hpp"
+#include "atlasfs/metrics.hpp"
 
 #include "atlasfs/checksum.hpp"
 #include "atlasfs/storage_node_protocol.hpp"
@@ -95,7 +96,7 @@ bool valid_record(const CoordinatorOperationRecord& record) {
     }
     return true;
 }
-bool sync_fd(int fd) { int rc; do { rc = ::fsync(fd); } while (rc < 0 && errno == EINTR); return rc == 0; }
+bool sync_fd(int fd) { int rc; do { rc = metrics::io::fsync(fd); } while (rc < 0 && errno == EINTR); return rc == 0; }
 
 }  // namespace
 
@@ -188,14 +189,17 @@ CoordinatorOperationStore::CoordinatorOperationStore(std::filesystem::path root,
     CoordinatorRecordFaultInjector fault_injector)
     : operations_directory_(std::move(root) / "coordinator" / "operations"),
       fault_injector_(std::move(fault_injector)) {
+    metrics::Timer startup(metrics::Counter::startup_calls, metrics::Counter::startup_ns);
     std::filesystem::create_directories(operations_directory_);
     std::error_code error;
     for (const auto& entry : std::filesystem::directory_iterator(operations_directory_, error)) {
+        metrics::add(metrics::Counter::startup_entries);
         const auto name = entry.path().filename().string();
         if (name.ends_with(".tmp")) continue;
         std::ifstream input(entry.path(), std::ios::binary);
         std::vector<std::byte> bytes;
         for (char value; input.get(value);) bytes.push_back(static_cast<std::byte>(value));
+        metrics::io::observed_read(bytes.size());
         const auto record = decode_coordinator_operation(bytes);
         if (!record || record->operation_id != name || !records_.emplace(name, *record).second)
             throw std::runtime_error("invalid durable coordinator operation record");
@@ -237,29 +241,29 @@ CoordinatorRecordError CoordinatorOperationStore::persist(const CoordinatorOpera
     catch (...) { return CoordinatorRecordError::invalid_record; }
     const auto temporary = operations_directory_ / (record.operation_id + ".tmp");
     const auto final = operations_directory_ / record.operation_id;
-    int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    int fd = metrics::io::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) return CoordinatorRecordError::filesystem_error;
     bool okay = !(fault_injector_ && fault_injector_(CoordinatorRecordFaultPoint::record_write));
     std::size_t offset = 0;
     while (okay && offset < bytes.size()) {
-        const auto written = ::write(fd, bytes.data() + offset, bytes.size() - offset);
+        const auto written = metrics::io::write(fd, bytes.data() + offset, bytes.size() - offset);
         if (written > 0) offset += static_cast<std::size_t>(written);
         else if (written < 0 && errno == EINTR) continue; else okay = false;
     }
     if (fault_injector_ && fault_injector_(CoordinatorRecordFaultPoint::record_sync)) okay = false;
     if (okay) okay = sync_fd(fd);
-    if (::close(fd) != 0) okay = false;
+    if (metrics::io::close(fd) != 0) okay = false;
     if (!okay) return CoordinatorRecordError::filesystem_error;
     if (fault_injector_ && fault_injector_(CoordinatorRecordFaultPoint::record_rename))
         return CoordinatorRecordError::filesystem_error;
-    std::error_code error; std::filesystem::rename(temporary, final, error);
+    std::error_code error; metrics::io::rename(temporary, final, error);
     if (error) return CoordinatorRecordError::filesystem_error;
     if (fault_injector_ && fault_injector_(CoordinatorRecordFaultPoint::directory_sync))
         return CoordinatorRecordError::filesystem_error;
-    const int directory = ::open(operations_directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const int directory = metrics::io::open(operations_directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory < 0) return CoordinatorRecordError::filesystem_error;
     const bool directory_synced = sync_fd(directory);
-    const bool directory_closed = ::close(directory) == 0;
+    const bool directory_closed = metrics::io::close(directory) == 0;
     if (!directory_synced || !directory_closed)
         return CoordinatorRecordError::filesystem_error;
     records_[record.operation_id] = record;

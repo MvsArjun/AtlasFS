@@ -1,4 +1,5 @@
 #include "atlasfs/epoch.hpp"
+#include "atlasfs/metrics.hpp"
 #include "atlasfs/checksum.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -70,11 +71,11 @@ bool valid_state(const State& state) {
     }
     return true;
 }
-bool sync_fd(int fd) { int result; do { result = ::fsync(fd); } while (result < 0 && errno == EINTR); return result == 0; }
+bool sync_fd(int fd) { int result; do { result = metrics::io::fsync(fd); } while (result < 0 && errno == EINTR); return result == 0; }
 bool sync_directory(const std::filesystem::path& path) {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const int fd = metrics::io::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) return false;
-    const bool okay = sync_fd(fd); return ::close(fd) == 0 && okay;
+    const bool okay = sync_fd(fd); return metrics::io::close(fd) == 0 && okay;
 }
 struct Shared {
     pid_t process{::getpid()};
@@ -85,7 +86,7 @@ struct Shared {
     std::uint64_t observed{};
     std::optional<Token> observed_token;
     std::optional<Token> observed_pending;
-    ~Shared() { if (descriptor >= 0) ::close(descriptor); }
+    ~Shared() { if (descriptor >= 0) metrics::io::close(descriptor); }
 };
 std::shared_ptr<Shared> shared_lock(const std::filesystem::path& path) {
     static std::mutex registry_mutex;
@@ -94,7 +95,7 @@ std::shared_ptr<Shared> shared_lock(const std::filesystem::path& path) {
     const auto key = std::make_pair(::getpid(), path);
     if (auto result = registry[key].lock()) return result;
     auto result = std::make_shared<Shared>();
-    result->descriptor = ::open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    result->descriptor = metrics::io::open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
     if (result->descriptor < 0) throw Error(Status::unresolved);
     registry[key] = result;
     return result;
@@ -173,30 +174,30 @@ void Store::provision(const std::filesystem::path& directory, const Token& initi
         std::filesystem::exists(marker))
         throw Error(Status::conflict);
     const auto bytes = encode_state({initial, std::nullopt, {}});
-    const int enrollment = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    const int enrollment = metrics::io::open(marker.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (enrollment < 0) throw Error(Status::unresolved);
     std::size_t enrolled{}; bool enrolled_okay = true;
     while (enrolled < bytes.size()) {
-        const auto n = ::write(enrollment, bytes.data() + enrolled, bytes.size() - enrolled);
+        const auto n = metrics::io::write(enrollment, bytes.data() + enrolled, bytes.size() - enrolled);
         if (n > 0) enrolled += static_cast<std::size_t>(n);
         else if (n < 0 && errno == EINTR) continue;
         else { enrolled_okay = false; break; }
     }
     enrolled_okay = sync_fd(enrollment) && enrolled_okay;
-    if (::close(enrollment) != 0 || !enrolled_okay || !sync_directory(directory.parent_path()) ||
+    if (metrics::io::close(enrollment) != 0 || !enrolled_okay || !sync_directory(directory.parent_path()) ||
         !std::filesystem::create_directory(directory)) throw Error(Status::unresolved);
     for (const auto& name : {"lock", "record"}) {
-        const int fd = ::open((directory / name).c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        const int fd = metrics::io::open((directory / name).c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
         if (fd < 0) throw Error(Status::unresolved);
         bool okay = true; std::size_t at{};
         if (std::string_view(name) == "record") while (at < bytes.size()) {
-            const auto n = ::write(fd, bytes.data() + at, bytes.size() - at);
+            const auto n = metrics::io::write(fd, bytes.data() + at, bytes.size() - at);
             if (n > 0) at += static_cast<std::size_t>(n);
             else if (n < 0 && errno == EINTR) continue;
             else { okay = false; break; }
         }
         okay = sync_fd(fd) && okay;
-        if (::close(fd) != 0 || !okay) throw Error(Status::unresolved);
+        if (metrics::io::close(fd) != 0 || !okay) throw Error(Status::unresolved);
     }
     if (!sync_directory(directory) || !sync_directory(directory.parent_path())) throw Error(Status::unresolved);
 }
@@ -221,6 +222,7 @@ State Store::read_locked() const {
         enrolled.push_back(static_cast<std::byte>(c));
     }
     const auto minimum = decode_state(enrolled);
+    metrics::io::observed_read(enrolled.size());
     if (!enrollment.eof() || !minimum || minimum->proposed ||
         minimum->current.authority != impl_->minimum.authority) throw Error(Status::unresolved);
     const auto path = impl_->directory / "record";
@@ -236,6 +238,7 @@ State Store::read_locked() const {
     input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
     if (!input || input.peek() != std::char_traits<char>::eof()) throw Error(Status::unresolved);
     const auto value = decode_state(bytes);
+    metrics::io::observed_read(bytes.size());
     if (!value || value->current.authority != impl_->minimum.authority ||
         value->current.number < impl_->minimum.number ||
         (value->current.number == impl_->minimum.number && value->current != impl_->minimum) ||
@@ -266,20 +269,20 @@ Status Store::publish_locked(const State& state) {
     auto injected = [&](FaultPoint point) { return impl_->fault && impl_->fault(point); };
     if (injected(FaultPoint::creation)) return Status::unresolved;
     const auto temporary = impl_->directory / "record.tmp";
-    const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    const int fd = metrics::io::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return Status::unresolved;
     bool okay = !injected(FaultPoint::write); std::size_t at{};
     while (okay && at < bytes.size()) {
-        const auto n = ::write(fd, bytes.data() + at, bytes.size() - at);
+        const auto n = metrics::io::write(fd, bytes.data() + at, bytes.size() - at);
         if (n > 0) at += static_cast<std::size_t>(n);
         else if (n < 0 && errno == EINTR) continue;
         else okay = false;
     }
     if (injected(FaultPoint::file_sync)) okay = false;
     if (okay) okay = sync_fd(fd);
-    if (::close(fd) != 0) okay = false;
+    if (metrics::io::close(fd) != 0) okay = false;
     if (!okay || injected(FaultPoint::rename)) return Status::unresolved;
-    std::error_code error; std::filesystem::rename(temporary, impl_->directory / "record", error);
+    std::error_code error; metrics::io::rename(temporary, impl_->directory / "record", error);
     if (error) return Status::unresolved;
     impl_->shared->observed = state.current.number;
     impl_->shared->observed_token = state.current;

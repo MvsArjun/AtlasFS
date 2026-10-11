@@ -1,4 +1,5 @@
 #include "atlasfs/repair.hpp"
+#include "atlasfs/metrics.hpp"
 
 #include "atlasfs/checksum.hpp"
 #include "atlasfs/object_protocol.hpp"
@@ -159,7 +160,7 @@ std::string execution_id(std::string_view plan) {
     output << "execution-" << std::hex << std::setw(8) << std::setfill('0') << checksum;
     return output.str();
 }
-bool sync_fd(int fd) { int result; do { result = ::fsync(fd); } while (result < 0 && errno == EINTR); return result == 0; }
+bool sync_fd(int fd) { int result; do { result = metrics::io::fsync(fd); } while (result < 0 && errno == EINTR); return result == 0; }
 }
 
 PlanningResult RepairPlanner::plan(const metadata::PlacementPlan& placement,
@@ -375,11 +376,14 @@ std::optional<RepairPlan> decode_repair_plan(std::span<const std::byte> encoded)
 
 RepairPlanStore::RepairPlanStore(std::filesystem::path root, RepairFaultInjector fault)
     : directory_(std::move(root) / "coordinator" / "repairs"), fault_(std::move(fault)) {
+    metrics::Timer startup(metrics::Counter::startup_calls, metrics::Counter::startup_ns);
     std::filesystem::create_directories(directory_); std::error_code error;
     for (const auto& entry : std::filesystem::directory_iterator(directory_, error)) {
+        metrics::add(metrics::Counter::startup_entries);
         const auto name = entry.path().filename().string(); if (name.ends_with(".tmp")) continue;
         std::ifstream input(entry.path(), std::ios::binary); std::vector<std::byte> bytes;
         for (char c; input.get(c);) bytes.push_back(static_cast<std::byte>(c));
+        metrics::io::observed_read(bytes.size());
         const auto value = decode_repair_plan(bytes);
         if (!value || value->plan_id != name || !plans_.emplace(name, *value).second)
             throw std::runtime_error("invalid durable repair plan");
@@ -440,22 +444,22 @@ RepairStoreError RepairPlanStore::persist(const RepairPlan& value) {
     if (fault_ && fault_(RepairFaultPoint::record_creation)) return RepairStoreError::filesystem_error;
     const auto bytes = encode_repair_plan(value); const auto temporary = directory_ / (value.plan_id + ".tmp");
     const auto final = directory_ / value.plan_id;
-    int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    int fd = metrics::io::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) return RepairStoreError::filesystem_error;
     bool okay = !(fault_ && fault_(RepairFaultPoint::record_write)); std::size_t offset = 0;
-    while (okay && offset < bytes.size()) { const auto written = ::write(fd, bytes.data() + offset, bytes.size() - offset);
+    while (okay && offset < bytes.size()) { const auto written = metrics::io::write(fd, bytes.data() + offset, bytes.size() - offset);
         if (written > 0) offset += static_cast<std::size_t>(written); else if (written < 0 && errno == EINTR) continue; else okay = false; }
     if (fault_ && fault_(RepairFaultPoint::record_sync)) okay = false;
     if (okay) okay = sync_fd(fd);
-    if (::close(fd) != 0) okay = false;
+    if (metrics::io::close(fd) != 0) okay = false;
     if (!okay) return RepairStoreError::filesystem_error;
     if (fault_ && fault_(RepairFaultPoint::record_rename)) return RepairStoreError::filesystem_error;
-    std::error_code error; std::filesystem::rename(temporary, final, error);
+    std::error_code error; metrics::io::rename(temporary, final, error);
     if (error) return RepairStoreError::filesystem_error;
     if (fault_ && fault_(RepairFaultPoint::directory_sync)) return RepairStoreError::filesystem_error;
-    const int directory = ::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const int directory = metrics::io::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory < 0) return RepairStoreError::filesystem_error;
-    const bool synced = sync_fd(directory); const bool closed = ::close(directory) == 0;
+    const bool synced = sync_fd(directory); const bool closed = metrics::io::close(directory) == 0;
     if (!synced || !closed) return RepairStoreError::filesystem_error;
     plans_[value.plan_id] = value; return RepairStoreError::none;
 }
@@ -742,9 +746,12 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
     // Replay every interrupted execution through the publisher, including when
     // bytes are visible. Presence cannot resolve an unknown durable journal.
     if (existing.error != storage::StoreError::none || recovering) {
-        const auto published = target->second->publish_repair(
+        const auto published = [&] {
+            metrics::Timer publication(metrics::Counter::publication_calls, metrics::Counter::publication_ns);
+            return target->second->publish_repair(
             plan->plan_id, plan->execution_id, plan->target_node, plan->object_id,
             source_chunk.manifest, source_chunk.chunk, source_chunk.data);
+        }();
         if (published.status != replication::RepairPublishStatus::published &&
             published.status != replication::RepairPublishStatus::already_present_valid) {
             plan->state = RepairPlanState::failed;
@@ -792,8 +799,9 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
     }
     plan->transfer_succeeded = true;
     plan->publication_succeeded = true;
-    const auto verified = target->second->get_chunk(
-        plan->object_id, plan->generation_id, plan->chunk_index);
+    std::optional<metrics::Timer> verification;
+    verification.emplace(metrics::Counter::verification_calls, metrics::Counter::verification_ns);
+    const auto verified = target->second->get_chunk(plan->object_id, plan->generation_id, plan->chunk_index);
     if (verified.error != storage::StoreError::none ||
         verified.manifest != expected_manifest || verified.chunk != source_chunk.chunk ||
         verified.data != source_chunk.data ||
@@ -805,13 +813,17 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
         return {RepairExecutionError::verification_failure, plan->state};
     }
     plan->verification_succeeded = true;
+    verification.reset();
     if (plans_.update(*plan) != RepairStoreError::none)
         return {RepairExecutionError::persistence_failure, plan->state};
     if (fault_ && fault_(RepairExecutionFaultPoint::after_publication_persist))
         return {RepairExecutionError::recovery_interrupted, RepairPlanState::executing};
 
-    const auto committed = catalog_.compare_exchange({identity, plan->catalog_version,
-        plan->observed_catalog_replicas, desired_replicas});
+    const auto committed = [&] {
+        metrics::Timer cas(metrics::Counter::cas_calls, metrics::Counter::cas_ns);
+        return catalog_.compare_exchange({identity, plan->catalog_version,
+            plan->observed_catalog_replicas, desired_replicas});
+    }();
     if (committed.status != metadata::ReplicaCatalogCasStatus::committed) {
         if (committed.status == metadata::ReplicaCatalogCasStatus::conflict ||
             committed.status == metadata::ReplicaCatalogCasStatus::no_change ||
@@ -840,6 +852,7 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
         placement_replicas.push_back(replica.node_id);
     plan->metadata_committed = true;
     plan->state = RepairPlanState::completed;
+    metrics::Timer completion(metrics::Counter::completion_calls, metrics::Counter::completion_ns);
     if (plans_.update(*plan) != RepairStoreError::none)
         return {RepairExecutionError::persistence_failure, RepairPlanState::executing};
     return {RepairExecutionError::none, plan->state};

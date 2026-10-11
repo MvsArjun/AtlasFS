@@ -1,6 +1,7 @@
 #pragma once
 
 #include "atlasfs/checksum.hpp"
+#include "atlasfs/metrics.hpp"
 #include "atlasfs/coordinator_operation.hpp"
 #include "atlasfs/remote_storage_node.hpp"
 #include "atlasfs/repair.hpp"
@@ -59,7 +60,10 @@ public:
     Running(std::shared_ptr<replication::StorageNode> node, const std::filesystem::path& journal,
             net::TlsConfig tls, std::shared_ptr<epoch::Store> fence, bool lost = false)
         : server(std::move(node), journal, std::move(tls), 0, false, lost, std::move(fence)),
-          thread([this] { try { server.serve(); } catch (...) { error = std::current_exception(); } }) {}
+          thread([this, observer = metrics::current_owner()] {
+              metrics::Scope scope(observer);
+              try { server.serve(); } catch (...) { error = std::current_exception(); }
+          }) {}
     ~Running() { stop(); }
     void stop() { server.stop(); if (thread.joinable()) thread.join(); }
     void check() { // Call only after stop/join. Lost-response injection intentionally stops serve().

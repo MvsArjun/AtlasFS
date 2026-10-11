@@ -18,6 +18,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(OpenSSL 3.0 REQUIRED)
 
+add_library(atlasfs_metrics src/metrics.cpp)
+target_include_directories(atlasfs_metrics PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_options(atlasfs_metrics PRIVATE -Wall -Wextra -Wpedantic)
+
 add_library(atlasfs_protocol
     src/protocol.cpp
 )
@@ -69,13 +73,13 @@ target_include_directories(atlasfs_net
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(atlasfs_net PUBLIC AtlasFS::protocol OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(atlasfs_net PUBLIC AtlasFS::protocol atlasfs_metrics OpenSSL::SSL OpenSSL::Crypto)
 
 target_include_directories(atlasfs_storage
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(atlasfs_storage PUBLIC AtlasFS::protocol)
+target_link_libraries(atlasfs_storage PUBLIC AtlasFS::protocol atlasfs_metrics)
 
 target_include_directories(atlasfs_metadata
     PUBLIC
@@ -126,11 +130,35 @@ if(ATLASFS_BUILD_BENCHMARKS)
     execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         OUTPUT_VARIABLE ATLASFS_BENCH_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
     file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/src/checksum.cpp" ATLASFS_BENCH_CHECKSUM_HASH)
+    file(GLOB_RECURSE ATLASFS_BENCH_SOURCES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/*.hpp")
+    list(APPEND ATLASFS_BENCH_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt" "${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_test_support.hpp")
+    list(SORT ATLASFS_BENCH_SOURCES)
+    set(ATLASFS_BENCH_HASH_INPUT "")
+    foreach(source IN LISTS ATLASFS_BENCH_SOURCES)
+        file(SHA256 "${source}" source_hash)
+        file(RELATIVE_PATH source_name "${CMAKE_CURRENT_SOURCE_DIR}" "${source}")
+        string(APPEND ATLASFS_BENCH_HASH_INPUT "${source_name}:${source_hash}\n")
+    endforeach()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ATLASFS_BENCH_SOURCES})
+    string(SHA256 ATLASFS_BENCH_SOURCE_HASH "${ATLASFS_BENCH_HASH_INPUT}")
+    execute_process(COMMAND git status --porcelain --untracked-files=no WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE ATLASFS_BENCH_DIRTY OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(ATLASFS_BENCH_DIRTY)
+        set(ATLASFS_BENCH_DIRTY_BOOL "true")
+    else()
+        set(ATLASFS_BENCH_DIRTY_BOOL "false")
+    endif()
     add_executable(atlasfs_bench benchmarks/atlasfs_bench.cpp)
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" ATLASFS_BENCH_BUILD_UPPER)
+    set(ATLASFS_BENCH_ALL_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${ATLASFS_BENCH_BUILD_UPPER}}")
     target_link_libraries(atlasfs_bench PRIVATE AtlasFS::replication Threads::Threads)
     target_compile_definitions(atlasfs_bench PRIVATE
         ATLASFS_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}" ATLASFS_BENCH_COMMIT="${ATLASFS_BENCH_COMMIT}"
-        ATLASFS_BENCH_CHECKSUM_HASH="${ATLASFS_BENCH_CHECKSUM_HASH}")
+        ATLASFS_BENCH_CHECKSUM_HASH="${ATLASFS_BENCH_CHECKSUM_HASH}"
+        ATLASFS_BENCH_SOURCE_HASH="${ATLASFS_BENCH_SOURCE_HASH}" ATLASFS_BENCH_SOURCE_DIRTY=${ATLASFS_BENCH_DIRTY_BOOL}
+        ATLASFS_BENCH_FLAGS="${ATLASFS_BENCH_ALL_FLAGS}")
     target_compile_options(atlasfs_bench PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 if(BUILD_TESTING)
@@ -155,6 +183,9 @@ if(BUILD_TESTING)
     target_link_libraries(atlasfs_epoch_tests PRIVATE AtlasFS::replication GTest::gtest_main Threads::Threads)
     add_executable(atlasfs_stress_tests tests/stress_test.cpp)
     target_link_libraries(atlasfs_stress_tests PRIVATE AtlasFS::replication GTest::gtest_main Threads::Threads)
+    add_executable(atlasfs_metrics_tests tests/metrics_test.cpp)
+    target_link_libraries(atlasfs_metrics_tests PRIVATE AtlasFS::replication GTest::gtest_main Threads::Threads)
+    target_compile_options(atlasfs_metrics_tests PRIVATE -Wall -Wextra -Wpedantic)
     add_executable(atlasfs_tcp_transport_tests tests/tcp_transport_test.cpp)
     target_link_libraries(atlasfs_tcp_transport_tests
         PRIVATE AtlasFS::net GTest::gtest_main Threads::Threads)
@@ -209,6 +240,7 @@ if(BUILD_TESTING)
     gtest_discover_tests(atlasfs_tls_transport_tests)
     gtest_discover_tests(atlasfs_epoch_tests)
     gtest_discover_tests(atlasfs_stress_tests)
+    gtest_discover_tests(atlasfs_metrics_tests)
     gtest_discover_tests(atlasfs_storage_tests)
     gtest_discover_tests(atlasfs_storage_integration_tests)
     gtest_discover_tests(atlasfs_metadata_tests)

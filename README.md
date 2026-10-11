@@ -156,6 +156,17 @@ baselines, limitations, fault coverage, and reproduction instructions.
 
 ## Repository layout
 
+Milestone 21 adds opt-in transport/filesystem instrumentation and warm-up samples:
+use `--warmup 3 --metrics on` (or `--metrics off` to measure collection overhead).
+`--suite startup` characterizes retained object/chunk/journal/catalog reopening.
+On Linux, run `python3 benchmarks/linux_run.py --executable build-bench/atlasfs_bench
+--output-dir build-bench/results --runner-class manual-uncontrolled --profile
+characterize --rounds 3`, then `python3 benchmarks/summarize.py build-bench/results`.
+The manual Linux workflow supports explicitly labeled hosted observations or an
+operator-controlled self-hosted runner; neither ordinary CI nor loopback traffic
+is a production capacity claim. See [Milestone 21](docs/milestone-21.md) for counter
+layers, temporary-space accounting, limitations and reproducible commands.
+
 The GitHub Actions workflow uses Ubuntu 24.04 and GCC 13 with separate normal,
 ASan/UBSan, and TSan jobs, serial CTest, and uploaded diagnostics. A workflow file
 is not evidence that CI or sanitizers passed; inspect the actual run result.

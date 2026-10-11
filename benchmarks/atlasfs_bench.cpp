@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -15,8 +16,13 @@
 namespace {
 using namespace atlasfs;
 using Clock = std::chrono::steady_clock;
+std::string utc_time() {
+    const auto now = std::time(nullptr); std::ostringstream out;
+    out << std::put_time(std::gmtime(&now), "%Y-%m-%dT%H:%M:%SZ"); return out.str();
+}
 struct Config {
-    std::size_t iterations{30}, objects{32}, bytes{65536};
+    std::size_t iterations{30}, objects{32}, bytes{65536}, warmup{3};
+    bool instrumentation{true};
     std::uint32_t chunk{16384}, replicas{2}, nodes{4}, workers{1};
     std::uint64_t seed{42};
     std::string suite{"all"}, output, label;
@@ -41,7 +47,7 @@ Config parse(int argc, char** argv) {
         const std::string key = argv[n];
         if (key == "--help") {
             std::cout << "--iterations N --objects N --bytes N --chunk N --replicas N --nodes N --workers N --seed N\n"
-                         "--suite all|local|distributed|fault --output file.json --label environment-label\n";
+                         "--suite all|local|distributed|fault|startup --warmup N --metrics on|off --output file.json --label environment-label\n";
             std::exit(0);
         }
         if (n + 1 >= argc) throw std::invalid_argument("option requires a value");
@@ -49,11 +55,13 @@ Config parse(int argc, char** argv) {
         if (key == "--output") c.output = value;
         else if (key == "--label") c.label = value;
         else if (key == "--suite") c.suite = value;
+        else if (key == "--metrics") { if (value != "on" && value != "off") throw std::invalid_argument("metrics must be on or off"); c.instrumentation = value == "on"; }
         else if (key == "--seed") c.seed = number(value);
         else {
             const auto v = number(value);
             if (v > 4194304) throw std::invalid_argument("numeric parameter exceeds bound");
             if (key == "--iterations") c.iterations = v;
+            else if (key == "--warmup") c.warmup = v;
             else if (key == "--objects") c.objects = v;
             else if (key == "--bytes") c.bytes = v;
             else if (key == "--chunk") c.chunk = static_cast<std::uint32_t>(v);
@@ -63,10 +71,10 @@ Config parse(int argc, char** argv) {
             else throw std::invalid_argument("unknown option");
         }
     }
-    if (!c.iterations || c.iterations > 10000 || !c.objects || c.objects > 10000 ||
+    if (!c.iterations || c.iterations > 10000 || !c.objects || c.objects > 10000 || c.warmup > 1000 ||
         !c.bytes || !c.chunk || !c.nodes || c.nodes > 16 || !c.replicas || c.replicas > c.nodes ||
         !c.workers || c.workers > 16 || (c.bytes + c.chunk - 1) / c.chunk > storage::kMaxChunkCount ||
-        (c.suite != "all" && c.suite != "local" && c.suite != "distributed" && c.suite != "fault"))
+        (c.suite != "all" && c.suite != "local" && c.suite != "distributed" && c.suite != "fault" && c.suite != "startup"))
         throw std::invalid_argument("unsupported workload bounds");
     return c;
 }
@@ -76,17 +84,32 @@ double cpu_seconds() {
     return static_cast<double>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) +
         static_cast<double>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
 }
+std::map<std::string, std::uint64_t> process_io() {
+    std::map<std::string, std::uint64_t> result;
+#ifdef __linux__
+    // Whole process, including sockets and metric proc reads; not per-object I/O.
+    std::ifstream input("/proc/self/io"); std::string key; std::uint64_t value{};
+    while (input >> key >> value) { if (key.ends_with(':')) key.pop_back(); result.emplace(key, value); }
+#endif
+    return result;
+}
 std::uint64_t disk_bytes(const std::filesystem::path& root, bool temporary = false) {
     std::uint64_t result{};
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
         const auto name = entry.path().filename().string();
         if (!entry.is_regular_file() || entry.path().extension() == ".pem") continue;
-        if (!temporary || name.ends_with(".tmp") || name.starts_with(".atlasfs-tmp-")) result += entry.file_size();
+        if (!temporary || name.ends_with(".tmp") || name.starts_with(".atlasfs-tmp-") || name.starts_with(".repair-") ||
+            entry.path().generic_string().find("/transactions/") != std::string::npos) result += entry.file_size();
     }
     return result;
 }
-struct Outcome { std::uint64_t bytes{}; bool rejected{}, unknown{}, timeout{}; double recovery_ms{-1}; };
+struct Outcome { std::uint64_t bytes{}; bool rejected{}, unknown{}, timeout{}; double recovery_ms{-1}, queue_ms{-1}; };
 struct Metric {
+    metrics::Snapshot counters;
+    std::map<std::string, std::uint64_t> process_io;
+    std::vector<double> queue_latencies;
+    std::uint64_t disk_baseline{};
+    std::size_t retained_objects{}, retained_chunks{}, retained_journals{}, retained_plans{}, retained_catalog_entries{};
     std::string name;
     std::size_t operations{}, errors{}, rejected{}, unknown{}, timeouts{};
     std::uint64_t bytes{}, disk{}, temporary{};
@@ -104,6 +127,8 @@ class Harness {
 public:
     explicit Harness(Config config) : config(std::move(config)) {}
     Config config;
+    const std::string started_utc{utc_time()};
+    std::shared_ptr<metrics::Collector> observer{std::make_shared<metrics::Collector>()};
     std::vector<Metric> results;
     template<class F> void measure(std::string name, std::size_t count, std::size_t bytes,
         std::uint32_t nodes, std::uint32_t replicas, const std::filesystem::path& root, F operation,
@@ -111,19 +136,27 @@ public:
         Metric m; m.name = std::move(name); m.object_bytes = bytes;
         m.chunks = bytes ? static_cast<std::uint32_t>((bytes + config.chunk - 1) / config.chunk) : 0;
         m.nodes = nodes; m.replicas = replicas; m.workers = workers;
+        // Disjoint operation indices preserve exact execution IDs and journal history.
+        for (std::size_t n = 0; n < config.warmup; ++n) operation(n);
+        if (config.instrumentation) observer->begin_files(root);
+        const auto prior = observer->snapshot();
+        const auto io_before = process_io();
+        m.disk_baseline = disk_bytes(root);
         std::mutex metrics_mutex;
         std::atomic_size_t next{0};
         auto work = [&] {
+            metrics::Scope scope(config.instrumentation ? observer : nullptr);
             for (;;) {
                 const auto n = next.fetch_add(1); if (n >= count) break;
                 const auto start = Clock::now(); Outcome outcome; std::string failure;
-                try { outcome = operation(n); }
+                try { outcome = operation(n + config.warmup); }
                 catch (const std::exception& error) { failure = error.what(); }
                 const auto latency = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
                 std::lock_guard lock(metrics_mutex);
                 ++m.operations; m.latencies.push_back(latency); m.bytes += outcome.bytes;
                 m.rejected += outcome.rejected; m.unknown += outcome.unknown; m.timeouts += outcome.timeout;
                 if (outcome.recovery_ms >= 0) m.recovery_latencies.push_back(outcome.recovery_ms);
+                if (outcome.queue_ms >= 0) m.queue_latencies.push_back(outcome.queue_ms);
                 if (!failure.empty()) { ++m.errors; if (m.failure.empty()) m.failure = "iteration=" + std::to_string(n) + " " + failure; }
             }
         };
@@ -133,7 +166,15 @@ public:
             for (auto& thread : threads) thread.join(); }
         m.wall = std::chrono::duration<double>(Clock::now() - start).count();
         const auto end_cpu = cpu_seconds(); m.cpu = cpu < 0 || end_cpu < 0 ? -1 : end_cpu - cpu;
+        m.counters = observer->snapshot();
+        for (std::size_t n = 0; n < metrics::counter_count; ++n) m.counters.values[n] -= prior.values[n];
+        const auto io_after = process_io();
+        if (io_before.size() == 7 && io_after.size() == 7)
+            for (const auto& [key, value] : io_after) if (value >= io_before.at(key)) m.process_io[key] = value - io_before.at(key);
         m.disk = disk_bytes(root); m.temporary = disk_bytes(root, true);
+        if (config.instrumentation && m.counters.accounting_complete &&
+            (m.counters.disk_current != m.disk || m.counters.temporary_current != m.temporary))
+            throw std::runtime_error("accounted file state disagrees with filesystem for " + m.name);
         std::cerr << m.name << ": " << m.operations << " operations, " << m.errors << " unexpected errors\n";
         results.push_back(std::move(m));
     }
@@ -178,7 +219,7 @@ public:
         for (const auto& node : cluster.nodes) bench::require(placement.register_node(bench::member(node.id)) == metadata::CoordinatorError::none, "register");
         auto manager = std::make_unique<replication::ReplicaManager>(cluster.clients());
         std::vector<metadata::PlacementPlan> plans;
-        for (std::size_t n = 0; n < config.objects; ++n) {
+        for (std::size_t n = 0; n < config.objects + config.warmup; ++n) {
             const auto value = bench::manifest(data, config.chunk, "generation-" + std::to_string(n));
             const auto result = placement.place_object({"object-" + std::to_string(n), value});
             bench::require(result.plan.has_value(), "placement"); plans.push_back(*result.plan);
@@ -190,13 +231,19 @@ public:
         });
         std::mutex coordinator_queue;
         measure("replicated_read_serialized_queue", config.iterations, config.bytes, config.nodes, config.replicas, cluster.root(), [&](auto n) {
-            std::lock_guard lock(coordinator_queue);
+            const auto submitted = Clock::now();
+            std::unique_lock lock(coordinator_queue, std::defer_lock);
+            { metrics::Timer queue(metrics::Counter::queue_calls, metrics::Counter::queue_ns); lock.lock(); }
+            const auto queue_ms = std::chrono::duration<double, std::milli>(Clock::now() - submitted).count();
             const auto result = manager->get(plans[(n * 2654435761ULL + config.seed) % plans.size()]);
             bench::require(result.status == replication::ReplicationStatus::success && result.data == data, "replicated read");
-            return Outcome{config.bytes};
+            return Outcome{config.bytes, false, false, false, -1, queue_ms};
         }, config.workers);
         measure("replicated_mixed_serialized_queue", config.iterations, config.bytes, config.nodes, config.replicas, cluster.root(), [&](auto n) {
-            std::lock_guard lock(coordinator_queue);
+            const auto submitted = Clock::now();
+            std::unique_lock lock(coordinator_queue, std::defer_lock);
+            { metrics::Timer queue(metrics::Counter::queue_calls, metrics::Counter::queue_ns); lock.lock(); }
+            const auto queue_ms = std::chrono::duration<double, std::milli>(Clock::now() - submitted).count();
             auto& plan = plans[(n * 2654435761ULL + config.seed) % plans.size()];
             auto guard = cluster.authority->authorize(cluster.token);
             if (n % 4 == 0) {
@@ -209,7 +256,7 @@ public:
                 const auto result = manager->get(plan);
                 bench::require(result.status == replication::ReplicationStatus::success && result.data == data, "mixed replicated read");
             }
-            return Outcome{config.bytes};
+            return Outcome{config.bytes, false, false, false, -1, queue_ms};
         }, config.workers);
         // Close the single active session before measuring new connection setup.
         manager.reset();
@@ -241,7 +288,7 @@ public:
         metadata::CoordinatorOperationStore history(cluster.root());
         const metadata::MembershipSnapshot members{10, {bench::member("a"), bench::member("b", false), bench::member("node-0")}};
         std::vector<std::pair<metadata::PlacementPlan, std::string>> pending;
-        for (std::size_t n = 0; n < config.objects; ++n) {
+        for (std::size_t n = 0; n < config.objects + config.warmup; ++n) {
             auto value = bench::placement("repair-" + std::to_string(n), bench::manifest(data, config.chunk, "repair-gen-" + std::to_string(n)), {"a", "b"});
             replication::ReplicaManager writer({source});
             auto seed = value; seed.replication_factor = 1; seed.chunks[0].replica_node_ids = {"a"};
@@ -288,19 +335,25 @@ public:
             });
     }
     void faults();
+    void startup();
     std::string json() const {
         utsname system{}; ::uname(&system); rusage usage{}; ::getrusage(RUSAGE_SELF, &usage);
         std::ostringstream out; out << std::setprecision(10);
-        out << "{\n\"schema\":1,\"seed\":" << config.seed << ",\"iterations\":" << config.iterations
+        out << "{\n\"schema\":2,\"seed\":" << config.seed << ",\"iterations\":" << config.iterations
+            << ",\"started_utc\":" << quote(started_utc) << ",\"run_id\":" << quote(started_utc + "-" + std::to_string(::getpid()))
             << ",\"objects\":" << config.objects << ",\"bytes\":" << config.bytes << ",\"chunk\":" << config.chunk
             << ",\"nodes\":" << config.nodes << ",\"replicas\":" << config.replicas << ",\"workers\":" << config.workers
             << ",\"suite\":" << quote(config.suite) << ",\"label\":" << quote(config.label)
+            << ",\"warmup_per_workload\":" << config.warmup << ",\"instrumentation\":" << (config.instrumentation ? "true" : "false")
             << ",\"compiler\":" << quote(__VERSION__) << ",\"openssl\":" << quote(OpenSSL_version(OPENSSL_VERSION))
             << ",\"build_type\":" << quote(ATLASFS_BENCH_BUILD_TYPE) << ",\"source_commit\":" << quote(ATLASFS_BENCH_COMMIT)
             << ",\"checksum_source_sha256\":" << quote(ATLASFS_BENCH_CHECKSUM_HASH)
+            << ",\"source_tree_sha256\":" << quote(ATLASFS_BENCH_SOURCE_HASH)
+            << ",\"source_dirty\":" << (ATLASFS_BENCH_SOURCE_DIRTY ? "true" : "false")
+            << ",\"compile_flags\":" << quote(ATLASFS_BENCH_FLAGS)
             << ",\"scratch_parent\":" << quote(std::filesystem::temp_directory_path().string())
             << ",\"os\":" << quote(std::string(system.sysname) + " " + system.release + " " + system.machine)
-            << ",\"network\":\"loopback only; encrypted wire bytes not measured\",\"network_bytes\":null"
+            << ",\"network\":\"loopback; socket bytes include TLS, exclude TCP/IP headers and retransmissions\",\"network_bytes\":null"
             << ",\"peak_rss_bytes\":";
         if (usage.ru_maxrss > 0) out << static_cast<std::uint64_t>(usage.ru_maxrss) * 1024; else out << "null";
         out << ",\"temporary_peak_bytes\":null,\"results\":[\n";
@@ -321,6 +374,38 @@ public:
             out << ",\"process_cpu_percent\":"; if (m.cpu < 0) out << "null"; else out << 100 * m.cpu / m.wall;
             out << ",\"disk_file_bytes\":" << m.disk << ",\"temporary_residual_bytes\":" << m.temporary
                 << ",\"recovery_samples\":" << m.recovery_latencies.size();
+            out << ",\"successes\":" << m.operations - m.errors << ",\"warmup_operations\":" << config.warmup;
+            out << ",\"disk_baseline_bytes\":" << m.disk_baseline << ",\"retained_objects\":" << m.retained_objects
+                << ",\"retained_chunks\":" << m.retained_chunks << ",\"retained_journals\":" << m.retained_journals
+                << ",\"retained_repair_plans\":" << m.retained_plans << ",\"retained_catalog_entries\":" << m.retained_catalog_entries;
+            out << ",\"io_counters\":";
+            if (!config.instrumentation) out << "null";
+            else {
+                out << '{';
+                for (std::size_t n = 0; n < metrics::counter_count; ++n) {
+                    if (n) out << ',';
+                    out << quote(metrics::name(static_cast<metrics::Counter>(n))) << ':' << m.counters.values[n];
+                }
+                out << ",\"saturated\":" << (m.counters.saturated ? "true" : "false")
+                    << ",\"accounting_complete\":" << (m.counters.accounting_complete ? "true" : "false") << '}';
+            }
+            out << ",\"temporary_peak_bytes\":";
+            if (!config.instrumentation || !m.counters.accounting_complete) out << "null"; else out << m.counters.temporary_peak;
+            out << ",\"additional_disk_peak_bytes\":";
+            if (!config.instrumentation || !m.counters.accounting_complete) out << "null"; else out << m.counters.disk_peak - m.counters.disk_baseline;
+            out << ",\"process_io\":";
+            if (m.process_io.empty()) out << "null";
+            else { out << '{'; bool initial = true; for (const auto& [key, value] : m.process_io) {
+                if (!initial) out << ',';
+                initial = false; out << quote(key) << ':' << value;
+            } out << '}'; }
+            out << ",\"queue_samples\":" << m.queue_latencies.size();
+            for (const auto p : {50, 95, 99}) {
+                out << ",\"queue_p" << p << "_ms\":";
+                if (m.queue_latencies.empty()) out << "null";
+                else { auto values = m.queue_latencies; std::sort(values.begin(), values.end());
+                    out << values[static_cast<std::size_t>(std::ceil(static_cast<double>(p) / 100 * values.size())) - 1]; }
+            }
             for (const auto p : {50, 95, 99}) {
                 out << ",\"recovery_p" << p << "_ms\":";
                 if (m.recovery_latencies.empty()) out << "null";
@@ -343,6 +428,53 @@ public:
     std::shared_ptr<replication::RemoteStorageNodeClient> client;
     bool blocked{};
 };
+void Harness::startup() {
+    bench::require(config.objects * ((config.bytes + config.chunk - 1) / config.chunk) <= 65536,
+                   "startup retained chunk/plan count exceeds accounting bound");
+    bench::Cluster cluster(1, config.chunk);
+    auto source = std::make_shared<replication::LocalStorageNode>("a", cluster.root() / "retained",
+        object_protocol::kMaxObjectDataSize, config.chunk);
+    const auto data = bench::payload(config.bytes, config.seed);
+    metadata::DurableReplicaCatalog catalog(cluster.root(), cluster.authority, cluster.token);
+    repair::RepairPlanStore plans(cluster.root());
+    metadata::CoordinatorOperationStore journals(cluster.root());
+    const metadata::MembershipSnapshot members{10, {bench::member("a"), bench::member("b", false), bench::member("node-0")}};
+    std::size_t plan_count = 0;
+    for (std::size_t n = 0; n < config.objects; ++n) {
+        const auto value = bench::placement("retained-" + std::to_string(n),
+            bench::manifest(data, config.chunk, "retained-gen-" + std::to_string(n)), {"a", "b"});
+        auto seed = value; seed.replication_factor = 1;
+        for (auto& chunk : seed.chunks) chunk.replica_node_ids = {"a"};
+        replication::ReplicaManager writer({source});
+        bench::require(writer.put(seed, data).status == replication::ReplicationStatus::success, "startup seed");
+        bench::seed_catalog(catalog, value);
+        bench::require(journals.create(metadata::make_coordinator_operation(value, "retained-operation-" + std::to_string(n), 7)) ==
+                       metadata::CoordinatorRecordError::none, "startup journal seed");
+        const auto planned = repair::RepairPlanner{}.plan(value, members, catalog.snapshot());
+        for (const auto& plan : planned.plans) {
+            bench::require(plans.create(plan) == repair::RepairStoreError::none, "startup repair seed"); ++plan_count;
+        }
+    }
+    auto describe = [&] {
+        auto& row = results.back(); row.retained_objects = config.objects;
+        row.retained_chunks = config.objects * ((config.bytes + config.chunk - 1) / config.chunk);
+        row.retained_journals = config.objects; row.retained_plans = plan_count;
+        row.retained_catalog_entries = catalog.list().size();
+    };
+    measure("retained_storage_reopen", config.iterations, config.bytes, 1, 1, cluster.root(), [&](auto) {
+        replication::LocalStorageNode reopened("a", cluster.root() / "retained", object_protocol::kMaxObjectDataSize, config.chunk);
+        bench::require(reopened.get_chunk("retained-0", "retained-gen-0", 0).error == storage::StoreError::none, "startup retained checksum");
+        return Outcome{std::min<std::size_t>(config.bytes, config.chunk)};
+    }); describe();
+    measure("retained_coordinator_reopen", config.iterations, 0, 0, 0, cluster.root(), [&](auto) {
+        metadata::DurableReplicaCatalog reopened_catalog(cluster.root(), cluster.authority, cluster.token);
+        repair::RepairPlanStore reopened_plans(cluster.root());
+        metadata::CoordinatorOperationStore reopened_journals(cluster.root());
+        bench::require(reopened_catalog.list().size() == catalog.list().size() && reopened_plans.list().size() == plan_count &&
+            reopened_journals.list().size() == config.objects, "startup retained state count");
+        return Outcome{};
+    }); describe();
+}
 void Harness::faults() {
     repair(false, repair::RepairExecutionFaultPoint::after_executing_persist);
     for (auto point : {repair::RepairExecutionFaultPoint::after_executing_persist,
@@ -422,9 +554,11 @@ void Harness::faults() {
 int main(int argc, char** argv) {
     try {
         Harness harness(parse(argc, argv));
+        metrics::Scope observation(harness.config.instrumentation ? harness.observer : nullptr);
         if (harness.config.suite == "all" || harness.config.suite == "local") harness.local();
         if (harness.config.suite == "all" || harness.config.suite == "distributed") harness.distributed();
         if (harness.config.suite == "all" || harness.config.suite == "fault") harness.faults();
+        if (harness.config.suite == "all" || harness.config.suite == "startup") harness.startup();
         const auto json = harness.json();
         if (harness.config.output.empty()) std::cout << json;
         else { std::ofstream output(harness.config.output); output << json; output.close();

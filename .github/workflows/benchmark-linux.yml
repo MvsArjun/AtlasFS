@@ -1,0 +1,53 @@
+name: AtlasFS Linux characterization
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Hosted observations or operator-controlled exclusive Linux runner
+        type: choice
+        options: [hosted, controlled]
+        default: hosted
+      profile:
+        description: Short correctness smoke or repeated characterization
+        type: choice
+        options: [smoke, characterize]
+        default: smoke
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ${{ inputs.runner == 'controlled' && fromJSON('["self-hosted", "linux", "atlasfs-benchmark"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    concurrency:
+      group: atlasfs-benchmark-${{ inputs.runner }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install hosted dependencies
+        if: inputs.runner == 'hosted'
+        run: sudo apt-get update && sudo apt-get install -y g++-13 cmake ninja-build libssl-dev openssl python3
+      - name: Release build
+        run: |
+          cmake -S . -B build-benchmark -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DATLASFS_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER=g++-13
+          cmake --build build-benchmark --parallel 4
+      - name: Repeated benchmark rounds (no timing gates)
+        env:
+          CXX: g++-13
+          RUNNER_CLASS: ${{ inputs.runner == 'controlled' && 'controlled' || 'shared' }}
+          PROFILE: ${{ inputs.profile }}
+        run: python3 benchmarks/linux_run.py --executable build-benchmark/atlasfs_bench --output-dir build-benchmark/results --runner-class "$RUNNER_CLASS" --profile "$PROFILE" --rounds 3
+      - name: Instrumentation overhead comparisons
+        if: inputs.profile == 'characterize'
+        run: |
+          for round in 1 2 3; do
+            python3 benchmarks/compare.py --allow-instrumentation-change build-benchmark/results/local-off-$round.json build-benchmark/results/local-on-$round.json > build-benchmark/results/overhead-$round.csv
+          done
+      - name: Summary report
+        run: python3 benchmarks/summarize.py build-benchmark/results
+      - name: Upload traceable results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-benchmark-${{ inputs.runner }}-${{ inputs.profile }}
+          path: build-benchmark/results/
+          if-no-files-found: error

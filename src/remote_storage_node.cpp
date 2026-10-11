@@ -1,4 +1,5 @@
 #include "atlasfs/remote_storage_node.hpp"
+#include "atlasfs/metrics.hpp"
 
 #include "atlasfs/checksum.hpp"
 #include "atlasfs/epoch_protocol.hpp"
@@ -394,8 +395,10 @@ protocol::Message StorageNodeServer::handle_authenticated(const protocol::Messag
 }
 
 void StorageNodeServer::load_records() {
+    metrics::Timer startup(metrics::Counter::startup_calls, metrics::Counter::startup_ns);
     std::error_code error;
     for (const auto& entry : std::filesystem::directory_iterator(operations_directory_, error)) {
+        metrics::add(metrics::Counter::startup_entries);
         if (entry.path().extension() == ".tmp") continue;
         std::ifstream input(entry.path()); unsigned state{}; Record record{};
         if (input >> state >> record.fingerprint >> record.probe_chunk >>
@@ -409,6 +412,7 @@ void StorageNodeServer::load_records() {
                 throw std::runtime_error("invalid durable fenced operation record");
             record.state = static_cast<snp::OperationState>(state);
             if (!read_epoch(input, record.epoch)) throw std::runtime_error("invalid operation epoch binding");
+            metrics::io::observed_record_read(entry.path());
             if (!fence_ && record.state == snp::OperationState::prepared) {
                 const auto visible = node_->get_chunk(record.object_id,
                                                        record.generation_id,
@@ -424,8 +428,10 @@ void StorageNodeServer::load_records() {
 }
 
 void StorageNodeServer::load_repair_records() {
+    metrics::Timer startup(metrics::Counter::startup_calls, metrics::Counter::startup_ns);
     std::error_code error;
     for (const auto& entry : std::filesystem::directory_iterator(repairs_directory_, error)) {
+        metrics::add(metrics::Counter::startup_entries);
         if (entry.path().extension() == ".tmp") continue;
         std::ifstream input(entry.path());
         unsigned status{};
@@ -445,6 +451,7 @@ void StorageNodeServer::load_repair_records() {
             throw std::runtime_error("invalid durable repair publication record");
         }
         record.status = static_cast<snp::RepairResponseStatus>(status);
+        metrics::io::observed_record_read(entry.path());
         if (!repair_records_.emplace(execution_id, std::move(record)).second)
             throw std::runtime_error("duplicate durable repair publication record");
     }
@@ -461,22 +468,23 @@ bool StorageNodeServer::persist(std::string_view operation_id, const Record& rec
     write_epoch(output, record.epoch);
     output.flush();
     if (!output) return false;
+    if (metrics::current()) metrics::io::observed_write(temporary, static_cast<std::uint64_t>(output.tellp()));
     output.close();
-    const int file = ::open(temporary.c_str(), O_RDWR | O_CLOEXEC);
-    if (file < 0 || ::fdatasync(file) != 0) {
-        if (file >= 0) ::close(file);
+    const int file = metrics::io::open(temporary.c_str(), O_RDWR | O_CLOEXEC);
+    if (file < 0 || metrics::io::fdatasync(file) != 0) {
+        if (file >= 0) metrics::io::close(file);
         return false;
     }
-    if (::close(file) != 0) return false;
-    std::error_code error; std::filesystem::rename(temporary, final, error);
+    if (metrics::io::close(file) != 0) return false;
+    std::error_code error; metrics::io::rename(temporary, final, error);
     if (error) return false;
-    const int directory = ::open(operations_directory_.c_str(),
+    const int directory = metrics::io::open(operations_directory_.c_str(),
                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (directory < 0 || ::fsync(directory) != 0) {
-        if (directory >= 0) ::close(directory);
+    if (directory < 0 || metrics::io::fsync(directory) != 0) {
+        if (directory >= 0) metrics::io::close(directory);
         return false;
     }
-    return ::close(directory) == 0;
+    return metrics::io::close(directory) == 0;
 }
 
 bool StorageNodeServer::persist_repair(
@@ -490,23 +498,24 @@ bool StorageNodeServer::persist_repair(
     write_epoch(output, record.epoch);
     output.flush();
     if (!output) return false;
+    if (metrics::current()) metrics::io::observed_write(temporary, static_cast<std::uint64_t>(output.tellp()));
     output.close();
-    const int file = ::open(temporary.c_str(), O_RDWR | O_CLOEXEC);
-    if (file < 0 || ::fdatasync(file) != 0) {
-        if (file >= 0) ::close(file);
+    const int file = metrics::io::open(temporary.c_str(), O_RDWR | O_CLOEXEC);
+    if (file < 0 || metrics::io::fdatasync(file) != 0) {
+        if (file >= 0) metrics::io::close(file);
         return false;
     }
-    if (::close(file) != 0) return false;
+    if (metrics::io::close(file) != 0) return false;
     std::error_code error;
-    std::filesystem::rename(temporary, final, error);
+    metrics::io::rename(temporary, final, error);
     if (error) return false;
-    const int directory = ::open(repairs_directory_.c_str(),
+    const int directory = metrics::io::open(repairs_directory_.c_str(),
                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (directory < 0 || ::fsync(directory) != 0) {
-        if (directory >= 0) ::close(directory);
+    if (directory < 0 || metrics::io::fsync(directory) != 0) {
+        if (directory >= 0) metrics::io::close(directory);
         return false;
     }
-    return ::close(directory) == 0;
+    return metrics::io::close(directory) == 0;
 }
 
 protocol::Message StorageNodeServer::handle(const protocol::Message& request,

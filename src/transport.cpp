@@ -1,4 +1,5 @@
 #include "atlasfs/transport.hpp"
+#include "atlasfs/metrics.hpp"
 
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -23,8 +24,10 @@ bool valid_id(std::string_view id) {
         });
 }
 void check_deadline(Deadline deadline) {
-    if (std::chrono::steady_clock::now() >= deadline)
+    if (std::chrono::steady_clock::now() >= deadline) {
+        metrics::add(metrics::Counter::deadlines);
         throw TransportError("transport deadline exceeded");
+    }
 }
 std::string uri_identity(X509* certificate) {
     if (!certificate) throw TransportError("peer certificate required");
@@ -54,9 +57,17 @@ public:
         for (;;) {
             check_deadline(deadline);
             const auto n = ::recv(descriptor_, buffer.data(), buffer.size(), 0);
-            if (n >= 0) return static_cast<std::size_t>(n);
+            metrics::add(metrics::Counter::socket_read_calls);
+            metrics::add(metrics::Counter::stream_read_calls);
+            if (n >= 0) {
+                metrics::add(metrics::Counter::socket_received, n);
+                metrics::add(metrics::Counter::framed_received, n);
+                if (n > 0 && static_cast<std::size_t>(n) < buffer.size()) metrics::add(metrics::Counter::socket_partial_reads);
+                return static_cast<std::size_t>(n);
+            }
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) { wait_socket(descriptor_, false, deadline); continue; }
+            metrics::add(metrics::Counter::socket_errors);
             throw TransportError("transport read failed");
         }
     }
@@ -64,9 +75,16 @@ public:
         while (!bytes.empty()) {
             check_deadline(deadline);
             const auto n = ::send(descriptor_, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+            metrics::add(metrics::Counter::socket_write_calls);
+            metrics::add(metrics::Counter::stream_write_calls);
+            if (n > 0) {
+                metrics::add(metrics::Counter::socket_sent, n);
+                if (static_cast<std::size_t>(n) < bytes.size()) metrics::add(metrics::Counter::socket_partial_writes);
+            }
             if (n > 0) { bytes = bytes.subspan(static_cast<std::size_t>(n)); continue; }
             if (n < 0 && errno == EINTR) continue;
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { wait_socket(descriptor_, true, deadline); continue; }
+            metrics::add(metrics::Counter::socket_errors);
             throw TransportError("transport write failed");
         }
     }
@@ -86,6 +104,11 @@ struct BioMethod {
             BIO_clear_retry_flags(bio);
             const auto fd = static_cast<int>(reinterpret_cast<std::intptr_t>(BIO_get_data(bio)));
             const auto n = ::recv(fd, bytes, static_cast<std::size_t>(size), 0);
+            metrics::add(metrics::Counter::socket_read_calls);
+            if (n > 0) {
+                metrics::add(metrics::Counter::socket_received, n);
+                if (n < size) metrics::add(metrics::Counter::socket_partial_reads);
+            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) metrics::add(metrics::Counter::socket_errors);
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) BIO_set_retry_read(bio);
             return static_cast<int>(n);
         });
@@ -93,6 +116,11 @@ struct BioMethod {
             BIO_clear_retry_flags(bio);
             const auto fd = static_cast<int>(reinterpret_cast<std::intptr_t>(BIO_get_data(bio)));
             const auto n = ::send(fd, bytes, static_cast<std::size_t>(size), MSG_NOSIGNAL);
+            metrics::add(metrics::Counter::socket_write_calls);
+            if (n > 0) {
+                metrics::add(metrics::Counter::socket_sent, n);
+                if (n < size) metrics::add(metrics::Counter::socket_partial_writes);
+            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) metrics::add(metrics::Counter::socket_errors);
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) BIO_set_retry_write(bio);
             return static_cast<int>(n);
         });
@@ -116,6 +144,7 @@ public:
         SSL_set_bio(ssl_.get(), bio, bio);
         if (expected) SSL_set_connect_state(ssl_.get());
         else SSL_set_accept_state(ssl_.get());
+        metrics::Timer handshake(metrics::Counter::tls_handshakes, metrics::Counter::tls_handshake_ns);
         const auto deadline = std::chrono::steady_clock::now() + config.timeout;
         for (;;) {
             check_deadline(deadline);
@@ -141,7 +170,12 @@ public:
             ERR_clear_error();
             std::size_t n{};
             const int result = SSL_read_ex(ssl_.get(), buffer.data(), buffer.size(), &n);
-            if (result == 1) return n;
+            metrics::add(metrics::Counter::stream_read_calls);
+            if (result == 1) {
+                metrics::add(metrics::Counter::tls_received, n);
+                metrics::add(metrics::Counter::framed_received, n);
+                return n;
+            }
             const int error = SSL_get_error(ssl_.get(), result);
             if (error == SSL_ERROR_ZERO_RETURN) return 0;
             retry_error(error, deadline);
@@ -153,6 +187,8 @@ public:
             ERR_clear_error();
             std::size_t n{};
             const int result = SSL_write_ex(ssl_.get(), bytes.data(), bytes.size(), &n);
+            metrics::add(metrics::Counter::stream_write_calls);
+            if (result == 1) metrics::add(metrics::Counter::tls_sent, n);
             if (result == 1) { bytes = bytes.subspan(n); continue; }
             retry(result, deadline);
         }
@@ -163,6 +199,7 @@ private:
         if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
             wait_socket(descriptor_, error == SSL_ERROR_WANT_WRITE, deadline); return;
         }
+        metrics::add(metrics::Counter::connection_failures);
         throw TransportError("TLS handshake or I/O failed");
     }
     int descriptor_;
@@ -210,7 +247,7 @@ void wait_socket(int descriptor, bool writing, Deadline deadline) {
         const int result = ::poll(&value, 1, static_cast<int>(std::clamp<std::int64_t>(remaining, 1, INT_MAX)));
         if (result > 0) return; // EOF/error readiness is handled by the next I/O call.
         if (result < 0 && errno == EINTR) continue;
-        if (result == 0) throw TransportError("transport deadline exceeded");
+        if (result == 0) { metrics::add(metrics::Counter::deadlines); throw TransportError("transport deadline exceeded"); }
         throw TransportError("socket wait failed");
     }
 }

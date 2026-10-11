@@ -1,4 +1,5 @@
 #include "atlasfs/object_store.hpp"
+#include "atlasfs/metrics.hpp"
 #include "atlasfs/checksum.hpp"
 #include "atlasfs/manifest.hpp"
 
@@ -31,8 +32,8 @@ public:
     [[nodiscard]] int get() const noexcept { return descriptor_; }
     [[nodiscard]] bool valid() const noexcept { return descriptor_ >= 0; }
     int release() noexcept { const int value = descriptor_; descriptor_ = -1; return value; }
-    int close_now() noexcept { const int value = release(); return value < 0 ? 0 : ::close(value); }
-    void reset() noexcept { const int value = release(); if (value >= 0) { ::close(value); } }
+    int close_now() noexcept { const int value = release(); return value < 0 ? 0 : metrics::io::close(value); }
+    void reset() noexcept { const int value = release(); if (value >= 0) { metrics::io::close(value); } }
 private:
     int descriptor_;
 };
@@ -40,7 +41,7 @@ private:
 class RemoveOnFailure {
 public:
     explicit RemoveOnFailure(std::filesystem::path path) : path_(std::move(path)) {}
-    ~RemoveOnFailure() { if (active_) { std::error_code ignored; std::filesystem::remove_all(path_, ignored); } }
+    ~RemoveOnFailure() { if (active_) { std::error_code ignored; metrics::io::remove_all(path_, ignored); } }
     RemoveOnFailure(const RemoveOnFailure&) = delete;
     RemoveOnFailure& operator=(const RemoveOnFailure&) = delete;
     void release() noexcept { active_ = false; }
@@ -52,7 +53,7 @@ private:
 bool write_all(int fd, std::span<const std::byte> data) noexcept {
     std::size_t offset = 0;
     while (offset < data.size()) {
-        const auto result = ::write(fd, data.data() + offset, data.size() - offset);
+        const auto result = metrics::io::write(fd, data.data() + offset, data.size() - offset);
         if (result > 0) { offset += static_cast<std::size_t>(result); }
         else if (result < 0 && errno == EINTR) { continue; }
         else { return false; }
@@ -63,7 +64,7 @@ bool write_all(int fd, std::span<const std::byte> data) noexcept {
 bool read_all(int fd, std::span<std::byte> data) noexcept {
     std::size_t offset = 0;
     while (offset < data.size()) {
-        const auto result = ::read(fd, data.data() + offset, data.size() - offset);
+        const auto result = metrics::io::read(fd, data.data() + offset, data.size() - offset);
         if (result > 0) { offset += static_cast<std::size_t>(result); }
         else if (result < 0 && errno == EINTR) { continue; }
         else { return false; }
@@ -74,13 +75,13 @@ bool read_all(int fd, std::span<std::byte> data) noexcept {
 bool at_eof(int fd) noexcept {
     std::byte extra{};
     ssize_t result;
-    do { result = ::read(fd, &extra, 1); } while (result < 0 && errno == EINTR);
+    do { result = metrics::io::read(fd, &extra, 1); } while (result < 0 && errno == EINTR);
     return result == 0;
 }
 
 bool sync_file(int fd) noexcept {
     int result;
-    do { result = ::fdatasync(fd); } while (result < 0 && errno == EINTR);
+    do { result = metrics::io::fdatasync(fd); } while (result < 0 && errno == EINTR);
     return result == 0;
 }
 
@@ -92,7 +93,7 @@ std::string chunk_filename(std::uint32_t index) {
 
 std::optional<std::vector<std::byte>> read_regular_file(const std::filesystem::path& path,
                                                         std::size_t maximum_size) {
-    FileDescriptor file(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    FileDescriptor file(metrics::io::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
     if (!file.valid()) { return std::nullopt; }
     struct stat metadata {};
     if (::fstat(file.get(), &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
@@ -106,7 +107,7 @@ std::optional<std::vector<std::byte>> read_regular_file(const std::filesystem::p
 
 bool write_synced_file(const std::filesystem::path& path, std::span<const std::byte> data,
                        bool fail_write, bool fail_sync) {
-    FileDescriptor file(::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+    FileDescriptor file(metrics::io::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
     return file.valid() && !fail_write && write_all(file.get(), data) && !fail_sync &&
            sync_file(file.get()) && file.close_now() == 0;
 }
@@ -195,7 +196,7 @@ StoreError ObjectStore::put(std::string_view object_id, std::span<const std::byt
     }
 
     const auto generation_path = chunks_directory_ / generation_id;
-    std::filesystem::rename(transaction_path, generation_path, error);
+    metrics::io::rename(transaction_path, generation_path, error);
     if (error) { return StoreError::filesystem_error; }
     transaction_cleanup.release();
     RemoveOnFailure generation_cleanup(generation_path);
@@ -207,13 +208,13 @@ StoreError ObjectStore::put(std::string_view object_id, std::span<const std::byt
         should_fail(PutFaultPoint::commit_rename)) {
         return StoreError::filesystem_error;
     }
-    std::filesystem::rename(manifest_temporary, object_path(object_id), error);
+    metrics::io::rename(manifest_temporary, object_path(object_id), error);
     if (error) { return StoreError::filesystem_error; }
     manifest_cleanup.release();
     generation_cleanup.release();
     if (sync_directory(objects_directory_) != StoreError::none) { return StoreError::filesystem_error; }
     if (previous_manifest && previous_manifest->generation_id != generation_id) {
-        std::filesystem::remove_all(chunks_directory_ / previous_manifest->generation_id, error);
+        metrics::io::remove_all(chunks_directory_ / previous_manifest->generation_id, error);
     }
     return StoreError::none;
 }
@@ -279,11 +280,11 @@ StoreError ObjectStore::prepare_replica(
         should_fail(PutFaultPoint::generation_rename)) {
         return StoreError::filesystem_error;
     }
-    std::filesystem::rename(transaction_path, generation_path, error);
+    metrics::io::rename(transaction_path, generation_path, error);
     if (error) { return StoreError::filesystem_error; }
     transaction_cleanup.release();
     if (sync_directory(chunks_directory_) != StoreError::none) {
-        std::filesystem::remove_all(generation_path, error);
+        metrics::io::remove_all(generation_path, error);
         return StoreError::filesystem_error;
     }
     std::optional<std::vector<std::byte>> previous;
@@ -302,14 +303,14 @@ StoreError ObjectStore::commit_replica(std::string_view object_id,
     if (pending->second.committed) { return StoreError::none; }
     const auto temporary = objects_directory_ / (".atlasfs-tmp-" + std::string(generation_id));
     std::error_code error;
-    std::filesystem::remove(temporary, error);
+    metrics::io::remove(temporary, error);
     error.clear();
     RemoveOnFailure cleanup(temporary);
     if (!write_synced_file(temporary, pending->second.manifest, false, false) ||
         should_fail(PutFaultPoint::commit_rename)) {
         return StoreError::filesystem_error;
     }
-    std::filesystem::rename(temporary, object_path(object_id), error);
+    metrics::io::rename(temporary, object_path(object_id), error);
     if (error) { return StoreError::filesystem_error; }
     cleanup.release();
     pending->second.committed = true;
@@ -360,23 +361,23 @@ StoreError ObjectStore::abort_replica(std::string_view object_id,
         if (pending->second.previous_manifest) {
             const auto temporary = objects_directory_ /
                 (".atlasfs-tmp-rollback-" + std::string(generation_id));
-            std::filesystem::remove(temporary, error);
+            metrics::io::remove(temporary, error);
             error.clear();
             RemoveOnFailure cleanup(temporary);
             if (!write_synced_file(temporary, *pending->second.previous_manifest, false, false)) {
                 return StoreError::filesystem_error;
             }
-            std::filesystem::rename(temporary, object_path(object_id), error);
+            metrics::io::rename(temporary, object_path(object_id), error);
             if (error) { return StoreError::filesystem_error; }
             cleanup.release();
-        } else if (::unlink(object_path(object_id).c_str()) != 0 && errno != ENOENT) {
+        } else if (metrics::io::unlink(object_path(object_id).c_str()) != 0 && errno != ENOENT) {
             return StoreError::filesystem_error;
         }
         if (sync_directory(objects_directory_) != StoreError::none) {
             return StoreError::filesystem_error;
         }
     }
-    std::filesystem::remove_all(chunks_directory_ / std::string(generation_id), error);
+    metrics::io::remove_all(chunks_directory_ / std::string(generation_id), error);
     if (error || sync_directory(chunks_directory_) != StoreError::none) {
         return StoreError::filesystem_error;
     }
@@ -394,7 +395,7 @@ StoreError ObjectStore::finalize_replica(std::string_view object_id,
         const auto previous = decode_manifest(*pending->second.previous_manifest, max_object_size_);
         if (previous && previous->generation_id != generation_id) {
             std::error_code error;
-            std::filesystem::remove_all(chunks_directory_ / previous->generation_id, error);
+            metrics::io::remove_all(chunks_directory_ / previous->generation_id, error);
             if (error || sync_directory(chunks_directory_) != StoreError::none) {
                 return StoreError::filesystem_error;
             }
@@ -505,22 +506,22 @@ StoreError ObjectStore::publish_repair_chunk(
     } else {
         if (std::filesystem::exists(generation_manifest)) return StoreError::corrupt_object;
         const auto temporary = generation / ".repair-manifest.tmp";
-        std::filesystem::remove(temporary, error); error.clear();
+        metrics::io::remove(temporary, error); error.clear();
         if (!write_synced_file(temporary, encoded, should_fail(PutFaultPoint::manifest_write),
                                should_fail(PutFaultPoint::manifest_sync))) {
-            std::filesystem::remove(temporary, error);
+            metrics::io::remove(temporary, error);
             return StoreError::filesystem_error;
         }
         const auto verified = read_regular_file(temporary, kMaximumManifestSize);
         if (!verified || *verified != encoded) {
-            std::filesystem::remove(temporary, error);
+            metrics::io::remove(temporary, error);
             return StoreError::corrupt_object;
         }
         if (should_fail(PutFaultPoint::generation_rename)) {
-            std::filesystem::remove(temporary, error);
+            metrics::io::remove(temporary, error);
             return StoreError::filesystem_error;
         }
-        std::filesystem::rename(temporary, generation_manifest, error);
+        metrics::io::rename(temporary, generation_manifest, error);
         if (error) return StoreError::filesystem_error;
         if (sync_directory(generation) != StoreError::none)
             return StoreError::result_unknown;
@@ -532,23 +533,23 @@ StoreError ObjectStore::publish_repair_chunk(
     } else {
         if (std::filesystem::exists(final_chunk)) return StoreError::corrupt_object;
         const auto temporary_chunk = generation / (".repair-" + chunk_filename(chunk.index) + ".tmp");
-        std::filesystem::remove(temporary_chunk, error); error.clear();
+        metrics::io::remove(temporary_chunk, error); error.clear();
         if (!write_synced_file(temporary_chunk, data, should_fail(PutFaultPoint::chunk_write),
                                should_fail(PutFaultPoint::chunk_sync))) {
-            std::filesystem::remove(temporary_chunk, error);
+            metrics::io::remove(temporary_chunk, error);
             return StoreError::filesystem_error;
         }
         const auto verified = read_regular_file(temporary_chunk, chunk.length);
         if (!verified || verified->size() != chunk.length ||
             integrity::crc32c(*verified) != chunk.checksum) {
-            std::filesystem::remove(temporary_chunk, error);
+            metrics::io::remove(temporary_chunk, error);
             return StoreError::corrupt_object;
         }
         if (should_fail(PutFaultPoint::generation_rename)) {
-            std::filesystem::remove(temporary_chunk, error);
+            metrics::io::remove(temporary_chunk, error);
             return StoreError::filesystem_error;
         }
-        std::filesystem::rename(temporary_chunk, final_chunk, error);
+        metrics::io::rename(temporary_chunk, final_chunk, error);
         if (error) return StoreError::filesystem_error;
         if (sync_directory(generation) != StoreError::none)
             return StoreError::result_unknown;
@@ -557,19 +558,19 @@ StoreError ObjectStore::publish_repair_chunk(
     if (!committed) {
         const auto temporary_manifest = objects_directory_ /
             (".repair-" + std::string(object_id) + ".tmp");
-        std::filesystem::remove(temporary_manifest, error); error.clear();
+        metrics::io::remove(temporary_manifest, error); error.clear();
         if (!write_synced_file(temporary_manifest, encoded,
                 should_fail(PutFaultPoint::manifest_write),
                 should_fail(PutFaultPoint::manifest_sync))) {
-            std::filesystem::remove(temporary_manifest, error);
+            metrics::io::remove(temporary_manifest, error);
             return StoreError::filesystem_error;
         }
         const auto verified = read_regular_file(temporary_manifest, kMaximumManifestSize);
         if (!verified || *verified != encoded || should_fail(PutFaultPoint::commit_rename)) {
-            std::filesystem::remove(temporary_manifest, error);
+            metrics::io::remove(temporary_manifest, error);
             return StoreError::filesystem_error;
         }
-        std::filesystem::rename(temporary_manifest, object_path(object_id), error);
+        metrics::io::rename(temporary_manifest, object_path(object_id), error);
         if (error) return StoreError::filesystem_error;
         if (sync_directory(objects_directory_) != StoreError::none)
             return StoreError::result_unknown;
@@ -586,12 +587,12 @@ StoreError ObjectStore::remove(std::string_view object_id) {
     }
     const auto manifest = decode_manifest(*manifest_bytes, max_object_size_);
     if (!manifest) { return StoreError::corrupt_object; }
-    if (::unlink(object_path(object_id).c_str()) != 0) {
+    if (metrics::io::unlink(object_path(object_id).c_str()) != 0) {
         return errno == ENOENT ? StoreError::not_found : StoreError::filesystem_error;
     }
     if (sync_directory(objects_directory_) != StoreError::none) { return StoreError::filesystem_error; }
     std::error_code error;
-    std::filesystem::remove_all(chunks_directory_ / manifest->generation_id, error);
+    metrics::io::remove_all(chunks_directory_ / manifest->generation_id, error);
     if (error || sync_directory(chunks_directory_) != StoreError::none) {
         return StoreError::filesystem_error;
     }
@@ -632,20 +633,21 @@ std::filesystem::path ObjectStore::next_temporary_path() {
 
 StoreError ObjectStore::sync_directory(const std::filesystem::path& path) const noexcept {
     if (should_fail(PutFaultPoint::directory_sync)) return StoreError::filesystem_error;
-    FileDescriptor directory(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    FileDescriptor directory(metrics::io::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     if (!directory.valid()) { return StoreError::filesystem_error; }
     int result;
-    do { result = ::fsync(directory.get()); } while (result < 0 && errno == EINTR);
+    do { result = metrics::io::fsync(directory.get()); } while (result < 0 && errno == EINTR);
     return result == 0 ? StoreError::none : StoreError::filesystem_error;
 }
 
 void ObjectStore::clean_incomplete_state() {
+    metrics::Timer startup(metrics::Counter::startup_calls, metrics::Counter::startup_ns);
     std::error_code error;
     std::vector<std::filesystem::path> removals;
     for (std::filesystem::directory_iterator it(transactions_directory_, error), end;
-         !error && it != end; it.increment(error)) { removals.push_back(it->path()); }
+         !error && it != end; it.increment(error)) { metrics::add(metrics::Counter::startup_entries); removals.push_back(it->path()); }
     for (const auto& path : removals) {
-        std::filesystem::remove_all(path, error);
+        metrics::io::remove_all(path, error);
         if (error) { break; }
     }
     if (error) { throw std::system_error(error, "clean AtlasFS transactions"); }
@@ -653,6 +655,7 @@ void ObjectStore::clean_incomplete_state() {
     removals.clear();
     for (std::filesystem::directory_iterator it(objects_directory_, error), end;
          !error && it != end; it.increment(error)) {
+        metrics::add(metrics::Counter::startup_entries);
         if (it->path().filename().string().starts_with(".atlasfs-tmp-") ||
             it->path().filename().string().starts_with(".repair-")) {
             removals.push_back(it->path());
@@ -665,19 +668,20 @@ void ObjectStore::clean_incomplete_state() {
         }
     }
     for (const auto& path : removals) {
-        std::filesystem::remove_all(path, error);
+        metrics::io::remove_all(path, error);
         if (error) { break; }
     }
     if (error) { throw std::system_error(error, "scan AtlasFS manifests"); }
     removals.clear();
     for (std::filesystem::directory_iterator it(chunks_directory_, error), end;
          !error && it != end; it.increment(error)) {
+        metrics::add(metrics::Counter::startup_entries);
         if (!referenced.contains(it->path().filename().string())) {
             removals.push_back(it->path());
         }
     }
     for (const auto& path : removals) {
-        std::filesystem::remove_all(path, error);
+        metrics::io::remove_all(path, error);
         if (error) { break; }
     }
     if (error) { throw std::system_error(error, "clean AtlasFS orphan generations"); }
@@ -690,11 +694,12 @@ void ObjectStore::clean_incomplete_state() {
         }
         for (std::filesystem::directory_iterator it(directory, error), end;
              !error && it != end; it.increment(error)) {
+            metrics::add(metrics::Counter::startup_entries);
             if (it->path().filename().string().starts_with(".repair-"))
                 removals.push_back(it->path());
         }
         for (const auto& path : removals) {
-            std::filesystem::remove_all(path, error);
+            metrics::io::remove_all(path, error);
             if (error) break;
         }
         if (error) break;

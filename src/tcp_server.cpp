@@ -1,4 +1,5 @@
 #include "atlasfs/tcp_server.hpp"
+#include "atlasfs/metrics.hpp"
 
 #include <arpa/inet.h>
 #include <array>
@@ -181,9 +182,14 @@ void TcpServer::handle_connection(Socket& connection) {
             auto result = parser.feed(
                 std::span<const std::byte>(buffer).first(static_cast<std::size_t>(received)));
             for (const auto& request : result.messages) {
+                metrics::add(metrics::Counter::frames_received);
+                metrics::add(metrics::Counter::payload_received, request.payload.size());
                 const auto response = tls_ ? authenticated_handler_(request, *stream->peer())
                                            : handler_(request);
                 stream->write_all(protocol::encode(response), deadline);
+                metrics::add(metrics::Counter::frames_sent);
+                metrics::add(metrics::Counter::payload_sent, response.payload.size());
+                metrics::add(metrics::Counter::framed_sent, response.payload.size() + protocol::kHeaderSize);
                 deadline = std::chrono::steady_clock::now() + timeout;
             }
             if (result.error != protocol::ParseError::none) {

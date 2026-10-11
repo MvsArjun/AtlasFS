@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AtlasFS benchmark v2",
+  "type": "object",
+  "required": ["schema", "source_commit", "source_tree_sha256", "source_dirty", "compile_flags", "started_utc", "run_id", "seed", "iterations", "objects", "bytes", "chunk", "nodes", "replicas", "workers", "warmup_per_workload", "instrumentation", "results"],
+  "properties": {
+    "schema": {"enum": [2]},
+    "source_commit": {"type": "string"},
+    "source_tree_sha256": {"type": "string"},
+    "source_dirty": {"type": "boolean"},
+    "compile_flags": {"type": "string"},
+    "started_utc": {"type": "string"},
+    "run_id": {"type": "string"},
+    "instrumentation": {"type": "boolean"},
+    "warmup_per_workload": {"type": "integer", "minimum": 0},
+    "results": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["workload", "operations", "successes", "unexpected_errors", "logical_bytes", "elapsed_seconds", "operations_per_second", "logical_bytes_per_second", "p50_ms", "p95_ms", "p99_ms", "io_counters", "process_io", "temporary_peak_bytes", "additional_disk_peak_bytes", "queue_samples", "queue_p50_ms", "queue_p95_ms", "queue_p99_ms"],
+        "properties": {
+          "workload": {"type": "string"},
+          "operations": {"type": "integer", "minimum": 1},
+          "successes": {"type": "integer", "minimum": 0},
+          "unexpected_errors": {"type": "integer", "minimum": 0},
+          "logical_bytes": {"type": "integer", "minimum": 0},
+          "elapsed_seconds": {"type": "number", "minimum": 0},
+          "operations_per_second": {"type": "number", "minimum": 0},
+          "logical_bytes_per_second": {"type": "number", "minimum": 0},
+          "p50_ms": {"type": "number", "minimum": 0},
+          "p95_ms": {"type": "number", "minimum": 0},
+          "p99_ms": {"type": "number", "minimum": 0},
+          "temporary_peak_bytes": {"type": ["integer", "null"], "minimum": 0},
+          "additional_disk_peak_bytes": {"type": ["integer", "null"], "minimum": 0},
+          "io_counters": {
+            "type": ["object", "null"],
+            "required": ["saturated", "accounting_complete", "serialized_payload_sent_bytes", "framed_sent_bytes", "tls_application_sent_bytes", "socket_sent_bytes", "socket_received_bytes", "file_write_bytes", "file_sync_calls", "directory_sync_calls", "startup_entries"],
+            "properties": {"saturated": {"type": "boolean"}, "accounting_complete": {"type": "boolean"}},
+            "additionalProperties": {"type": "integer", "minimum": 0}
+          },
+          "process_io": {
+            "type": ["object", "null"],
+            "required": ["rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes", "cancelled_write_bytes"],
+            "additionalProperties": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    }
+  }
+}

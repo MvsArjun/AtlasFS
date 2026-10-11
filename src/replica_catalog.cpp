@@ -1,4 +1,5 @@
 #include "atlasfs/replica_catalog.hpp"
+#include "atlasfs/metrics.hpp"
 
 #include "atlasfs/checksum.hpp"
 #include "atlasfs/object_protocol.hpp"
@@ -163,19 +164,19 @@ bool valid_snapshot(const ReplicaCatalogSnapshot& snapshot) {
 bool sync_fd(int descriptor) {
     int result;
     do {
-        result = ::fsync(descriptor);
+        result = metrics::io::fsync(descriptor);
     } while (result < 0 && errno == EINTR);
     return result == 0;
 }
 
 bool sync_directory(const std::filesystem::path& path) {
     const int descriptor =
-        ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        metrics::io::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (descriptor < 0) {
         return false;
     }
     const bool synced = sync_fd(descriptor);
-    const bool closed = ::close(descriptor) == 0;
+    const bool closed = metrics::io::close(descriptor) == 0;
     return synced && closed;
 }
 
@@ -320,6 +321,7 @@ DurableReplicaCatalog::DurableReplicaCatalog(std::filesystem::path root,
     : directory_(std::move(root) / "coordinator" / "replicas"),
       record_path_(directory_ / "catalog"),
       fault_injector_(std::move(fault_injector)), authority_(std::move(authority)), session_(std::move(session)) {
+    metrics::Timer startup(metrics::Counter::startup_calls, metrics::Counter::startup_ns);
     const auto epoch_path = directory_.parent_path() / "epoch";
     if (authority_) {
         if (!session_ || !epoch::valid_token(*session_) || authority_->directory() != std::filesystem::canonical(epoch_path))
@@ -358,6 +360,7 @@ DurableReplicaCatalog::DurableReplicaCatalog(std::filesystem::path root,
         }
     }
     const bool exists = std::filesystem::exists(record_path_, error);
+    metrics::add(metrics::Counter::startup_entries);
     if (error) {
         throw std::system_error(error, "inspect replica catalog");
     }
@@ -384,6 +387,7 @@ DurableReplicaCatalog::DurableReplicaCatalog(std::filesystem::path root,
         throw std::runtime_error("read durable replica catalog");
     }
     const auto decoded = decode_replica_catalog(bytes);
+    metrics::io::observed_read(bytes.size());
     if (!decoded) {
         throw std::runtime_error("invalid durable replica catalog");
     }
@@ -579,7 +583,7 @@ ReplicaCatalogError DurableReplicaCatalog::publish(
         return ReplicaCatalogError::persistence_error;
     }
     const auto temporary = directory_ / "catalog.tmp";
-    const int descriptor = ::open(
+    const int descriptor = metrics::io::open(
         temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (descriptor < 0) {
         return ReplicaCatalogError::persistence_error;
@@ -589,7 +593,7 @@ ReplicaCatalogError DurableReplicaCatalog::publish(
     std::size_t offset = 0;
     while (okay && offset < bytes.size()) {
         const auto written =
-            ::write(descriptor, bytes.data() + offset, bytes.size() - offset);
+            metrics::io::write(descriptor, bytes.data() + offset, bytes.size() - offset);
         if (written > 0) {
             offset += static_cast<std::size_t>(written);
         } else if (written < 0 && errno == EINTR) {
@@ -605,7 +609,7 @@ ReplicaCatalogError DurableReplicaCatalog::publish(
     if (okay) {
         okay = sync_fd(descriptor);
     }
-    if (::close(descriptor) != 0) {
+    if (metrics::io::close(descriptor) != 0) {
         okay = false;
     }
     if (!okay) {
@@ -616,7 +620,7 @@ ReplicaCatalogError DurableReplicaCatalog::publish(
         return ReplicaCatalogError::persistence_error;
     }
     std::error_code error;
-    std::filesystem::rename(temporary, record_path_, error);
+    metrics::io::rename(temporary, record_path_, error);
     if (error) {
         return ReplicaCatalogError::persistence_error;
     }

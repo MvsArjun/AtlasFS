@@ -44,8 +44,12 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           TSAN_OPTIONS: halt_on_error=1
         run: |
-          ./build/atlasfs_bench --iterations 3 --objects 3 --bytes 4096 --chunk 1024 --workers 2 --output build/benchmark-smoke.json
+          ./build/atlasfs_bench --iterations 3 --objects 3 --bytes 4096 --chunk 1024 --workers 2 --warmup 1 --output build/benchmark-smoke.json
           python3 benchmarks/validate.py build/benchmark-smoke.json
+          ./build/atlasfs_bench --iterations 3 --objects 3 --bytes 4096 --chunk 1024 --workers 2 --warmup 1 --metrics off --output build/benchmark-disabled.json
+          python3 benchmarks/validate.py build/benchmark-disabled.json
+          python3 benchmarks/compare.py build/benchmark-smoke.json build/benchmark-smoke.json
+          python3 benchmarks/tool_test.py build/benchmark-smoke.json
           python3 -c 'import subprocess; assert subprocess.run(["./build/atlasfs_bench", "--iterations", "0"]).returncode==2'
       - name: Repeat authenticated repair integration tests
         if: matrix.mode == 'normal'
@@ -64,3 +68,4 @@ jobs:
           path: |
             build/Testing/Temporary/
             build/benchmark-smoke.json
+            build/benchmark-disabled.json

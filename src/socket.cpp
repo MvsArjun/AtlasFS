@@ -1,4 +1,5 @@
 #include "atlasfs/socket.hpp"
+#include "atlasfs/metrics.hpp"
 #include "atlasfs/transport.hpp"
 
 #include <arpa/inet.h>
@@ -16,6 +17,7 @@ namespace atlasfs::net {
 namespace {
 
 [[noreturn]] void throw_system_error(const char* operation) {
+    metrics::add(metrics::Counter::connection_failures);
     throw std::system_error(errno, std::generic_category(), operation);
 }
 
@@ -58,6 +60,7 @@ void Socket::reset(int descriptor) noexcept {
 }
 
 Socket connect_loopback(std::uint16_t port, std::chrono::milliseconds timeout) {
+    metrics::Timer timing(metrics::Counter::tcp_connects, metrics::Counter::tcp_connect_ns);
     if (timeout.count() <= 0 || timeout > std::chrono::minutes(5))
         throw std::invalid_argument("invalid connection timeout");
     Socket socket(::socket(AF_INET, SOCK_STREAM, 0));
@@ -82,7 +85,7 @@ Socket connect_loopback(std::uint16_t port, std::chrono::milliseconds timeout) {
         socklen_t length = sizeof(error);
         if (::getsockopt(socket.get(), SOL_SOCKET, SO_ERROR, &error, &length) != 0)
             throw_system_error("getsockopt(connect)");
-        if (error != 0) throw std::system_error(error, std::generic_category(), "connect");
+        if (error != 0) { metrics::add(metrics::Counter::connection_failures); throw std::system_error(error, std::generic_category(), "connect"); }
     }
     // Preserve the raw-socket compatibility API; stream users make it nonblocking.
     if (::fcntl(socket.get(), F_SETFL, flags) != 0) throw_system_error("fcntl(connect)");
