@@ -25,5 +25,15 @@ show the three rounds; `transport-off-1.json` / `transport-on-1.json` retain an
 unchanged raw pair. Pair order was off/on, on/off, off/on. Use
 `python3 benchmarks/compare.py --allow-transport-change transport-off-1.json transport-on-1.json`.
 
+Optimized profile source: `ca687d0f5dec3b3b379f664b07992d6006f5683c`.
+[Successful full workflow](https://github.com/MvsArjun/AtlasFS/actions/runs/38113019605),
+artifact `linux-benchmark-hosted-characterize` (ID 11692496391), contains the
+39 final raw reports. `optimized-summary.csv` is its unchanged summary.
+This runner exposed EPYC 9V45 instead of EPYC 7763: **do not compare different
+jobs' timings as an optimization ratio**. Use the same-job transport A/B pair
+for that claim. Across baseline, paired transport and optimized full profiles,
+84 reports validated 21,696 measured cycles with zero unexpected errors and
+zero residual temporary bytes.
+
 For methods, metric attribution, mount/durability limitations, verification and
 interpretation, see [Milestone 21](../../../docs/milestone-21.md).

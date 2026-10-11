@@ -111,7 +111,11 @@ an independent filesystem traversal and fails if complete accounting disagrees.
 bytes**, including any temporary baseline. `additional_disk_peak_bytes` is peak
 regular-file bytes minus the initial baseline. Neither is allocated disk blocks,
 directory metadata, COW overhead, cache memory, or device writes. The accounting
-requires a private root and no unobserved external writers. Failure hooks and
+requires a private root and no unobserved external writers.
+The gauge follows AtlasFS's close-before-rename/unlink publication discipline;
+it is not an inode tracker for arbitrary hard links or writes through renamed
+open descriptors. Concurrent updates are safe, but do not constitute a global
+filesystem transaction or a physical allocation trace. Failure hooks and
 restart cleanup are tested; orphan final generations can remain non-authoritative.
 Cleanup counts apply to tracked files, not empty directories.
 
@@ -383,6 +387,72 @@ byte reduction or real-network speedup is claimed.
 A dedicated Linux baseline is
 unavailable without a supplied controlled runner; shared observations must not
 be substituted for that missing capacity evidence.
+
+### Final optimized profile and verification
+
+[Final-code verification](https://github.com/MvsArjun/AtlasFS/actions/runs/38112997172)
+passed for `ca687d0f5dec3b3b379f664b07992d6006f5683c`: normal 325/325 (5.96 s),
+ASan/UBSan 325/325 (16.58 s), TSan 325/325 (18.55 s), all exit 0. Each job
+validated 24-workload/72-cycle enabled and disabled smoke, including the six
+Python checks. Normal CI also passed Cppcheck, production-only build, seven
+TLS-repair tests repeated ten times (70 executions, 1.61 s), and 31 epoch
+activation/RPC/repair/catalog tests repeated ten times (310 executions, 6.78 s).
+
+Local optimized MSYS2 verification passed 325/325 (39.57 s), Cppcheck 2.21
+over 24 translation units, production-only Release build, enabled/disabled and
+TCP_NODELAY opt-out smoke validation and six tooling checks, all exit 0.
+Thirty-one Metrics/TLS-repair/epoch-repair cases repeated three times passed
+(93 executions, 14.87 s). A newly cloned checkout of the published optimized
+revision independently configured/fetched GoogleTest, built, passed 325/325
+(40.00 s), and validated 24 workloads/72 cycles and the six tooling checks.
+Windows and MSYS Git initially disagreed on CRLF normalization in that clone;
+setting that clone's `core.autocrlf=true` aligned them. Reconfigured benchmark
+metadata reflects the same source bytes without relabeling an uncommitted edit
+as a published clean source. Correctness runtimes are not benchmark speedups.
+
+[Final characterization 38113019605](https://github.com/MvsArjun/AtlasFS/actions/runs/38113019605)
+passed at the same optimized revision: 39 reports, 10,200 measured cycles,
+32.36 s summed measured-row time, zero unexpected errors and zero residual
+temporary bytes. Artifact `linux-benchmark-hosted-characterize` (ID 11692496391)
+contains all raw reports and exact environments/commands. Maximum process RSS
+was 19,668,992 bytes. [optimized-summary.csv](../benchmarks/results/m21/optimized-summary.csv)
+retains all 72 repeated workload groups, sample counts, wall times, percentiles,
+CPU/RSS, queue, byte, sync and peak-space values.
+
+**This job ran on a different exposed CPU: AMD EPYC 9V45**, two available
+processors. Distribution/kernel/RAM and tool versions matched the recorded
+baseline, and the virtual ext4 mount had the same unsafe-for-power-loss-evidence
+options. Its fingerprint is
+`c349ed44a59e634c5ef189b63523f6842ed7b42a50b3a773089412d312933a58`, versus the
+baseline/A-B fingerprint
+`ec6696a00ab35046df0c1cae4f42e5f3f55c614c45938afd67a24d7eefaa1c7d`.
+Do not turn these jobs' runtime difference into an optimization ratio. Only the
+same-job TCP_NODELAY pair above supports the claimed improvement.
+
+Final-profile observations (medians of three per-round measurements):
+
+| Workload | Samples/round | ops/s | p50 / p95 / p99 ms | Queue p99 ms |
+| --- | ---: | ---: | --- | ---: |
+| R2 64 KiB read, workers 1 | 80 | 809.23 | 1.219 / 1.282 / 1.410 | 0.00020 |
+| Same, workers 2 | 80 | 810.50 | 1.226 / 1.286 / 98.555 | 97.183 |
+| Same, workers 4 | 80 | 788.50 | 1.224 / 1.423 / 101.184 | 99.808 |
+| Remote 16 KiB repair | 20 | 158.88 | 6.224 / 6.785 / 6.808 | unavailable |
+
+Read CPU was about 106–107% of one CPU; extra workers still did not increase
+throughput, and unfair queue tails remain visible. At 8/32/128 objects, final
+storage startup p50 was 0.214/0.659/2.504 ms; coordinator startup p50 was
+0.331/1.234/5.095 ms. These are new-environment observations, not startup
+optimization comparisons.
+
+In final repair round 1, twenty repairs took 125.88 ms: RPC aggregate 48.67 ms,
+file syncs 53.37 ms and directory syncs 31.86 ms. Publication/verification/CAS/
+completion stage totals were 45.99/3.00/12.97/12.25 ms. Sync costs are now a
+substantial part of this particular workload; they were not removed. Write
+byte categories, 200 file syncs, 220 directory syncs, 16,384-byte temporary
+peak and 338,855-byte additional apparent-file peak matched the baseline
+work volume. Physical storage behavior remains unknown. Longer controlled-host
+sync and batching experiments would require a separately reviewed design that
+preserves commit acknowledgement and failure semantics.
 
 The serial coordinator queue and sequential server dispatch are architectural
 boundaries. Startup scanning and catalog snapshot growth remain investigation
