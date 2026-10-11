@@ -249,7 +249,8 @@ public:
             bench::seed_catalog(*catalog, value);
             pending.emplace_back(std::move(value), "");
         }
-        const auto historical = metadata::make_coordinator_operation(pending[0].first, "history", 7);
+        if (pending.empty()) throw std::invalid_argument("repair workload requires at least one object");
+        const auto historical = metadata::make_coordinator_operation(pending.front().first, "history", 7);
         bench::require(history.create(historical) == metadata::CoordinatorRecordError::none, "history seed");
         const auto before = metadata::encode_coordinator_operation(*history.get("history"));
         measure(recover ? "repair_restart_reconcile_window_" + std::to_string(static_cast<int>(point)) : "remote_repair_verify_catalog_cas",

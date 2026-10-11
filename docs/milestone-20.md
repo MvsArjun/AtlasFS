@@ -285,6 +285,13 @@ wall-clock performance threshold. Actual final counts, exit codes, fresh-clone
 results and CI links are reported in the delivery report; workflow text alone is
 not evidence of sanitizer success.
 
+The first published Milestone 20 CI run passed all normal and sanitizer tests,
+but the normal job stopped at Cppcheck: the analyzer could not infer the CLI's
+nonzero-object precondition at repair-history seeding. An explicit empty-workload
+guard now protects that access; no diagnostic suppression or invariant relaxation
+was introduced. The final delivery report identifies the subsequent verification
+run rather than treating the initially failed run as successful.
+
 ## Remaining scope and next engineering priority
 
 No consensus, election, multi-coordinator operation, automatic replanning,
