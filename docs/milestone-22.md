@@ -291,6 +291,17 @@ or VM fingerprints is valid optimization evidence.
 
 ## Final evidence pending
 
+The first hardened-code CI attempt
+[38162648935](https://github.com/MvsArjun/AtlasFS/actions/runs/38162648935)
+exposed an incorrect regression-test assumption: queue high-water can be four,
+not three, during a handoff with no active handler. Normal repeated testing and
+the TSan suite failed that assertion; their diagnostics did not report a data
+race. The corrected bound is waiting ≤ min(configured capacity, worker count),
+and active handler plus waiting callers ≤ worker count. The independent assertion
+that handler concurrency is one remains unchanged. This is a test/documentation
+correction, not relaxation of queue capacity or authority serialization. Final
+CI must pass the corrected test before completion.
+
 The initial implementation `020c8fab50ad9e3f1e266e2b2f8c3578efca38fd`
 passed [Linux verification](https://github.com/MvsArjun/AtlasFS/actions/runs/38114978604):
 363/363 normal (7.11 s), ASan/UBSan (29.18 s), and TSan (19.26 s), both

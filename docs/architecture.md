@@ -159,7 +159,9 @@ rejects an oversized returned payload, but cannot preempt that allocation.
 One `AdmissionQueue` admits complete requests into the entire handler, including
 peer-role/target authorization, epoch guard, storage maps, publication and journal
 updates. The queue capacity counts pending requests, not the one active handler;
-default four, validated 0–65,536, effectively at most workers minus one. Queue
+default four, validated 0–65,536, effectively at most the worker count (one fewer
+while a handler is active). A handoff can transiently have no active handler
+and every worker waiting; it never creates another worker or task. Queue
 overflow or pre-execution deadline expiration closes that connection. Since the
 request may have been sent, clients conservatively retain existing unknown-outcome
 semantics rather than treating EOF as proof that no remote change occurred.

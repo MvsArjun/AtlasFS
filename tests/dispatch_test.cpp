@@ -176,7 +176,8 @@ TEST_F(Dispatch, ConcurrentConnectionsHaveIsolatedIdsAndSerializedHandlers) {
     for (auto& result : results) EXPECT_TRUE(result.get());
     EXPECT_EQ(peak, 1U);
     EXPECT_EQ(server.snapshot().requests, 80U);
-    EXPECT_LE(server.snapshot().peak_request_waiting, 3U);
+    // During handoff the lease can be idle while all four worker callers wait.
+    EXPECT_LE(server.snapshot().peak_request_waiting, 4U);
     running.stop(); EXPECT_FALSE(running.error);
 }
 TEST_F(Dispatch, HandlerExceptionStopsAllWorkersAndRethrowsFromServe) {
