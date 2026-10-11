@@ -80,6 +80,9 @@ mutex, not wall-clock invocation order. Diagnostic tickets identify that order;
 they are neither durable execution IDs nor proof of completion order. Tickets
 and cumulative counters saturate. Cancelled, expired, and shutdown-rejected
 waiters are removed without blocking later live waiters.
+Each waiter owns a condition variable: lease release wakes only the FIFO head,
+cancellation wakes only its caller, and shutdown wakes every pending waiter.
+This avoids waking the entire bounded queue on every ordinary handoff.
 
 | Result | Meaning before granting a lease |
 | --- | --- |
@@ -124,6 +127,11 @@ When all worker slots are occupied, the acceptor promptly closes another
 accepted socket before handshake or request execution. The kernel listen
 backlog remains a separate OS-managed resource. Existing payload-size limits
 remain enforced per frame.
+Returned response payloads must also fit the configured transport limit before
+encoding. An oversized trusted-handler result fails the endpoint closed; the
+callback's internal allocation itself cannot be safely preempted by transport.
+Unexpected worker-control and admission synchronization exceptions propagate
+through endpoint failure and cleanup rather than masquerading as socket errors.
 
 Workers may perform TLS/socket processing concurrently, but every complete
 request enters one FIFO admission gate before invoking the application handler.
@@ -243,6 +251,9 @@ no unexpected exception, INCLUDING correctly exercised expected rejections.
 unknown, timed-out, and non-executed work. `operations_per_second` is attempted
 cycle throughput. Queue percentiles cover admission attempts, including rejected
 ones; ordinary fairness comparisons have adequate capacity to avoid overload.
+Additive `queue_max_ms` and `latency_max_ms` also report the worst measured wait
+and cycle. In a long batch, only three starving workers among hundreds of
+operations can be invisible to p99; percentiles alone are not a fairness proof.
 Legacy mutex queue capacity/peak are null because its waiting queue was neither
 bounded nor measured. FIFO queue limits and high-water values are numeric.
 
@@ -279,6 +290,35 @@ workflow results must remain labeled `shared`. No ratio between different CPU
 or VM fingerprints is valid optimization evidence.
 
 ## Final evidence pending
+
+The initial implementation `020c8fab50ad9e3f1e266e2b2f8c3578efca38fd`
+passed [Linux verification](https://github.com/MvsArjun/AtlasFS/actions/runs/38114978604):
+363/363 normal (7.11 s), ASan/UBSan (29.18 s), and TSan (19.26 s), both
+27-workload/81-cycle smoke modes and 13 tooling tests in each job. Its normal
+production/static checks and 70 TLS, 310 epoch/recovery and 400 scheduling
+repeat executions passed. An independent remote fresh clone passed 363/363
+(43.12 s), validated smoke, and reported a clean source checkout.
+
+Initial three-round [admission measurements](https://github.com/MvsArjun/AtlasFS/actions/runs/38115003308)
+on fingerprint `45ffedee19174ba645d32cde353b2908f17586b6c36ca9254b384ee57db53fa0`
+(EPYC 9V74, two CPUs, 8,323,969,024 memory bytes) reduced four-worker read
+queue p99 125.924→5.195 ms and end-to-end p99 127.581→6.913 ms; read
+throughput 625.998→611.111/s (-2.38%). The 400-cycle mixed median was
+160.476→137.531/s (-14.30%), so this is not evidence of universal non-regression.
+Counts were identical: 2,400 file syncs, 2,400 directory syncs and 13,256,680
+written bytes per mixed round. In the two slow FIFO rounds, sync wait grew
+approximately 0.90→1.31 s and 0.94→1.24 s, accounting for most of the extra
+0.42/0.47 s wall time. Hosted filesystem variation is a plausible contributor,
+not a proven dismissal of the observed regression. Follow-up measurements are
+required after targeted FIFO wakeups and final endpoint hardening.
+
+Initial three-round [dispatch measurements](https://github.com/MvsArjun/AtlasFS/actions/runs/38115005101)
+on fingerprint `b78ff2ba8010ed1c02bbea6f7573983212914cd35ffd7f4d5a1b4ace9e275a56`
+reduced independent-connection p99 202.707→3.487 ms (idle) and
+202.774→3.449 ms (partial frame). Keeping FIFO constant, four-worker read
+throughput was 430.559→428.584/s (-0.46%); sustained mixed was
+130.716→131.467/s (+0.57%). These ratios are internal paired comparisons,
+not ratios between different admission/dispatch runners.
 
 Local integrated verification of the candidate passed 363/363 CTest cases in
 44.48 s on MSYS2 GCC 15.3. The 38 added cases comprise 16 admission tests,

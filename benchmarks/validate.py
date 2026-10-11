@@ -60,6 +60,8 @@ for path in args.files:
         names.add(name)
         assert row["operations"] > 0 and row["unexpected_errors"] == 0, (path, name, "failure")
         assert 0 <= row["p50_ms"] <= row["p95_ms"] <= row["p99_ms"], (path, name, "percentiles")
+        if "latency_max_ms" in row:
+            assert row["latency_max_ms"] >= row["p99_ms"], (path, name, "maximum latency")
         assert row["elapsed_seconds"] > 0 and row["temporary_residual_bytes"] == 0, (path, name, "residual temporary bytes")
         for field in ("operations_per_second", "logical_bytes_per_second", "p50_ms", "p95_ms", "p99_ms"):
             assert math.isfinite(row[field]), (path, name, field)
@@ -85,6 +87,8 @@ for path in args.files:
                 values = [row[f"{prefix}_p{p}_ms"] for p in (50, 95, 99)]
                 assert (samples == 0 and values == [None] * 3) or (0 < samples <= row["operations"] and 0 <= values[0] <= values[1] <= values[2]), (path, name, prefix)
         if scheduling:
+            if "queue_max_ms" in row:
+                assert (row["queue_samples"] == 0 and row["queue_max_ms"] is None) or (row["queue_samples"] > 0 and row["queue_max_ms"] >= row["queue_p99_ms"]), (path, name, "maximum queue latency")
             required = ("executed_operations", "successful_operations", "successful_operations_per_second", "admission_attempts",
                         "admitted_operations", "admission_overloads", "admission_cancelled", "admission_deadline_expired",
                         "admission_shutdown_rejected", "admission_overload_rate", "row_admission_policy", "admission_queue_capacity",

@@ -151,7 +151,10 @@ The requested kernel listen backlog is the worker count (the OS may round it).
 Excess accepted connections close before authentication, without a synthetic
 response or retry. The default connection request limit is 1,000,000 (validated
 1–1,000,000); closure follows its last acknowledged request. Payload limits still
-bound each parser; one request and response can consume additional bounded copies.
+bound each parser; outbound response payloads use the same limit before encoding.
+Current storage handlers make additional bounded request/response copies. Trusted
+callbacks can allocate arbitrarily inside their own implementation: the transport
+rejects an oversized returned payload, but cannot preempt that allocation.
 
 One `AdmissionQueue` admits complete requests into the entire handler, including
 peer-role/target authorization, epoch guard, storage maps, publication and journal
@@ -196,8 +199,10 @@ Storage servers instead install `StorageRequestHandler`.
 executor. It grants one move-only lease in mutex-linearized enqueue FIFO order.
 The active owner cannot reacquire ahead of existing waiters. Intrusive waiter nodes
 live on blocked callers' stacks; capacity bounds queue state rather than allocating
-unbounded tasks. Zero capacity permits only an immediate idle acquisition. Stop
-tokens, absolute deadlines and shutdown unlink pending waiters without FIFO holes;
+unbounded tasks. Zero capacity permits only an immediate idle acquisition. Cancellation
+notification wakes only its caller, and lease release wakes only the FIFO head;
+shutdown wakes all pending callers. This avoids a per-operation broadcast herd.
+Stop tokens, absolute deadlines and shutdown unlink pending waiters without FIFO holes;
 leases may outlive the queue owner through shared state. Diagnostic counters and
 tickets saturate rather than wrap, and tickets are not durable execution IDs.
 

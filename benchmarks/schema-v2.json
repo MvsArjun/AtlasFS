@@ -61,6 +61,8 @@
           "p50_ms": {"type": "number", "minimum": 0},
           "p95_ms": {"type": "number", "minimum": 0},
           "p99_ms": {"type": "number", "minimum": 0},
+          "latency_max_ms": {"type": "number", "minimum": 0},
+          "queue_max_ms": {"type": ["number", "null"], "minimum": 0},
           "temporary_peak_bytes": {"type": ["integer", "null"], "minimum": 0},
           "additional_disk_peak_bytes": {"type": ["integer", "null"], "minimum": 0},
           "io_counters": {

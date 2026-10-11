@@ -22,7 +22,7 @@ for run in index["runs"]:
 if len(environments) != 1:
     parser.error("cannot aggregate performance rounds across different machine fingerprints")
 fields = ["case", "workload", "rounds", "operations_total", "elapsed_seconds_total", "median_ops_s", "median_bytes_s", "median_p50_ms", "median_p95_ms", "median_p99_ms", "median_queue_p50_ms", "median_queue_p95_ms", "median_queue_p99_ms", "median_cpu_seconds", "median_cpu_percent", "median_process_peak_rss_bytes", "median_socket_sent", "median_file_write_bytes", "median_file_sync_ns", "median_directory_sync_ns", "median_temporary_peak", "median_additional_disk_peak", "median_startup_entries",
-          "successful_operations_total", "executed_operations_total", "unexpected_errors_total", "expected_rejections_total", "timeouts_total", "unknown_outcomes_total", "admission_overloads_total", "admission_cancelled_total", "admission_deadline_expired_total", "admission_shutdown_rejected_total", "median_successful_ops_s", "median_admission_overload_rate", "maximum_admission_queue_peak", "median_independent_connection_p50_ms", "median_independent_connection_p95_ms", "median_independent_connection_p99_ms", "maximum_dispatch_active", "maximum_dispatch_request_waiting"]
+          "successful_operations_total", "executed_operations_total", "unexpected_errors_total", "expected_rejections_total", "timeouts_total", "unknown_outcomes_total", "admission_overloads_total", "admission_cancelled_total", "admission_deadline_expired_total", "admission_shutdown_rejected_total", "median_successful_ops_s", "median_admission_overload_rate", "maximum_admission_queue_peak", "median_independent_connection_p50_ms", "median_independent_connection_p95_ms", "median_independent_connection_p99_ms", "maximum_dispatch_active", "maximum_dispatch_request_waiting", "maximum_latency_ms", "maximum_queue_wait_ms"]
 summary = []
 for (case, workload), rows in sorted(groups.items()):
     def median(field, counters=False):
@@ -41,7 +41,7 @@ for (case, workload), rows in sorted(groups.items()):
         *[total(field) for field in ("successful_operations", "executed_operations", "unexpected_errors", "expected_rejections", "timeouts", "unknown_outcomes", "admission_overloads", "admission_cancelled", "admission_deadline_expired", "admission_shutdown_rejected")],
         median("successful_operations_per_second"), median("admission_overload_rate"), maximum("admission_queue_peak"),
         median("independent_connection_p50_ms"), median("independent_connection_p95_ms"), median("independent_connection_p99_ms"),
-        maximum("peak_active", True), maximum("peak_request_waiting", True)])))
+        maximum("peak_active", True), maximum("peak_request_waiting", True), maximum("latency_max_ms"), maximum("queue_max_ms") ])))
 with (args.directory / "summary.csv").open("w", newline="", encoding="utf-8") as output:
     writer = csv.DictWriter(output, fields); writer.writeheader(); writer.writerows(summary)
 with (args.directory / "summary.json").open("w", encoding="utf-8") as output:

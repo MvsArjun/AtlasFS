@@ -51,7 +51,7 @@ if len(old) != len(before["results"]) or len(new) != len(after["results"]):
 if old.keys() != new.keys():
     parser.error("workload sets differ")
 writer = csv.writer(sys.stdout, lineterminator="\n")
-extra_fields = ("p95_ms", "p99_ms", "queue_p50_ms", "queue_p95_ms", "queue_p99_ms",
+extra_fields = ("p95_ms", "p99_ms", "latency_max_ms", "queue_p50_ms", "queue_p95_ms", "queue_p99_ms", "queue_max_ms",
                 "successful_operations_per_second", "admission_overloads", "admission_deadline_expired",
                 "admission_cancelled", "admission_shutdown_rejected", "timeouts", "unexpected_errors",
                 "independent_connection_p50_ms", "independent_connection_p95_ms", "independent_connection_p99_ms")

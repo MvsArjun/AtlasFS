@@ -469,7 +469,9 @@ public:
                 << ",\"replicas\":" << m.replicas << ",\"workers\":" << m.workers << ",\"elapsed_seconds\":" << m.wall
                 << ",\"operations_per_second\":" << m.operations / m.wall << ",\"logical_bytes_per_second\":" << m.bytes / m.wall
                 << ",\"logical_bytes\":" << m.bytes << ",\"p50_ms\":" << m.percentile(.50) << ",\"p95_ms\":" << m.percentile(.95)
-                << ",\"p99_ms\":" << m.percentile(.99) << ",\"cpu_seconds\":";
+                << ",\"p99_ms\":" << m.percentile(.99)
+                << ",\"latency_max_ms\":" << *std::max_element(m.latencies.begin(), m.latencies.end())
+                << ",\"cpu_seconds\":";
             if (m.cpu < 0) out << "null"; else out << m.cpu;
             out << ",\"process_cpu_percent\":"; if (m.cpu < 0) out << "null"; else out << 100 * m.cpu / m.wall;
             out << ",\"disk_file_bytes\":" << m.disk << ",\"temporary_residual_bytes\":" << m.temporary
@@ -500,6 +502,9 @@ public:
                 initial = false; out << quote(key) << ':' << value;
             } out << '}'; }
             out << ",\"queue_samples\":" << m.queue_latencies.size();
+            out << ",\"queue_max_ms\":";
+            if (m.queue_latencies.empty()) out << "null";
+            else out << *std::max_element(m.queue_latencies.begin(), m.queue_latencies.end());
             for (const auto p : {50, 95, 99}) {
                 out << ",\"queue_p" << p << "_ms\":";
                 if (m.queue_latencies.empty()) out << "null";

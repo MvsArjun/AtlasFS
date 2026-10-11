@@ -98,6 +98,15 @@ class BenchmarkTools(unittest.TestCase):
         value.setdefault("environment", {})["machine_fingerprint"] = "different-machine"
         self.check(value, "compare.py", (str(SOURCE.resolve()),))
 
+    @unittest.skipUnless("queue_max_ms" in REPORT["results"][0], "pre-maximum-wait report")
+    def test_maximum_wait_below_percentile_is_rejected(self):
+        value = copy.deepcopy(REPORT)
+        row = next(row for row in value["results"] if row["queue_samples"])
+        row["queue_max_ms"] = -1
+        self.check(value)
+        row["queue_max_ms"] = 0
+        self.check(value)
+
 
 if __name__ == "__main__":
     unittest.main()

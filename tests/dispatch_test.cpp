@@ -195,6 +195,35 @@ TEST_F(Dispatch, HandlerExceptionStopsAllWorkersAndRethrowsFromServe) {
     EXPECT_EQ(server.snapshot().active, 0U);
     EXPECT_EQ(server.snapshot().requests, 1U);
 }
+TEST(DispatchResponseLimit, OversizedHandlerResponseFailsEndpointClosed) {
+    TcpServer server(0, [](const auto& request) {
+        auto response = echo_response(request);
+        response.payload.resize(2);
+        return response;
+    }, 1);
+    Running running(server);
+    TcpClient client(server.port()), idle(server.port());
+    EXPECT_THROW(static_cast<void>(client.request(ping(1))), TransportError);
+    running.stop();
+    ASSERT_TRUE(running.error);
+    EXPECT_THROW(std::rethrow_exception(running.error), std::length_error);
+    EXPECT_EQ(server.snapshot().active, 0U);
+    EXPECT_EQ(server.snapshot().requests, 1U);
+}
+TEST(DispatchResponseLimit, ExactPayloadLimitRemainsValid) {
+    TcpServer server(0, [](const auto& request) {
+        auto response = echo_response(request);
+        response.payload.resize(4, std::byte{7});
+        return response;
+    }, 4);
+    Running running(server);
+    TcpClient client(server.port());
+    const auto response = client.request(ping(1));
+    EXPECT_EQ(response.request_id, 1U);
+    EXPECT_EQ(response.payload.size(), 4U);
+    EXPECT_EQ(response.payload.back(), std::byte{7});
+    running.stop(); EXPECT_FALSE(running.error);
+}
 TEST_F(Dispatch, ShutdownCancelsQueuedRequestWithoutPreemptingExecutingHandler) {
     Latch release;
     std::atomic_uint effects{};

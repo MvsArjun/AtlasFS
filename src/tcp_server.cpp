@@ -243,32 +243,45 @@ void TcpServer::serve_serial() {
 }
 
 void TcpServer::worker(std::size_t index) noexcept {
-    for (;;) {
-        int descriptor;
-        {
-            std::unique_lock lock(state_->mutex);
-            state_->ready.wait(lock, [&] {
-                return stopping_.load() || state_->descriptors[index] >= 0;
-            });
-            descriptor = state_->descriptors[index];
-            if (descriptor < 0) return;
+    // Ownership survives exception unwinding until lifecycle retirement. A
+    // worker-control error must not close an fd still visible to stop().
+    Socket connection;
+    try {
+        for (;;) {
+            {
+                std::unique_lock lock(state_->mutex);
+                state_->ready.wait(lock, [&] {
+                    return stopping_.load() || state_->descriptors[index] >= 0;
+                });
+                const auto descriptor = state_->descriptors[index];
+                if (descriptor < 0) return;
+                connection.reset(descriptor);
+            }
+            if (!stopping_.load()) {
+                try { handle_connection(connection); }
+                catch (const TransportError&) {} // Connection-local authentication/I/O failure.
+                catch (const std::system_error&) {} // TCP setup; admission errors fail before rethrow.
+            }
+            {
+                std::lock_guard lock(state_->mutex);
+                // Retire before close under the same lock used by stop().
+                state_->descriptors[index] = -1;
+                --state_->counters.active;
+                connection.reset();
+            }
+            if (stopping_.load()) return;
         }
-        Socket connection(descriptor);
-        if (!stopping_.load()) {
-            try { handle_connection(connection); }
-            catch (const TransportError&) {} // Connection-local authentication/I/O failure.
-            catch (const std::system_error&) {}
-            catch (...) { fail(std::current_exception()); }
-        }
-        {
-            std::lock_guard lock(state_->mutex);
-            // Retire the descriptor before closing, under the same lifecycle lock
-            // used by stop(). The kernel cannot reuse an fd visible to shutdown.
+    } catch (...) {
+        fail(std::current_exception());
+        std::lock_guard lock(state_->mutex);
+        const auto descriptor = state_->descriptors[index];
+        if (descriptor >= 0) {
+            // A wait error can occur before the assigned socket was claimed.
+            if (!connection.valid()) connection.reset(descriptor);
             state_->descriptors[index] = -1;
             --state_->counters.active;
             connection.reset();
         }
-        if (stopping_.load()) return;
     }
 }
 
@@ -324,7 +337,13 @@ void TcpServer::handle_connection(Socket& connection) {
                 metrics::add(metrics::Counter::payload_received, request.payload.size());
                 scheduling::AdmissionQueue::Result admitted;
                 if (admission_) {
-                    admitted = admission_->acquire(deadline);
+                    try { admitted = admission_->acquire(deadline); }
+                    catch (...) {
+                        // Synchronization failures are not expected socket I/O
+                        // errors, even when they use std::system_error.
+                        fail(std::current_exception());
+                        throw;
+                    }
                     if (admitted.status != scheduling::AdmissionQueue::Status::admitted) {
                         std::lock_guard lock(state_->mutex);
                         if (admitted.status == scheduling::AdmissionQueue::Status::deadline_expired)
@@ -346,6 +365,8 @@ void TcpServer::handle_connection(Socket& connection) {
                     // journals all remain in this one serialized handler boundary.
                     response = tls_ ? authenticated_handler_(request, *stream->peer())
                                     : handler_(request);
+                    if (response.payload.size() > max_payload_size_)
+                        throw std::length_error("TCP handler response exceeds payload limit");
                 } catch (...) {
                     fail(std::current_exception());
                     throw;

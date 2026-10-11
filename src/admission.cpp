@@ -16,6 +16,7 @@ struct AdmissionQueue::State {
         Waiter* next{};
         std::uint64_t ticket{};
         bool linked{};
+        std::condition_variable ready;
     };
     explicit State(std::size_t capacity) { stats.capacity = capacity; }
     static void increment(std::uint64_t& value) noexcept {
@@ -50,6 +51,9 @@ struct AdmissionQueue::State {
         }
         return {status, {}, sequence};
     }
+    // Under mutex: a waiter owns its condition variable until unlink/return.
+    // Only the FIFO head can acquire; avoid waking every waiter on each turn.
+    void notify_head() noexcept { if (head) head->ready.notify_one(); }
     std::mutex mutex;
     std::condition_variable changed;
     Snapshot stats;
@@ -69,7 +73,11 @@ AdmissionQueue::Lease& AdmissionQueue::Lease::operator=(Lease&& other) noexcept 
 void AdmissionQueue::Lease::release() noexcept {
     auto state = std::move(state_);
     if (!state) return;
-    { std::lock_guard lock(state->mutex); state->stats.active = false; }
+    {
+        std::lock_guard lock(state->mutex);
+        state->stats.active = false;
+        state->notify_head();
+    }
     state->changed.notify_all();
 }
 
@@ -87,9 +95,9 @@ AdmissionQueue::Result AdmissionQueue::acquire(Clock::time_point deadline,
     // synchronously. Destruction must also occur after the lock is released.
     // Taking the mutex in the callback prevents a lost notify between checking
     // cancellation and atomically releasing the mutex in condition_variable.
-    std::stop_callback stopped(cancellation, [state] {
+    std::stop_callback stopped(cancellation, [state, &waiter] {
         std::lock_guard lock(state->mutex);
-        state->changed.notify_all();
+        waiter.ready.notify_one();
     });
     std::unique_lock lock(state->mutex);
     const auto rejection = [&]() -> std::optional<Status> {
@@ -112,6 +120,7 @@ AdmissionQueue::Result AdmissionQueue::acquire(Clock::time_point deadline,
         for (;;) {
             if (const auto status = rejection()) {
                 state->erase(waiter);
+                if (!state->stats.active) state->notify_head();
                 state->changed.notify_all();
                 return state->reject(*status, waiter.ticket);
             }
@@ -121,12 +130,13 @@ AdmissionQueue::Result AdmissionQueue::acquire(Clock::time_point deadline,
                 State::increment(state->stats.admitted);
                 return {Status::admitted, Lease(state), waiter.ticket};
             }
-            if (deadline == Clock::time_point::max()) state->changed.wait(lock);
-            else state->changed.wait_until(lock, deadline);
+            if (deadline == Clock::time_point::max()) waiter.ready.wait(lock);
+            else waiter.ready.wait_until(lock, deadline);
         }
     } catch (...) {
         // No stack waiter may remain linked after a condition-variable error.
         state->erase(waiter);
+        if (!state->stats.active) state->notify_head();
         state->changed.notify_all();
         throw;
     }
@@ -139,7 +149,12 @@ AdmissionQueue::Snapshot AdmissionQueue::snapshot() const {
 }
 void AdmissionQueue::shutdown() noexcept {
     const auto state = state_;
-    { std::lock_guard lock(state->mutex); state->closing = true; }
+    {
+        std::lock_guard lock(state->mutex);
+        state->closing = true;
+        for (auto* waiter = state->head; waiter; waiter = waiter->next)
+            waiter->ready.notify_one();
+    }
     state->changed.notify_all();
 }
 bool AdmissionQueue::wait_idle(Clock::time_point deadline) const {
