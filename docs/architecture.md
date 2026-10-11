@@ -5,9 +5,9 @@
 AtlasFS currently contains a dependency-free protocol library and a Linux/POSIX
 TCP transport library, plus a persistent `ObjectStore`. `TcpClient` encodes
 requests, sends complete frames, and uses `StreamParser` to receive responses.
-`TcpServer` listens only on loopback,
-accepts connections sequentially, parses arbitrary receive chunks, invokes a
-request handler, and reliably sends encoded responses. `StorageRequestHandler`
+`TcpServer` listens only on loopback, accepts into fixed connection-worker slots,
+parses arbitrary receive chunks in connection-owned parsers, admits handlers
+through one bounded FIFO, and reliably sends encoded responses. `StorageRequestHandler`
 decodes operation payloads and delegates filesystem work to `ObjectStore`. The
 wire-facing path remains single-node; replication is deliberately in-process.
 
@@ -141,18 +141,47 @@ bounded chunks rather than increasing frame sizes without limit.
 This keeps synchronization outside a low-level value parser and makes ownership
 clear.
 
-### Blocking sequential transport
+### Bounded transport I/O and serialized durable dispatch
 
-The server uses blocking POSIX sockets and handles one connection at a time. This
-is the smallest execution model that proves real TCP framing and lifecycle
-correctness. `recv()` output is passed directly to `StreamParser`; the transport
-does not duplicate framing logic. `send_all()` retries interrupted calls and
-continues after short writes. A move-only `Socket` closes its descriptor exactly
-once.
+Milestone 22 separates connection I/O from durable dispatch. The server starts
+four fixed workers by default (validated 1–16), each owning at most one socket,
+SSL stream, parser and request/response state. Accept assigns only an idle slot;
+there is no accepted-socket user-space queue or per-connection thread creation.
+The requested kernel listen backlog is the worker count (the OS may round it).
+Excess accepted connections close before authentication, without a synthetic
+response or retry. The default connection request limit is 1,000,000 (validated
+1–1,000,000); closure follows its last acknowledged request. Payload limits still
+bound each parser; one request and response can consume additional bounded copies.
+
+One `AdmissionQueue` admits complete requests into the entire handler, including
+peer-role/target authorization, epoch guard, storage maps, publication and journal
+updates. The queue capacity counts pending requests, not the one active handler;
+default four, validated 0–65,536, effectively at most workers minus one. Queue
+overflow or pre-execution deadline expiration closes that connection. Since the
+request may have been sent, clients conservatively retain existing unknown-outcome
+semantics rather than treating EOF as proof that no remote change occurred.
+Response I/O releases the handler lease first. Slow TLS handshakes, idle peers,
+partial frames and response writes can therefore occupy only their fixed slot.
+An absolute frame deadline includes read, queue wait and response write; it renews
+only after a complete response, not on partial input. TLS handshake/connect retain
+their existing absolute deadlines. Active filesystem work is not forcibly interrupted
+or rolled back at a deadline; filesystem stalls can extend shutdown completion.
+
+`DispatchConfig::serial` retains full-connection sequential ownership as a
+same-binary behavioral measurement reference. It is not byte-identical M21 source:
+diagnostics and connection limits also apply. No parallel durable storage handler,
+second catalog writer, new wire status or durable-format change is introduced.
+`StreamParser` still owns framing; a move-only `Socket` closes exactly once.
 
 The listening socket binds to `127.0.0.1`; port zero is supported and the chosen
 port is obtained with `getsockname()`. `stop()` shuts down the listener and any
-active connection so a test or owner can deterministically unblock the server.
+registered connections so a test or owner can unblock transport I/O. Pending
+admissions are cancelled; an executing handler finishes under its existing guard.
+The owner must stop and join the thread calling `serve()` before destruction.
+Descriptor unregister and close share the lifecycle lock used by shutdown, so a
+reused descriptor is never left visible to `stop()`. Fatal handler exceptions
+stop all connections, join workers, and are rethrown by `serve()`; expected TLS,
+protocol and socket failures remain connection-local.
 Malformed, oversized, and incomplete frames close only their connection. The
 server continues accepting later connections.
 
@@ -160,6 +189,34 @@ The default transport handler remains storage-free. For request message types it
 returns a `response` with the same request ID, flags, and payload. Receiving a
 response-type message where a request is expected produces an `error_response`.
 Storage servers instead install `StorageRequestHandler`.
+
+### Caller admission and authority ownership
+
+`scheduling::AdmissionQueue` is a caller-thread admission primitive, not a task
+executor. It grants one move-only lease in mutex-linearized enqueue FIFO order.
+The active owner cannot reacquire ahead of existing waiters. Intrusive waiter nodes
+live on blocked callers' stacks; capacity bounds queue state rather than allocating
+unbounded tasks. Zero capacity permits only an immediate idle acquisition. Stop
+tokens, absolute deadlines and shutdown unlink pending waiters without FIFO holes;
+leases may outlive the queue owner through shared state. Diagnostic counters and
+tickets saturate rather than wrap, and tickets are not durable execution IDs.
+
+The benchmark holds the lease around shared clients, placement, durable coordinator
+history and repair orchestration. Other API users must establish the same boundary;
+adding the primitive does not automatically make these existing APIs thread-safe.
+Acquire caller admission before the coordinator epoch/catalog authority guard.
+Never hold a storage target's local epoch guard across an RPC to that same target.
+Direct storage calls must be externally serialized with the owning server.
+
+Cancellation after grant never revokes an active lease or undoes remote I/O.
+Before handler execution the server checks confirmed socket disconnect after FIFO
+grant; raw EOF includes write-half-close, which this request/response service treats
+as cancellation. Buffered TLS close records are not definitive evidence, so this is
+best-effort detection, not a guarantee that every disconnected request is skipped.
+Once dispatched, disconnect/timeout may leave durable changes and remains unknown
+to the client. Explicit reconciliation reuses the exact execution ID/fingerprint;
+no scheduling path automatically retries, replans, changes catalog authority or
+rewrites operation history. See [Milestone 22](milestone-22.md) for measurements.
 
 ### Persistent chunked object store
 

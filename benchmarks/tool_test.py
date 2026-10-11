@@ -57,6 +57,47 @@ class BenchmarkTools(unittest.TestCase):
         self.check(value, "compare.py", (str(SOURCE.resolve()),))
         self.check(value, "compare.py", ("--allow-transport-change", str(SOURCE.resolve())), expected=0)
 
+    def test_admission_change_requires_explicit_comparison(self):
+        value = copy.deepcopy(REPORT)
+        value["admission_policy"] = "mutex" if REPORT.get("admission_policy", "mutex") == "fifo" else "fifo"
+        self.check(value, "compare.py", (str(SOURCE.resolve()),))
+        self.check(value, "compare.py", ("--allow-admission-change", str(SOURCE.resolve())), expected=0)
+
+    def test_dispatch_change_requires_explicit_comparison(self):
+        value = copy.deepcopy(REPORT)
+        value["dispatch_policy"] = "serial" if REPORT.get("dispatch_policy", "serial") == "bounded" else "bounded"
+        self.check(value, "compare.py", (str(SOURCE.resolve()),))
+        self.check(value, "compare.py", ("--allow-dispatch-change", str(SOURCE.resolve())), expected=0)
+
+    def test_explicit_policy_change_does_not_hide_capacity_change(self):
+        value = copy.deepcopy(REPORT)
+        value["admission_capacity"] = REPORT.get("admission_capacity", 16) + 1
+        self.check(value, "compare.py", ("--allow-admission-change", str(SOURCE.resolve())))
+
+    @unittest.skipUnless(REPORT.get("scheduling_schema") == 1, "pre-M22 report")
+    def test_admission_count_corruption_is_rejected(self):
+        value = copy.deepcopy(REPORT)
+        value["results"][0]["admission_overloads"] += 1
+        self.check(value)
+
+    @unittest.skipUnless(REPORT.get("scheduling_schema") == 1, "pre-M22 report")
+    def test_queue_capacity_violation_is_rejected(self):
+        value = copy.deepcopy(REPORT)
+        row = next(row for row in value["results"] if row["row_admission_policy"] == "fifo")
+        row["admission_queue_peak"] = row["admission_queue_capacity"] + 1
+        self.check(value)
+
+    @unittest.skipUnless(REPORT.get("scheduling_schema") == 1, "pre-M22 report")
+    def test_scheduling_metadata_is_required_when_marked(self):
+        value = copy.deepcopy(REPORT)
+        del value["admission_timeout_ms"]
+        self.check(value)
+
+    def test_machine_fingerprint_change_is_rejected(self):
+        value = copy.deepcopy(REPORT)
+        value.setdefault("environment", {})["machine_fingerprint"] = "different-machine"
+        self.check(value, "compare.py", (str(SOURCE.resolve()),))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(OpenSSL 3.0 REQUIRED)
+find_package(Threads REQUIRED)
+
+add_library(atlasfs_scheduling src/admission.cpp)
+add_library(AtlasFS::scheduling ALIAS atlasfs_scheduling)
+target_include_directories(atlasfs_scheduling PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_link_libraries(atlasfs_scheduling PUBLIC Threads::Threads)
+target_compile_options(atlasfs_scheduling PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(atlasfs_metrics src/metrics.cpp)
 target_include_directories(atlasfs_metrics PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
@@ -73,7 +80,7 @@ target_include_directories(atlasfs_net
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(atlasfs_net PUBLIC AtlasFS::protocol atlasfs_metrics OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(atlasfs_net PUBLIC AtlasFS::protocol AtlasFS::scheduling atlasfs_metrics OpenSSL::SSL OpenSSL::Crypto)
 
 target_include_directories(atlasfs_storage
     PUBLIC
@@ -186,6 +193,9 @@ if(BUILD_TESTING)
     add_executable(atlasfs_metrics_tests tests/metrics_test.cpp)
     target_link_libraries(atlasfs_metrics_tests PRIVATE AtlasFS::replication GTest::gtest_main Threads::Threads)
     target_compile_options(atlasfs_metrics_tests PRIVATE -Wall -Wextra -Wpedantic)
+    add_executable(atlasfs_scheduling_tests tests/admission_test.cpp tests/dispatch_test.cpp tests/scheduling_integration_test.cpp)
+    target_link_libraries(atlasfs_scheduling_tests PRIVATE AtlasFS::replication GTest::gtest_main Threads::Threads)
+    target_compile_options(atlasfs_scheduling_tests PRIVATE -Wall -Wextra -Wpedantic)
     add_executable(atlasfs_tcp_transport_tests tests/tcp_transport_test.cpp)
     target_link_libraries(atlasfs_tcp_transport_tests
         PRIVATE AtlasFS::net GTest::gtest_main Threads::Threads)
@@ -241,6 +251,7 @@ if(BUILD_TESTING)
     gtest_discover_tests(atlasfs_epoch_tests)
     gtest_discover_tests(atlasfs_stress_tests)
     gtest_discover_tests(atlasfs_metrics_tests)
+    gtest_discover_tests(atlasfs_scheduling_tests)
     gtest_discover_tests(atlasfs_storage_tests)
     gtest_discover_tests(atlasfs_storage_integration_tests)
     gtest_discover_tests(atlasfs_metadata_tests)

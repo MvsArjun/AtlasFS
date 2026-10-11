@@ -1,5 +1,6 @@
 #include "scenario.hpp"
 #include "atlasfs/socket.hpp"
+#include "atlasfs/admission.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -9,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <sys/resource.h>
 #include <sys/utsname.h>
@@ -26,7 +28,9 @@ struct Config {
     bool nodelay{true};
     std::uint32_t chunk{16384}, replicas{2}, nodes{4}, workers{1};
     std::uint64_t seed{42};
-    std::string suite{"all"}, output, label;
+    std::size_t admission_capacity{16}, admission_timeout_ms{5000};
+    net::DispatchConfig dispatch;
+    std::string admission{"fifo"}, suite{"all"}, output, label;
 };
 std::string quote(std::string_view value) {
     std::string result{"\""};
@@ -48,7 +52,9 @@ Config parse(int argc, char** argv) {
         const std::string key = argv[n];
         if (key == "--help") {
             std::cout << "--iterations N --objects N --bytes N --chunk N --replicas N --nodes N --workers N --seed N\n"
-                         "--suite all|local|distributed|fault|startup --warmup N --metrics on|off --tcp-nodelay on|off --output file.json --label environment-label\n";
+                         "--suite all|local|distributed|fault|startup|dispatch --warmup N --metrics on|off --tcp-nodelay on|off\n"
+                         "--admission mutex|fifo --admission-capacity N --admission-timeout-ms N\n"
+                         "--dispatch serial|bounded --dispatch-workers N --dispatch-capacity N --connection-requests N --output file.json --label environment-label\n";
             std::exit(0);
         }
         if (n + 1 >= argc) throw std::invalid_argument("option requires a value");
@@ -56,6 +62,8 @@ Config parse(int argc, char** argv) {
         if (key == "--output") c.output = value;
         else if (key == "--label") c.label = value;
         else if (key == "--suite") c.suite = value;
+        else if (key == "--admission") { if (value != "mutex" && value != "fifo") throw std::invalid_argument("admission must be mutex or fifo"); c.admission = value; }
+        else if (key == "--dispatch") { if (value != "serial" && value != "bounded") throw std::invalid_argument("dispatch must be serial or bounded"); c.dispatch.serial = value == "serial"; }
         else if (key == "--metrics") { if (value != "on" && value != "off") throw std::invalid_argument("metrics must be on or off"); c.instrumentation = value == "on"; }
         else if (key == "--tcp-nodelay") { if (value != "on" && value != "off") throw std::invalid_argument("tcp-nodelay must be on or off"); c.nodelay = value == "on"; }
         else if (key == "--seed") c.seed = number(value);
@@ -70,13 +78,23 @@ Config parse(int argc, char** argv) {
             else if (key == "--replicas") c.replicas = static_cast<std::uint32_t>(v);
             else if (key == "--nodes") c.nodes = static_cast<std::uint32_t>(v);
             else if (key == "--workers") c.workers = static_cast<std::uint32_t>(v);
+            else if (key == "--admission-capacity") c.admission_capacity = v;
+            else if (key == "--admission-timeout-ms") c.admission_timeout_ms = v;
+            else if (key == "--dispatch-workers") c.dispatch.workers = v;
+            else if (key == "--dispatch-capacity") c.dispatch.request_queue_capacity = v;
+            else if (key == "--connection-requests") c.dispatch.max_requests_per_connection = v;
             else throw std::invalid_argument("unknown option");
         }
     }
+    if (!c.dispatch.serial && c.dispatch.workers < 2 && c.suite != "local")
+        throw std::invalid_argument("non-local bounded benchmark suites require at least two dispatch workers; use serial for the one-slot reference");
     if (!c.iterations || c.iterations > 10000 || !c.objects || c.objects > 10000 || c.warmup > 1000 ||
         !c.bytes || !c.chunk || !c.nodes || c.nodes > 16 || !c.replicas || c.replicas > c.nodes ||
         !c.workers || c.workers > 16 || (c.bytes + c.chunk - 1) / c.chunk > storage::kMaxChunkCount ||
-        (c.suite != "all" && c.suite != "local" && c.suite != "distributed" && c.suite != "fault" && c.suite != "startup"))
+        c.admission_capacity > 65536 || !c.admission_timeout_ms || c.admission_timeout_ms > 60000 ||
+        !c.dispatch.workers || c.dispatch.workers > 16 || c.dispatch.request_queue_capacity > 65536 ||
+        !c.dispatch.max_requests_per_connection || c.dispatch.max_requests_per_connection > 1000000 ||
+        (c.suite != "all" && c.suite != "local" && c.suite != "distributed" && c.suite != "fault" && c.suite != "startup" && c.suite != "dispatch"))
         throw std::invalid_argument("unsupported workload bounds");
     return c;
 }
@@ -105,7 +123,11 @@ std::uint64_t disk_bytes(const std::filesystem::path& root, bool temporary = fal
     }
     return result;
 }
-struct Outcome { std::uint64_t bytes{}; bool rejected{}, unknown{}, timeout{}; double recovery_ms{-1}, queue_ms{-1}; };
+struct Outcome {
+    std::uint64_t bytes{}; bool rejected{}, unknown{}, timeout{}; double recovery_ms{-1}, queue_ms{-1};
+    bool executed{true}, admission_attempted{}, overloaded{}, cancelled{}, deadline_expired{}, shutdown_rejected{};
+    double independent_connection_ms{-1};
+};
 struct Metric {
     metrics::Snapshot counters;
     std::map<std::string, std::uint64_t> process_io;
@@ -114,11 +136,16 @@ struct Metric {
     std::size_t retained_objects{}, retained_chunks{}, retained_journals{}, retained_plans{}, retained_catalog_entries{};
     std::string name;
     std::size_t operations{}, errors{}, rejected{}, unknown{}, timeouts{};
+    std::size_t executed{}, successful{}, admission_attempts{}, admitted{}, overloaded{}, cancelled{}, deadline_expired{}, shutdown_rejected{};
+    std::size_t admission_capacity{}, admission_peak_waiting{};
+    std::string admission_policy{"none"};
+    std::optional<net::DispatchSnapshot> dispatch_snapshot;
     std::uint64_t bytes{}, disk{}, temporary{};
     std::size_t object_bytes{}; std::uint32_t chunks{}, nodes{}, replicas{}, workers{};
     double wall{}, cpu{};
     std::vector<double> latencies;
     std::vector<double> recovery_latencies;
+    std::vector<double> independent_latencies;
     std::string failure;
     double percentile(double p) const {
         auto values = latencies; std::sort(values.begin(), values.end());
@@ -132,6 +159,29 @@ public:
     const std::string started_utc{utc_time()};
     std::shared_ptr<metrics::Collector> observer{std::make_shared<metrics::Collector>()};
     std::vector<Metric> results;
+    template<class F> Outcome admitted_operation(std::mutex& legacy, scheduling::AdmissionQueue& queue, F operation) {
+        const auto submitted = Clock::now();
+        std::unique_lock lock(legacy, std::defer_lock);
+        scheduling::AdmissionQueue::Result acquired;
+        {
+            metrics::Timer timing(metrics::Counter::queue_calls, metrics::Counter::queue_ns);
+            if (config.admission == "mutex") lock.lock();
+            else acquired = queue.acquire(submitted + std::chrono::milliseconds(config.admission_timeout_ms));
+        }
+        const auto waited = std::chrono::duration<double, std::milli>(Clock::now() - submitted).count();
+        if (config.admission == "fifo" && acquired.status != scheduling::AdmissionQueue::Status::admitted) {
+            Outcome outcome; outcome.executed = false; outcome.rejected = true;
+            outcome.admission_attempted = true; outcome.queue_ms = waited;
+            outcome.overloaded = acquired.status == scheduling::AdmissionQueue::Status::overloaded;
+            outcome.cancelled = acquired.status == scheduling::AdmissionQueue::Status::cancelled;
+            outcome.deadline_expired = acquired.status == scheduling::AdmissionQueue::Status::deadline_expired;
+            outcome.shutdown_rejected = acquired.status == scheduling::AdmissionQueue::Status::shutdown;
+            outcome.timeout = outcome.deadline_expired;
+            return outcome;
+        }
+        auto outcome = operation(); outcome.queue_ms = waited; outcome.admission_attempted = true;
+        return outcome;
+    }
     template<class F> void measure(std::string name, std::size_t count, std::size_t bytes,
         std::uint32_t nodes, std::uint32_t replicas, const std::filesystem::path& root, F operation,
         std::uint32_t workers = 1) {
@@ -157,8 +207,14 @@ public:
                 std::lock_guard lock(metrics_mutex);
                 ++m.operations; m.latencies.push_back(latency); m.bytes += outcome.bytes;
                 m.rejected += outcome.rejected; m.unknown += outcome.unknown; m.timeouts += outcome.timeout;
+                m.executed += outcome.executed; m.admission_attempts += outcome.admission_attempted;
+                m.admitted += outcome.admission_attempted && outcome.executed;
+                m.overloaded += outcome.overloaded; m.cancelled += outcome.cancelled;
+                m.deadline_expired += outcome.deadline_expired; m.shutdown_rejected += outcome.shutdown_rejected;
+                m.successful += failure.empty() && outcome.executed && !outcome.rejected && !outcome.unknown && !outcome.timeout;
                 if (outcome.recovery_ms >= 0) m.recovery_latencies.push_back(outcome.recovery_ms);
                 if (outcome.queue_ms >= 0) m.queue_latencies.push_back(outcome.queue_ms);
+                if (outcome.independent_connection_ms >= 0) m.independent_latencies.push_back(outcome.independent_connection_ms);
                 if (!failure.empty()) { ++m.errors; if (m.failure.empty()) m.failure = "iteration=" + std::to_string(n) + " " + failure; }
             }
         };
@@ -215,7 +271,7 @@ public:
         });
     }
     void distributed() {
-        bench::Cluster cluster(config.nodes, config.chunk, config.nodelay);
+        bench::Cluster cluster(config.nodes, config.chunk, config.nodelay, config.dispatch);
         const auto data = bench::payload(config.bytes, config.seed);
         metadata::MetadataCoordinator placement(std::make_unique<metadata::RendezvousPlacement>(), config.replicas);
         for (const auto& node : cluster.nodes) bench::require(placement.register_node(bench::member(node.id)) == metadata::CoordinatorError::none, "register");
@@ -232,34 +288,51 @@ public:
             return Outcome{config.bytes};
         });
         std::mutex coordinator_queue;
+        scheduling::AdmissionQueue read_admission(config.admission_capacity);
         measure("replicated_read_serialized_queue", config.iterations, config.bytes, config.nodes, config.replicas, cluster.root(), [&](auto n) {
-            const auto submitted = Clock::now();
-            std::unique_lock lock(coordinator_queue, std::defer_lock);
-            { metrics::Timer queue(metrics::Counter::queue_calls, metrics::Counter::queue_ns); lock.lock(); }
-            const auto queue_ms = std::chrono::duration<double, std::milli>(Clock::now() - submitted).count();
-            const auto result = manager->get(plans[(n * 2654435761ULL + config.seed) % plans.size()]);
-            bench::require(result.status == replication::ReplicationStatus::success && result.data == data, "replicated read");
-            return Outcome{config.bytes, false, false, false, -1, queue_ms};
+            return admitted_operation(coordinator_queue, read_admission, [&] {
+                const auto result = manager->get(plans[(n * 2654435761ULL + config.seed) % plans.size()]);
+                bench::require(result.status == replication::ReplicationStatus::success && result.data == data, "replicated read");
+                return Outcome{config.bytes};
+            });
         }, config.workers);
+        results.back().admission_capacity = config.admission_capacity;
+        results.back().admission_peak_waiting = read_admission.snapshot().peak_waiting;
+        results.back().admission_policy = config.admission;
+        scheduling::AdmissionQueue mixed_admission(config.admission_capacity);
         measure("replicated_mixed_serialized_queue", config.iterations, config.bytes, config.nodes, config.replicas, cluster.root(), [&](auto n) {
-            const auto submitted = Clock::now();
-            std::unique_lock lock(coordinator_queue, std::defer_lock);
-            { metrics::Timer queue(metrics::Counter::queue_calls, metrics::Counter::queue_ns); lock.lock(); }
-            const auto queue_ms = std::chrono::duration<double, std::milli>(Clock::now() - submitted).count();
-            auto& plan = plans[(n * 2654435761ULL + config.seed) % plans.size()];
-            auto guard = cluster.authority->authorize(cluster.token);
-            if (n % 4 == 0) {
-                const auto value = bench::manifest(data, config.chunk, "mixed-gen-" + std::to_string(n));
-                const auto changed = placement.place_object({plan.object_id, value});
-                bench::require(changed.plan.has_value(), "mixed placement");
-                bench::require(manager->put(*changed.plan, data).status == replication::ReplicationStatus::success, "mixed replicated write");
-                plan = *changed.plan;
-            } else {
-                const auto result = manager->get(plan);
-                bench::require(result.status == replication::ReplicationStatus::success && result.data == data, "mixed replicated read");
-            }
-            return Outcome{config.bytes, false, false, false, -1, queue_ms};
+            return admitted_operation(coordinator_queue, mixed_admission, [&] {
+                auto& plan = plans[(n * 2654435761ULL + config.seed) % plans.size()];
+                auto guard = cluster.authority->authorize(cluster.token);
+                if (n % 4 == 0) {
+                    const auto value = bench::manifest(data, config.chunk, "mixed-gen-" + std::to_string(n));
+                    const auto changed = placement.place_object({plan.object_id, value});
+                    bench::require(changed.plan.has_value(), "mixed placement");
+                    bench::require(manager->put(*changed.plan, data).status == replication::ReplicationStatus::success, "mixed replicated write");
+                    plan = *changed.plan;
+                } else {
+                    const auto result = manager->get(plan);
+                    bench::require(result.status == replication::ReplicationStatus::success && result.data == data, "mixed replicated read");
+                }
+                return Outcome{config.bytes};
+            });
         }, config.workers);
+        results.back().admission_capacity = config.admission_capacity;
+        results.back().admission_peak_waiting = mixed_admission.snapshot().peak_waiting;
+        results.back().admission_policy = config.admission;
+        // Deterministic offered-load rejection: one active lease, no waiting
+        // capacity. No RPC can be sent; this is not successful-work throughput.
+        scheduling::AdmissionQueue overload(0);
+        auto held = overload.acquire(); bench::require(static_cast<bool>(held.lease), "overload probe active lease");
+        measure("bounded_admission_capacity_zero_overload", config.iterations, 0, 0, 0, cluster.root(), [&](auto) {
+            const auto start = Clock::now();
+            const auto rejected = overload.acquire(start + std::chrono::milliseconds(config.admission_timeout_ms));
+            bench::require(rejected.status == scheduling::AdmissionQueue::Status::overloaded, "capacity zero admission accepted a waiter");
+            Outcome outcome; outcome.executed = false; outcome.rejected = true;
+            outcome.admission_attempted = true; outcome.overloaded = true;
+            outcome.queue_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count(); return outcome;
+        }, config.workers);
+        results.back().admission_policy = "fifo";
         // Close the single active session before measuring new connection setup.
         manager.reset();
         cluster.nodes[0].client.reset();
@@ -281,7 +354,7 @@ public:
         });
     }
     void repair(bool recover, repair::RepairExecutionFaultPoint point) {
-        bench::Cluster cluster(1, config.chunk, config.nodelay);
+        bench::Cluster cluster(1, config.chunk, config.nodelay, config.dispatch);
         auto source = std::make_shared<replication::LocalStorageNode>("a", cluster.root() / "source",
             object_protocol::kMaxObjectDataSize, config.chunk);
         const auto data = bench::payload(std::min<std::size_t>(config.bytes, config.chunk), config.seed);
@@ -302,8 +375,11 @@ public:
         const auto historical = metadata::make_coordinator_operation(pending.front().first, "history", 7);
         bench::require(history.create(historical) == metadata::CoordinatorRecordError::none, "history seed");
         const auto before = metadata::encode_coordinator_operation(*history.get("history"));
+        std::mutex repair_mutex;
+        scheduling::AdmissionQueue repair_admission(config.admission_capacity);
         measure(recover ? "repair_restart_reconcile_window_" + std::to_string(static_cast<int>(point)) : "remote_repair_verify_catalog_cas",
             std::min(config.iterations, config.objects), data.size(), 2, 2, cluster.root(), [&](auto n) {
+                return admitted_operation(repair_mutex, repair_admission, [&] {
                 // Distinct objects are needed because repair journals cannot be silently recycled.
                 auto& item = pending[n];
                 const auto planned = repair::RepairPlanner{}.plan(item.first, members, catalog->snapshot());
@@ -334,10 +410,15 @@ public:
                 bench::require(executed.state == repair::RepairPlanState::completed, "repair completion");
                 bench::require(metadata::encode_coordinator_operation(*history.get("history")) == before, "history changed");
                 return Outcome{data.size()};
+                });
             });
+        results.back().admission_capacity = config.admission_capacity;
+        results.back().admission_peak_waiting = repair_admission.snapshot().peak_waiting;
+        results.back().admission_policy = config.admission;
     }
     void faults();
     void startup();
+    void dispatch();
     std::string json() const {
         utsname system{}; ::uname(&system); rusage usage{}; ::getrusage(RUSAGE_SELF, &usage);
         std::ostringstream out; out << std::setprecision(10);
@@ -348,6 +429,13 @@ public:
             << ",\"suite\":" << quote(config.suite) << ",\"label\":" << quote(config.label)
             << ",\"warmup_per_workload\":" << config.warmup << ",\"instrumentation\":" << (config.instrumentation ? "true" : "false")
             << ",\"tcp_nodelay\":" << (config.nodelay ? "true" : "false")
+            << ",\"scheduling_schema\":1"
+            << ",\"admission_policy\":" << quote(config.admission) << ",\"admission_capacity\":" << config.admission_capacity
+            << ",\"admission_timeout_ms\":" << config.admission_timeout_ms
+            << ",\"dispatch_policy\":" << quote(config.dispatch.serial ? "serial" : "bounded")
+            << ",\"dispatch_workers\":" << config.dispatch.workers << ",\"dispatch_capacity\":" << config.dispatch.request_queue_capacity
+            << ",\"connection_request_limit\":" << config.dispatch.max_requests_per_connection
+            << ",\"dispatch_probe_server_timeout_ms\":200,\"dispatch_probe_client_timeout_ms\":1000"
             << ",\"compiler\":" << quote(__VERSION__) << ",\"openssl\":" << quote(OpenSSL_version(OPENSSL_VERSION))
             << ",\"build_type\":" << quote(ATLASFS_BENCH_BUILD_TYPE) << ",\"source_commit\":" << quote(ATLASFS_BENCH_COMMIT)
             << ",\"checksum_source_sha256\":" << quote(ATLASFS_BENCH_CHECKSUM_HASH)
@@ -368,6 +456,15 @@ public:
                 << ",\"expected_rejections\":" << m.rejected << ",\"unknown_outcomes\":" << m.unknown << ",\"timeouts\":" << m.timeouts
                 << ",\"error_rate\":" << static_cast<double>(m.errors) / m.operations
                 << ",\"timeout_rate\":" << static_cast<double>(m.timeouts) / m.operations
+                << ",\"executed_operations\":" << m.executed << ",\"successful_operations\":" << m.successful
+                << ",\"successful_operations_per_second\":" << m.successful / m.wall
+                << ",\"admission_attempts\":" << m.admission_attempts << ",\"admitted_operations\":" << m.admitted
+                << ",\"admission_overloads\":" << m.overloaded << ",\"admission_cancelled\":" << m.cancelled
+                << ",\"admission_deadline_expired\":" << m.deadline_expired << ",\"admission_shutdown_rejected\":" << m.shutdown_rejected
+                << ",\"admission_overload_rate\":" << static_cast<double>(m.overloaded) / m.operations
+                << ",\"row_admission_policy\":" << quote(m.admission_policy)
+                << ",\"admission_queue_capacity\":" << (m.admission_policy == "fifo" ? std::to_string(m.admission_capacity) : "null")
+                << ",\"admission_queue_peak\":" << (m.admission_policy == "fifo" ? std::to_string(m.admission_peak_waiting) : "null")
                 << ",\"object_bytes\":" << m.object_bytes << ",\"chunks\":" << m.chunks << ",\"nodes\":" << m.nodes
                 << ",\"replicas\":" << m.replicas << ",\"workers\":" << m.workers << ",\"elapsed_seconds\":" << m.wall
                 << ",\"operations_per_second\":" << m.operations / m.wall << ",\"logical_bytes_per_second\":" << m.bytes / m.wall
@@ -415,11 +512,86 @@ public:
                 else { auto values = m.recovery_latencies; std::sort(values.begin(), values.end());
                     out << values[static_cast<std::size_t>(std::ceil(static_cast<double>(p) / 100 * values.size())) - 1]; }
             }
+            out << ",\"independent_connection_samples\":" << m.independent_latencies.size();
+            for (const auto p : {50, 95, 99}) {
+                out << ",\"independent_connection_p" << p << "_ms\":";
+                if (m.independent_latencies.empty()) out << "null";
+                else { auto values = m.independent_latencies; std::sort(values.begin(), values.end());
+                    out << values[static_cast<std::size_t>(std::ceil(static_cast<double>(p) / 100 * values.size())) - 1]; }
+            }
+            out << ",\"dispatch_snapshot\":";
+            if (!m.dispatch_snapshot) out << "null";
+            else {
+                const auto& state = *m.dispatch_snapshot;
+                out << "{\"includes_warmup\":true,\"accepted\":" << state.accepted << ",\"rejected\":" << state.rejected
+                    << ",\"active\":" << state.active << ",\"peak_active\":" << state.peak_active << ",\"requests\":" << state.requests
+                    << ",\"request_limit_closes\":" << state.request_limit_closes << ",\"admission_rejected\":" << state.admission_rejected
+                    << ",\"admission_expired\":" << state.admission_expired << ",\"disconnect_cancellations\":" << state.disconnect_cancellations
+                    << ",\"request_waiting\":" << state.request_waiting << ",\"peak_request_waiting\":" << state.peak_request_waiting << '}';
+            }
             out << ",\"first_failure\":" << quote(m.failure) << '}';
         }
         return out.str() + "\n]}\n";
     }
 };
+void Harness::dispatch() {
+    test::Certificates temporary;
+    auto server_config = temporary.config({"dispatch", net::PeerRole::storage});
+    auto client_config = temporary.config({"coordinator", net::PeerRole::coordinator});
+    server_config.timeout = std::chrono::milliseconds(200);
+    client_config.timeout = std::chrono::milliseconds(1000);
+    server_config.tcp_nodelay = client_config.tcp_nodelay = config.nodelay;
+    test::Certificates::allow(server_config, client_config.local_identity, {"dispatch"});
+    test::Certificates::allow(client_config, server_config.local_identity, {"dispatch"});
+    for (const bool partial : {false, true}) {
+        // Dispatch-only authenticated query echo. This does not mutate storage,
+        // perform a catalog transition, or claim to measure authority parallelism.
+        net::TcpServer server(server_config, 0, [](const auto& request, const auto& peer) {
+            if (request.type != protocol::MessageType::epoch_query_request ||
+                !net::authorize_storage(peer, "dispatch", request.type))
+                return protocol::Message{protocol::MessageType::error_response, 0, request.request_id, {}};
+            return protocol::Message{protocol::MessageType::epoch_query_response, 0, request.request_id, request.payload};
+        }, protocol::kDefaultMaxPayloadSize, config.dispatch);
+        std::exception_ptr failure;
+        std::thread serving([&server, &failure, owner = metrics::current_owner()] {
+            metrics::Scope scope(owner);
+            try { server.serve(); } catch (...) { failure = std::current_exception(); }
+        });
+        auto stop = [&] { server.stop(); if (serving.joinable()) serving.join(); };
+        try {
+            measure(partial ? "tls_independent_connection_partial_frame_hol" : "tls_independent_connection_idle_hol",
+                config.iterations, 0, 1, 0, temporary.root(), [&](auto n) {
+                    // The first handshake completes before submitting connection
+                    // two, proving that connection one owns a real server slot.
+                    auto holder = net::connect_loopback(server.port(), client_config.timeout);
+                    if (config.nodelay) net::set_tcp_nodelay(holder.get(), true);
+                    net::TlsContext context(client_config);
+                    auto stream = context.connect(holder.get(), server_config.local_identity);
+                    const protocol::Message request{protocol::MessageType::epoch_query_request, 0, n + 1,
+                        {std::byte{0}, std::byte{3}, std::byte{0}, std::byte{0}}};
+                    if (partial) {
+                        const auto frame = protocol::encode(request);
+                        stream->write_all(std::span<const std::byte>(frame).first(7), Clock::now() + client_config.timeout);
+                    }
+                    const auto submitted = Clock::now();
+                    net::TcpClient independent(server.port(), client_config, server_config.local_identity);
+                    const auto response = independent.request(request);
+                    bench::require(response.type == protocol::MessageType::epoch_query_response && response.payload == request.payload,
+                        "independent authenticated dispatch response");
+                    const auto latency = std::chrono::duration<double, std::milli>(Clock::now() - submitted).count();
+                    independent.close(); stream.reset(); holder.reset();
+                    // Reuse an empty fixture, not sockets still retiring from a
+                    // prior operation. This is a cleanup bound, not a speed gate.
+                    const auto cleanup = Clock::now() + client_config.timeout;
+                    while (server.snapshot().active != 0 && Clock::now() < cleanup) std::this_thread::yield();
+                    bench::require(server.snapshot().active == 0, "dispatch connection cleanup exceeded client deadline");
+                    Outcome outcome; outcome.independent_connection_ms = latency; return outcome;
+                });
+            stop(); results.back().dispatch_snapshot = server.snapshot();
+            if (failure) std::rethrow_exception(failure);
+        } catch (...) { stop(); throw; }
+    }
+}
 class Partition final : public epoch::Participant {
 public:
     explicit Partition(std::shared_ptr<replication::RemoteStorageNodeClient> client) : client(std::move(client)) {}
@@ -434,7 +606,7 @@ public:
 void Harness::startup() {
     bench::require(config.objects * ((config.bytes + config.chunk - 1) / config.chunk) <= 65536,
                    "startup retained chunk/plan count exceeds accounting bound");
-    bench::Cluster cluster(1, config.chunk, config.nodelay);
+    bench::Cluster cluster(1, config.chunk, config.nodelay, config.dispatch);
     auto source = std::make_shared<replication::LocalStorageNode>("a", cluster.root() / "retained",
         object_protocol::kMaxObjectDataSize, config.chunk);
     const auto data = bench::payload(config.bytes, config.seed);
@@ -484,7 +656,7 @@ void Harness::faults() {
                        repair::RepairExecutionFaultPoint::after_publication_persist,
                        repair::RepairExecutionFaultPoint::after_catalog_commit}) repair(true, point);
     {
-        bench::Cluster cluster(1, config.chunk, config.nodelay);
+        bench::Cluster cluster(1, config.chunk, config.nodelay, config.dispatch);
         const auto data = bench::payload(std::min<std::size_t>(config.bytes, config.chunk), config.seed);
         measure("lost_repair_response_restart_exact_replay", config.iterations, data.size(), 1, 1, cluster.root(), [&](auto n) {
             cluster.restart(0, config.chunk, true);
@@ -501,7 +673,7 @@ void Harness::faults() {
         });
     }
     {
-        bench::Cluster cluster(1, config.chunk, config.nodelay);
+        bench::Cluster cluster(1, config.chunk, config.nodelay, config.dispatch);
         const auto data = bench::payload(std::min<std::size_t>(config.bytes, config.chunk), config.seed);
         measure("repair_transport_outage_exact_explicit_replay", config.iterations, data.size(), 1, 1, cluster.root(), [&](auto n) {
             const auto value = bench::manifest(data, config.chunk, "outage-gen-" + std::to_string(n));
@@ -520,7 +692,7 @@ void Harness::faults() {
         });
     }
     {
-        bench::Cluster cluster(2, config.chunk, config.nodelay);
+        bench::Cluster cluster(2, config.chunk, config.nodelay, config.dispatch);
         const auto data = bench::payload(config.bytes, config.seed);
         const auto plan = bench::placement("restart-object", bench::manifest(data, config.chunk, "restart-generation"), {"node-0", "node-1"});
         { replication::ReplicaManager manager(cluster.clients());
@@ -562,6 +734,7 @@ int main(int argc, char** argv) {
         if (harness.config.suite == "all" || harness.config.suite == "distributed") harness.distributed();
         if (harness.config.suite == "all" || harness.config.suite == "fault") harness.faults();
         if (harness.config.suite == "all" || harness.config.suite == "startup") harness.startup();
+        if (harness.config.suite == "all" || harness.config.suite == "dispatch") harness.dispatch();
         const auto json = harness.json();
         if (harness.config.output.empty()) std::cout << json;
         else { std::ofstream output(harness.config.output); output << json; output.close();

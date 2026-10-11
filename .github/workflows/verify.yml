@@ -58,9 +58,12 @@ jobs:
       - name: Repeat epoch activation and recovery integration tests
         if: matrix.mode == 'normal'
         run: ctest --test-dir build -R 'EpochActivation|EpochRpc|EpochRepair|EpochCatalog' --repeat until-fail:10 --output-on-failure --timeout 60
+      - name: Repeat bounded admission, dispatch and durable scheduling regressions
+        if: matrix.mode == 'normal'
+        run: ctest --test-dir build -R 'AdmissionQueue|Dispatch|SchedulingIntegration' --repeat until-fail:10 --output-on-failure --timeout 60
       - name: Production-only build
         if: matrix.mode == 'normal'
-        run: cmake -S . -B build-production -G Ninja -DBUILD_TESTING=OFF -DCMAKE_CXX_COMPILER=g++-13 && cmake --build build-production --parallel 4
+        run: cmake -S . -B build-production -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DATLASFS_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER=g++-13 && cmake --build build-production --parallel 4
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4

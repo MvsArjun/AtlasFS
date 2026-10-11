@@ -46,6 +46,13 @@ for path in args.files:
     assert data["schema"] in (1, 2) and data["results"], path
     if data["schema"] == 2:
         schema_check(data, schema, path)
+    scheduling = data.get("scheduling_schema") == 1
+    if scheduling:
+        required = ("admission_policy", "admission_capacity", "admission_timeout_ms", "dispatch_policy", "dispatch_workers",
+                    "dispatch_capacity", "connection_request_limit", "dispatch_probe_server_timeout_ms", "dispatch_probe_client_timeout_ms")
+        assert all(field in data for field in required), (path, "scheduling metadata")
+        assert data["admission_capacity"] <= 65536 and data["admission_timeout_ms"] <= 60000, (path, "admission bounds")
+        assert data["dispatch_workers"] <= 16 and data["dispatch_capacity"] <= 65536 and data["connection_request_limit"] <= 1000000, (path, "dispatch bounds")
     names = set()
     for row in data["results"]:
         name = row["workload"]
@@ -77,4 +84,32 @@ for path in args.files:
                 samples = row[prefix + "_samples"]
                 values = [row[f"{prefix}_p{p}_ms"] for p in (50, 95, 99)]
                 assert (samples == 0 and values == [None] * 3) or (0 < samples <= row["operations"] and 0 <= values[0] <= values[1] <= values[2]), (path, name, prefix)
+        if scheduling:
+            required = ("executed_operations", "successful_operations", "successful_operations_per_second", "admission_attempts",
+                        "admitted_operations", "admission_overloads", "admission_cancelled", "admission_deadline_expired",
+                        "admission_shutdown_rejected", "admission_overload_rate", "row_admission_policy", "admission_queue_capacity",
+                        "admission_queue_peak", "independent_connection_samples", "independent_connection_p50_ms",
+                        "independent_connection_p95_ms", "independent_connection_p99_ms", "dispatch_snapshot")
+            assert all(field in row for field in required), (path, name, "scheduling result fields")
+            rejected = sum(row[field] for field in ("admission_overloads", "admission_cancelled", "admission_deadline_expired", "admission_shutdown_rejected"))
+            assert row["admission_attempts"] == row["admitted_operations"] + rejected, (path, name, "admission partition")
+            assert 0 <= row["admitted_operations"] <= row["executed_operations"] == row["operations"] - rejected, (path, name, "execution count")
+            assert 0 <= row["successful_operations"] <= row["executed_operations"], (path, name, "successful count")
+            assert row["expected_rejections"] >= rejected and row["timeouts"] >= row["admission_deadline_expired"], (path, name, "rejection counts")
+            assert row["queue_samples"] == row["admission_attempts"], (path, name, "admission latency samples")
+            assert math.isclose(row["successful_operations_per_second"], row["successful_operations"] / row["elapsed_seconds"], rel_tol=1e-8, abs_tol=1e-8), (path, name, "successful rate")
+            assert math.isclose(row["admission_overload_rate"], row["admission_overloads"] / row["operations"], rel_tol=1e-8, abs_tol=1e-8), (path, name, "overload rate")
+            if row["row_admission_policy"] == "fifo":
+                assert row["admission_attempts"] and 0 <= row["admission_queue_peak"] <= row["admission_queue_capacity"] <= 65536, (path, name, "queue bound")
+            else:
+                assert row["admission_queue_capacity"] is None and row["admission_queue_peak"] is None, (path, name, "reference queue accounting")
+                assert row["row_admission_policy"] != "none" or row["admission_attempts"] == 0, (path, name, "no admission")
+            samples = row["independent_connection_samples"]
+            values = [row[f"independent_connection_p{p}_ms"] for p in (50, 95, 99)]
+            assert (samples == 0 and values == [None] * 3) or (0 < samples <= row["operations"] and 0 <= values[0] <= values[1] <= values[2]), (path, name, "independent connection")
+            dispatch = row["dispatch_snapshot"]
+            if dispatch is not None:
+                limit = 1 if data["dispatch_policy"] == "serial" else data["dispatch_workers"]
+                assert dispatch["active"] == 0 and dispatch["peak_active"] <= limit, (path, name, "connection bound")
+                assert dispatch["request_waiting"] == 0 and dispatch["peak_request_waiting"] <= data["dispatch_capacity"], (path, name, "request queue bound")
     print(f'{path}: {len(names)} workloads, {sum(r["operations"] for r in data["results"])} operations, valid')

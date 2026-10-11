@@ -305,12 +305,13 @@ RepairPublishResult RemoteStorageNodeClient::publish_repair(
 
 StorageNodeServer::StorageNodeServer(std::shared_ptr<StorageNode> node,
     std::filesystem::path journal_root, std::uint16_t port,
-    bool drop_commit_response_once, bool drop_repair_response_once)
+    bool drop_commit_response_once, bool drop_repair_response_once, const net::DispatchConfig& dispatch)
     : node_(std::move(node)), operations_directory_(journal_root / "operations"),
       repairs_directory_(std::move(journal_root) / "repairs"),
       drop_commit_response_once_(drop_commit_response_once),
       drop_repair_response_once_(drop_repair_response_once),
-      server_(port, [this](const protocol::Message& request) { return handle(request); }) {
+      server_(port, [this](const protocol::Message& request) { return handle(request); },
+              protocol::kDefaultMaxPayloadSize, dispatch) {
     if (!node_) throw std::invalid_argument("storage server requires node");
     if (enrolled(operations_directory_.parent_path())) throw std::invalid_argument("enrolled storage requires TLS epoch fencing");
     std::filesystem::create_directories(operations_directory_);
@@ -320,10 +321,11 @@ StorageNodeServer::StorageNodeServer(std::shared_ptr<StorageNode> node,
 }
 
 std::uint16_t StorageNodeServer::port() const noexcept { return server_.port(); }
+net::DispatchSnapshot StorageNodeServer::snapshot() const noexcept { return server_.snapshot(); }
 StorageNodeServer::StorageNodeServer(std::shared_ptr<StorageNode> node,
     std::filesystem::path journal_root, net::TlsConfig config, std::uint16_t port,
     bool drop_commit_response_once, bool drop_repair_response_once,
-    std::shared_ptr<epoch::Store> fence, bool drop_epoch_response_once)
+    std::shared_ptr<epoch::Store> fence, bool drop_epoch_response_once, const net::DispatchConfig& dispatch)
     : node_(std::move(node)), operations_directory_(journal_root / "operations"),
       repairs_directory_(std::move(journal_root) / "repairs"),
       drop_commit_response_once_(drop_commit_response_once),
@@ -332,7 +334,7 @@ StorageNodeServer::StorageNodeServer(std::shared_ptr<StorageNode> node,
       server_(storage_tls(node_, std::move(config)), port,
           [this](const protocol::Message& request, const net::PeerPolicy& peer) {
               return handle_authenticated(request, peer);
-          }) {
+          }, protocol::kDefaultMaxPayloadSize, dispatch) {
     if (!fence_ && enrolled(operations_directory_.parent_path()))
         throw std::invalid_argument("enrolled storage requires epoch fencing");
     if (fence_ && fence_->directory() != std::filesystem::canonical(operations_directory_.parent_path() / "epoch"))

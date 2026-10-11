@@ -61,7 +61,7 @@ def main():
     parser.add_argument("--executable", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--runner-class", choices=("shared", "controlled", "manual-uncontrolled"), default="manual-uncontrolled")
-    parser.add_argument("--profile", choices=("smoke", "characterize", "transport"), default="smoke")
+    parser.add_argument("--profile", choices=("smoke", "characterize", "transport", "admission", "dispatch"), default="smoke")
     parser.add_argument("--rounds", type=int, default=3)
     args = parser.parse_args()
     if platform.system() != "Linux":
@@ -74,6 +74,41 @@ def main():
     cases = [("smoke", ["--iterations", "3", "--objects", "3", "--bytes", "4096", "--chunk", "1024", "--workers", "2", "--warmup", "1"])]
     if args.profile == "transport":
         cases = [("nodelay-" + mode, ["--suite", "distributed", "--iterations", "40", "--objects", "16", "--bytes", "65536", "--chunk", "16384", "--nodes", "4", "--replicas", "2", "--workers", "1", "--warmup", "4", "--tcp-nodelay", mode]) for mode in ("off", "on")]
+    if args.profile == "admission":
+        cases = []
+        # Full-connection serial reference mode is identical on both sides:
+        # this isolates admission fairness from the independent dispatch change.
+        for workers, iterations, prefix in ((1, 80, "workers-1"), (2, 80, "workers-2"),
+                                             (4, 80, "workers-4"), (4, 400, "sustained-4")):
+            for policy in ("mutex", "fifo"):
+                cases.append((f"{prefix}-{policy}", ["--suite", "distributed", "--iterations", str(iterations),
+                    "--objects", "16", "--bytes", "65536", "--chunk", "16384", "--nodes", "4", "--replicas", "2",
+                    "--workers", str(workers), "--warmup", "4", "--admission", policy, "--dispatch", "serial",
+                    "--admission-capacity", "16", "--admission-timeout-ms", "5000", "--tcp-nodelay", "on"]))
+        for policy in ("mutex", "fifo"):
+            cases.append((f"fault-{policy}", ["--suite", "fault", "--iterations", "20", "--objects", "20",
+                "--bytes", "65536", "--chunk", "16384", "--workers", "4", "--warmup", "3",
+                "--admission", policy, "--dispatch", "serial", "--tcp-nodelay", "on"]))
+    if args.profile == "dispatch":
+        cases = [("dispatch-" + policy, ["--suite", "dispatch", "--iterations", "12", "--objects", "1",
+            "--bytes", "4096", "--chunk", "1024", "--workers", "1", "--warmup", "2",
+            "--admission", "fifo", "--dispatch", policy, "--dispatch-workers", "4", "--dispatch-capacity", "4", "--tcp-nodelay", "on"])
+            for policy in ("serial", "bounded")]
+        # Hold coordinator admission at FIFO on both sides. Unlike the earlier
+        # admission profile, these pairs audit the default bounded server's
+        # handler-gate overhead on real distributed and durable repair work.
+        for workers, iterations, prefix in ((1, 80, "dispatch-workers-1"), (2, 80, "dispatch-workers-2"),
+                                             (4, 80, "dispatch-workers-4"), (4, 400, "dispatch-sustained-4")):
+            for policy in ("serial", "bounded"):
+                cases.append((f"{prefix}-{policy}", ["--suite", "distributed", "--iterations", str(iterations),
+                    "--objects", "16", "--bytes", "65536", "--chunk", "16384", "--nodes", "4", "--replicas", "2",
+                    "--workers", str(workers), "--warmup", "4", "--admission", "fifo", "--dispatch", policy,
+                    "--dispatch-workers", "4", "--dispatch-capacity", "4", "--admission-capacity", "16",
+                    "--admission-timeout-ms", "5000", "--tcp-nodelay", "on"]))
+        for policy in ("serial", "bounded"):
+            cases.append((f"dispatch-fault-{policy}", ["--suite", "fault", "--iterations", "20", "--objects", "20",
+                "--bytes", "65536", "--chunk", "16384", "--workers", "4", "--warmup", "3", "--admission", "fifo",
+                "--dispatch", policy, "--dispatch-workers", "4", "--dispatch-capacity", "4", "--tcp-nodelay", "on"]))
     if args.profile == "characterize":
         cases = []
         for mode in ("off", "on"):
@@ -89,10 +124,13 @@ def main():
         cases.append(("fault", ["--suite", "fault", "--iterations", "20", "--objects", "20", "--bytes", "65536", "--chunk", "16384", "--warmup", "3"]))
     index = []
     for round_number in range(1, args.rounds + 1):
-        # Alternate paired collector order to expose, not hide, order/cache noise.
+        # Alternate paired variant order to expose, not hide, order/cache noise.
         ordered = list(cases)
         if args.profile in ("characterize", "transport") and round_number % 2 == 0:
             ordered[0], ordered[1] = ordered[1], ordered[0]
+        if args.profile in ("admission", "dispatch") and round_number % 2 == 0:
+            for pair in range(0, len(ordered), 2):
+                ordered[pair], ordered[pair + 1] = ordered[pair + 1], ordered[pair]
         for case, parameters in ordered:
             target = args.output_dir / f"{case}-{round_number}.json"
             if target.exists():

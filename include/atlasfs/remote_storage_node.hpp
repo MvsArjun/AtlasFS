@@ -60,14 +60,17 @@ class StorageNodeServer {
 public:
     StorageNodeServer(std::shared_ptr<StorageNode> node, std::filesystem::path journal_root,
                      std::uint16_t port = 0, bool drop_commit_response_once = false,
-                     bool drop_repair_response_once = false);
+                     bool drop_repair_response_once = false,
+                     const net::DispatchConfig& dispatch = {});
     StorageNodeServer(std::shared_ptr<StorageNode> node, std::filesystem::path journal_root,
                      net::TlsConfig config, std::uint16_t port = 0,
                      bool drop_commit_response_once = false,
                      bool drop_repair_response_once = false,
                      std::shared_ptr<epoch::Store> fence = {},
-                     bool drop_epoch_response_once = false);
+                     bool drop_epoch_response_once = false,
+                     const net::DispatchConfig& dispatch = {});
     [[nodiscard]] std::uint16_t port() const noexcept;
+    [[nodiscard]] net::DispatchSnapshot snapshot() const noexcept;
     void serve();
     void stop() noexcept;
 private:

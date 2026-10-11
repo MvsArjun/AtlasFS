@@ -10,7 +10,7 @@ on:
       profile:
         description: Short correctness smoke or repeated characterization
         type: choice
-        options: [smoke, characterize, transport]
+        options: [smoke, characterize, transport, admission, dispatch]
         default: smoke
 permissions:
   contents: read
@@ -49,6 +49,22 @@ jobs:
         run: |
           for round in 1 2 3; do
             python3 benchmarks/compare.py --allow-transport-change build-benchmark/results/nodelay-off-$round.json build-benchmark/results/nodelay-on-$round.json > build-benchmark/results/transport-$round.csv
+          done
+      - name: Same-runner admission comparisons
+        if: inputs.profile == 'admission'
+        run: |
+          for round in 1 2 3; do
+            for case in workers-1 workers-2 workers-4 sustained-4 fault; do
+              python3 benchmarks/compare.py --allow-admission-change build-benchmark/results/$case-mutex-$round.json build-benchmark/results/$case-fifo-$round.json > build-benchmark/results/$case-admission-$round.csv
+            done
+          done
+      - name: Same-runner independent dispatch comparisons
+        if: inputs.profile == 'dispatch'
+        run: |
+          for round in 1 2 3; do
+            for case in dispatch dispatch-workers-1 dispatch-workers-2 dispatch-workers-4 dispatch-sustained-4 dispatch-fault; do
+              python3 benchmarks/compare.py --allow-dispatch-change build-benchmark/results/$case-serial-$round.json build-benchmark/results/$case-bounded-$round.json > build-benchmark/results/$case-$round.csv
+            done
           done
       - name: Upload traceable results
         if: always()

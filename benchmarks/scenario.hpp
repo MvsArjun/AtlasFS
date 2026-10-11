@@ -58,8 +58,9 @@ inline void seed_catalog(metadata::DurableReplicaCatalog& catalog, const metadat
 class Running {
 public:
     Running(std::shared_ptr<replication::StorageNode> node, const std::filesystem::path& journal,
-            net::TlsConfig tls, std::shared_ptr<epoch::Store> fence, bool lost = false)
-        : server(std::move(node), journal, std::move(tls), 0, false, lost, std::move(fence)),
+            net::TlsConfig tls, std::shared_ptr<epoch::Store> fence, bool lost = false,
+            net::DispatchConfig dispatch = {})
+        : server(std::move(node), journal, std::move(tls), 0, false, lost, std::move(fence), false, dispatch),
           thread([this, observer = metrics::current_owner()] {
               metrics::Scope scope(observer);
               try { server.serve(); } catch (...) { error = std::current_exception(); }
@@ -95,7 +96,9 @@ public:
     net::TlsConfig coordinator{temporary.config({"coordinator", net::PeerRole::coordinator})};
     std::shared_ptr<epoch::Store> authority;
     std::vector<SecureNode> nodes;
-    Cluster(std::uint32_t count, std::uint32_t chunk, bool nodelay = true) {
+    net::DispatchConfig dispatch;
+    Cluster(std::uint32_t count, std::uint32_t chunk, bool nodelay = true,
+            const net::DispatchConfig& options = {}) : dispatch(options) {
         coordinator.tcp_nodelay = nodelay;
         std::filesystem::create_directory(root() / "coordinator");
         epoch::Store::provision(root() / "coordinator" / "epoch", token);
@@ -125,7 +128,7 @@ public:
     }
     void start(std::size_t n, bool lost = false) {
         auto& node = nodes.at(n);
-        node.running = std::make_unique<Running>(node.local, node.journal, node.tls, node.fence, lost);
+        node.running = std::make_unique<Running>(node.local, node.journal, node.tls, node.fence, lost, dispatch);
         node.client = std::make_shared<replication::RemoteStorageNodeClient>(node.id, node.running->server.port(), coordinator, token);
     }
     void restart(std::size_t n, std::uint32_t chunk, bool lost = false) {

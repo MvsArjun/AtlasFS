@@ -19,16 +19,29 @@ for run in index["runs"]:
     for row in report["results"]:
         row["process_peak_rss_bytes"] = report.get("peak_rss_bytes")
         groups.setdefault((run["case"], row["workload"]), []).append(row)
-fields = ["case", "workload", "rounds", "operations_total", "elapsed_seconds_total", "median_ops_s", "median_bytes_s", "median_p50_ms", "median_p95_ms", "median_p99_ms", "median_queue_p50_ms", "median_queue_p95_ms", "median_queue_p99_ms", "median_cpu_seconds", "median_cpu_percent", "median_process_peak_rss_bytes", "median_socket_sent", "median_file_write_bytes", "median_file_sync_ns", "median_directory_sync_ns", "median_temporary_peak", "median_additional_disk_peak", "median_startup_entries"]
+if len(environments) != 1:
+    parser.error("cannot aggregate performance rounds across different machine fingerprints")
+fields = ["case", "workload", "rounds", "operations_total", "elapsed_seconds_total", "median_ops_s", "median_bytes_s", "median_p50_ms", "median_p95_ms", "median_p99_ms", "median_queue_p50_ms", "median_queue_p95_ms", "median_queue_p99_ms", "median_cpu_seconds", "median_cpu_percent", "median_process_peak_rss_bytes", "median_socket_sent", "median_file_write_bytes", "median_file_sync_ns", "median_directory_sync_ns", "median_temporary_peak", "median_additional_disk_peak", "median_startup_entries",
+          "successful_operations_total", "executed_operations_total", "unexpected_errors_total", "expected_rejections_total", "timeouts_total", "unknown_outcomes_total", "admission_overloads_total", "admission_cancelled_total", "admission_deadline_expired_total", "admission_shutdown_rejected_total", "median_successful_ops_s", "median_admission_overload_rate", "maximum_admission_queue_peak", "median_independent_connection_p50_ms", "median_independent_connection_p95_ms", "median_independent_connection_p99_ms", "maximum_dispatch_active", "maximum_dispatch_request_waiting"]
 summary = []
 for (case, workload), rows in sorted(groups.items()):
     def median(field, counters=False):
         values = [(row["io_counters"] or {}).get(field) if counters else row.get(field) for row in rows]
         return statistics.median(values) if all(value is not None for value in values) else None
+    def total(field):
+        values = [row.get(field) for row in rows]
+        return sum(values) if all(value is not None for value in values) else None
+    def maximum(field, dispatch=False):
+        values = [(row.get("dispatch_snapshot") or {}).get(field) if dispatch else row.get(field) for row in rows]
+        return max(values) if all(value is not None for value in values) else None
     summary.append(dict(zip(fields, [case, workload, len(rows), sum(row["operations"] for row in rows), sum(row["elapsed_seconds"] for row in rows),
         median("operations_per_second"), median("logical_bytes_per_second"), median("p50_ms"), median("p95_ms"), median("p99_ms"), median("queue_p50_ms"), median("queue_p95_ms"), median("queue_p99_ms"), median("cpu_seconds"), median("process_cpu_percent"), median("process_peak_rss_bytes"),
         median("socket_sent_bytes", True), median("file_write_bytes", True), median("file_sync_ns", True), median("directory_sync_ns", True),
-        median("temporary_peak_bytes"), median("additional_disk_peak_bytes"), median("startup_entries", True)])))
+        median("temporary_peak_bytes"), median("additional_disk_peak_bytes"), median("startup_entries", True),
+        *[total(field) for field in ("successful_operations", "executed_operations", "unexpected_errors", "expected_rejections", "timeouts", "unknown_outcomes", "admission_overloads", "admission_cancelled", "admission_deadline_expired", "admission_shutdown_rejected")],
+        median("successful_operations_per_second"), median("admission_overload_rate"), maximum("admission_queue_peak"),
+        median("independent_connection_p50_ms"), median("independent_connection_p95_ms"), median("independent_connection_p99_ms"),
+        maximum("peak_active", True), maximum("peak_request_waiting", True)])))
 with (args.directory / "summary.csv").open("w", newline="", encoding="utf-8") as output:
     writer = csv.DictWriter(output, fields); writer.writeheader(); writer.writerows(summary)
 with (args.directory / "summary.json").open("w", encoding="utf-8") as output:

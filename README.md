@@ -149,12 +149,30 @@ python3 benchmarks/compare.py before.json after.json
 Use `--suite local|distributed|fault|all` and `--help` for bounded parameters.
 JSON includes throughput, p50/p95/p99 latency, CPU time, reported peak RSS, disk
 file bytes, known rejections/unknown outcomes, and recovery timing. Worker requests
-queue through **one serialized coordinator**; they do not imply parallel node
-dispatch or multiple authorities. Long runs are separate from short deterministic
+queue through **one serialized coordinator**; independent connections may process
+transport I/O concurrently, but durable handlers retain one serialized admission
+boundary. Long runs are separate from short deterministic
 `Stress*` regressions in CTest. See [Milestone 20](docs/milestone-20.md) for measured
 baselines, limitations, fault coverage, and reproduction instructions.
 
 ## Repository layout
+
+Milestone 22 adds `scheduling::AdmissionQueue`: one active caller lease and a
+bounded FIFO of waiting callers, with explicit overload, cancellation, deadline,
+and shutdown outcomes. Existing coordinator/client APIs remain synchronous and
+are not independently thread-safe; callers must hold the same admission lease
+around shared orchestration, epoch guards, catalog operations, and clients.
+`TcpServer` defaults to four fixed connection workers with isolated TLS/parser
+state, four pending handler admissions, and a million-request connection limit.
+Authorization, epoch validation, publication, and journals remain inside one
+serialized handler; response I/O does not hold that lease. Overload closes the
+connection and never triggers automatic retry. Stop cancels pending work and
+unblocks sockets, but cannot undo an executing durable operation.
+See [Milestone 22](docs/milestone-22.md) for bounds, uncertainty, regressions,
+and same-runner FIFO/mutex and independent-connection comparisons. Benchmark
+`--admission mutex|fifo` and `--dispatch serial|bounded` expose behavioral
+references for separate experiments; `--profile admission` and `--profile
+dispatch` run three alternating paired rounds on Linux.
 
 Milestone 21 adds opt-in transport/filesystem instrumentation and warm-up samples:
 use `--warmup 3 --metrics on` (or `--metrics off` to measure collection overhead).
@@ -219,5 +237,6 @@ transfers one bounded logical object per PUT or GET.
 Node membership, plans, and replication orchestration are in-process and
 single-threaded. Storage roots, chunks, manifests, and current replica metadata
 are durable and independent. Multiple catalog writers, automatic repair,
-consensus, automatic credential management, and production concurrency remain
-deliberately out of scope.
+consensus, automatic credential management, and parallel durable handler execution
+remain deliberately out of scope. Bounded connection I/O concurrency is supported;
+one storage root still requires one owning server and serialized direct access.

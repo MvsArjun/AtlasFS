@@ -1,14 +1,19 @@
 #include "atlasfs/tcp_server.hpp"
 #include "atlasfs/metrics.hpp"
+#include "atlasfs/admission.hpp"
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <array>
 #include <cerrno>
+#include <condition_variable>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdexcept>
 #include <string_view>
 #include <sys/socket.h>
 #include <system_error>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 
@@ -25,6 +30,15 @@ std::vector<std::byte> to_bytes(std::string_view text) {
 }
 
 }  // namespace
+
+struct TcpServer::DispatchState {
+    explicit DispatchState(std::size_t workers) : descriptors(workers, -1) {}
+    mutable std::mutex mutex;
+    std::condition_variable ready;
+    std::vector<int> descriptors;
+    DispatchSnapshot counters;
+    std::exception_ptr failure;
+};
 
 protocol::Message echo_response(const protocol::Message& request) {
     switch (request.type) {
@@ -65,11 +79,19 @@ protocol::Message echo_response(const protocol::Message& request) {
 }
 
 TcpServer::TcpServer(std::uint16_t port, RequestHandler handler,
-                     std::uint32_t max_payload_size)
-    : handler_(std::move(handler)), max_payload_size_(max_payload_size) {
+                     std::uint32_t max_payload_size, const DispatchConfig& dispatch)
+    : handler_(std::move(handler)), max_payload_size_(max_payload_size), dispatch_(dispatch) {
     if (!handler_) {
         throw std::invalid_argument("TCP server requires a request handler");
     }
+    if (dispatch_.workers < 1 || dispatch_.workers > 16 ||
+        dispatch_.request_queue_capacity > 65536 ||
+        dispatch_.max_requests_per_connection < 1 ||
+        dispatch_.max_requests_per_connection > 1000000)
+        throw std::invalid_argument("invalid TCP dispatch configuration");
+    state_ = std::make_unique<DispatchState>(dispatch_.serial ? 1 : dispatch_.workers);
+    if (!dispatch_.serial)
+        admission_ = std::make_unique<scheduling::AdmissionQueue>(dispatch_.request_queue_capacity);
 
     listener_.reset(::socket(AF_INET, SOCK_STREAM, 0));
     if (!listener_.valid()) {
@@ -90,7 +112,7 @@ TcpServer::TcpServer(std::uint16_t port, RequestHandler handler,
         0) {
         throw_system_error("bind");
     }
-    if (::listen(listener_.get(), SOMAXCONN) < 0) {
+    if (::listen(listener_.get(), static_cast<int>(dispatch_.workers)) < 0) {
         throw_system_error("listen");
     }
 
@@ -107,8 +129,9 @@ TcpServer::~TcpServer() {
 }
 
 TcpServer::TcpServer(TlsConfig config, std::uint16_t port,
-                     AuthenticatedRequestHandler handler, std::uint32_t max_payload_size)
-    : TcpServer(port, echo_response, max_payload_size) {
+                     AuthenticatedRequestHandler handler, std::uint32_t max_payload_size,
+                     const DispatchConfig& dispatch)
+    : TcpServer(port, echo_response, max_payload_size, dispatch) {
     if (!handler) throw std::invalid_argument("TLS server requires an authenticated handler");
     tls_ = std::make_shared<TlsContext>(std::move(config));
     authenticated_handler_ = std::move(handler);
@@ -118,7 +141,69 @@ std::uint16_t TcpServer::port() const noexcept {
     return port_;
 }
 
+DispatchSnapshot TcpServer::snapshot() const noexcept {
+    DispatchSnapshot result;
+    {
+        std::lock_guard lock(state_->mutex);
+        result = state_->counters;
+    }
+    // Never nest lifecycle and admission locks, including in diagnostics.
+    if (admission_) {
+        const auto queue = admission_->snapshot();
+        result.request_waiting = queue.waiting;
+        result.peak_request_waiting = queue.peak_waiting;
+    }
+    return result;
+}
+
 void TcpServer::serve() {
+    if (serving_.exchange(true)) throw std::logic_error("TCP server may only be served once");
+    if (dispatch_.serial) {
+        serve_serial();
+    } else {
+        std::vector<std::thread> workers;
+        try {
+            workers.reserve(dispatch_.workers);
+            for (std::size_t index = 0; index < dispatch_.workers; ++index) {
+                workers.emplace_back([this, index, observer = metrics::current_owner()] {
+                    metrics::Scope scope(observer);
+                    worker(index);
+                });
+            }
+            while (!stopping_.load()) {
+                Socket connection(::accept(listener_.get(), nullptr, nullptr));
+                if (!connection.valid()) {
+                    if (errno == EINTR) continue;
+                    if (stopping_.load()) break;
+                    throw_system_error("accept");
+                }
+                std::lock_guard lock(state_->mutex);
+                ++state_->counters.accepted;
+                auto available = std::find(state_->descriptors.begin(), state_->descriptors.end(), -1);
+                if (stopping_.load() || available == state_->descriptors.end()) {
+                    // Before TLS authentication/request identity, closing is the only
+                    // safe rejection. No implicit retry or synthetic success reply.
+                    ++state_->counters.rejected;
+                    continue;
+                }
+                *available = connection.release();
+                ++state_->counters.active;
+                state_->counters.peak_active = std::max(state_->counters.peak_active,
+                                                       state_->counters.active);
+                state_->ready.notify_all();
+            }
+        } catch (...) {
+            fail(std::current_exception());
+        }
+        stop();
+        for (auto& thread : workers) if (thread.joinable()) thread.join();
+    }
+    std::exception_ptr failure;
+    { std::lock_guard lock(state_->mutex); failure = state_->failure; }
+    if (failure) std::rethrow_exception(failure);
+}
+
+void TcpServer::serve_serial() {
     while (!stopping_.load()) {
         const int descriptor = ::accept(listener_.get(), nullptr, nullptr);
         if (descriptor < 0) {
@@ -128,32 +213,68 @@ void TcpServer::serve() {
             if (stopping_.load()) {
                 return;
             }
-            throw_system_error("accept");
+            fail(std::make_exception_ptr(std::system_error(errno, std::generic_category(), "accept")));
+            return;
         }
 
         Socket connection(descriptor);
-        set_active_descriptor(descriptor);
+        {
+            std::lock_guard lock(state_->mutex);
+            if (stopping_.load()) return;
+            state_->descriptors.front() = descriptor;
+            ++state_->counters.accepted;
+            ++state_->counters.active;
+            state_->counters.peak_active = 1;
+        }
         try {
             handle_connection(connection);
         } catch (const TransportError&) {
-            clear_active_descriptor(descriptor);
-            if (stopping_.load()) return;
-            continue;
         } catch (const std::system_error&) {
-            clear_active_descriptor(descriptor);
-            if (stopping_.load()) {
-                return;
-            }
-            continue;
         } catch (...) {
-            clear_active_descriptor(descriptor);
-            if (stopping_.load()) {
-                return;
-            }
-            throw;
+            fail(std::current_exception());
         }
-        clear_active_descriptor(descriptor);
+        {
+            std::lock_guard lock(state_->mutex);
+            state_->descriptors.front() = -1;
+            --state_->counters.active;
+            connection.reset();
+        }
     }
+}
+
+void TcpServer::worker(std::size_t index) noexcept {
+    for (;;) {
+        int descriptor;
+        {
+            std::unique_lock lock(state_->mutex);
+            state_->ready.wait(lock, [&] {
+                return stopping_.load() || state_->descriptors[index] >= 0;
+            });
+            descriptor = state_->descriptors[index];
+            if (descriptor < 0) return;
+        }
+        Socket connection(descriptor);
+        if (!stopping_.load()) {
+            try { handle_connection(connection); }
+            catch (const TransportError&) {} // Connection-local authentication/I/O failure.
+            catch (const std::system_error&) {}
+            catch (...) { fail(std::current_exception()); }
+        }
+        {
+            std::lock_guard lock(state_->mutex);
+            // Retire the descriptor before closing, under the same lifecycle lock
+            // used by stop(). The kernel cannot reuse an fd visible to shutdown.
+            state_->descriptors[index] = -1;
+            --state_->counters.active;
+            connection.reset();
+        }
+        if (stopping_.load()) return;
+    }
+}
+
+void TcpServer::fail(std::exception_ptr failure) noexcept {
+    { std::lock_guard lock(state_->mutex); if (!state_->failure) state_->failure = std::move(failure); }
+    stop();
 }
 
 void TcpServer::stop() noexcept {
@@ -163,10 +284,25 @@ void TcpServer::stop() noexcept {
     if (listener_.valid()) {
         ::shutdown(listener_.get(), SHUT_RDWR);
     }
-    std::lock_guard lock(active_mutex_);
-    if (active_descriptor_ >= 0) {
-        ::shutdown(active_descriptor_, SHUT_RDWR);
+    if (admission_) admission_->shutdown();
+    std::lock_guard lock(state_->mutex);
+    for (const auto descriptor : state_->descriptors)
+        if (descriptor >= 0) ::shutdown(descriptor, SHUT_RDWR);
+    state_->ready.notify_all();
+}
+
+bool TcpServer::disconnected(int descriptor) const noexcept {
+    pollfd state{descriptor, POLLIN, 0};
+    if (::poll(&state, 1, 0) <= 0) return false;
+    if (state.revents & (POLLHUP | POLLERR | POLLNVAL)) return true;
+    if (state.revents & POLLIN) {
+        // Peek raw socket state only. Never consume encrypted bytes outside SSL.
+        // Buffered TLS records/close_notify are not definitive disconnect evidence.
+        std::byte byte;
+        const auto result = ::recv(descriptor, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+        return result == 0 || (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR);
     }
+    return false;
 }
 
 void TcpServer::handle_connection(Socket& connection) {
@@ -176,6 +312,7 @@ void TcpServer::handle_connection(Socket& connection) {
     auto stream = tls_ ? tls_->accept(connection.get()) : plaintext_stream(connection.get());
     const auto timeout = tls_ ? tls_->timeout() : std::chrono::seconds(5);
     auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::size_t served = 0;
 
     while (!stopping_.load()) {
         const auto received = stream->read(buffer, deadline);
@@ -185,13 +322,45 @@ void TcpServer::handle_connection(Socket& connection) {
             for (const auto& request : result.messages) {
                 metrics::add(metrics::Counter::frames_received);
                 metrics::add(metrics::Counter::payload_received, request.payload.size());
-                const auto response = tls_ ? authenticated_handler_(request, *stream->peer())
-                                           : handler_(request);
+                scheduling::AdmissionQueue::Result admitted;
+                if (admission_) {
+                    admitted = admission_->acquire(deadline);
+                    if (admitted.status != scheduling::AdmissionQueue::Status::admitted) {
+                        std::lock_guard lock(state_->mutex);
+                        if (admitted.status == scheduling::AdmissionQueue::Status::deadline_expired)
+                            ++state_->counters.admission_expired;
+                        else ++state_->counters.admission_rejected;
+                        return;
+                    }
+                    if (stopping_.load()) return;
+                    if (disconnected(connection.get())) {
+                        std::lock_guard lock(state_->mutex);
+                        ++state_->counters.disconnect_cancellations;
+                        return;
+                    }
+                }
+                { std::lock_guard lock(state_->mutex); ++state_->counters.requests; }
+                protocol::Message response;
+                try {
+                    // Authentication policy, epoch guard, physical publication and
+                    // journals all remain in this one serialized handler boundary.
+                    response = tls_ ? authenticated_handler_(request, *stream->peer())
+                                    : handler_(request);
+                } catch (...) {
+                    fail(std::current_exception());
+                    throw;
+                }
+                admitted.lease.release(); // Slow response I/O does not own authority.
                 stream->write_all(protocol::encode(response), deadline);
                 metrics::add(metrics::Counter::frames_sent);
                 metrics::add(metrics::Counter::payload_sent, response.payload.size());
                 metrics::add(metrics::Counter::framed_sent, response.payload.size() + protocol::kHeaderSize);
                 deadline = std::chrono::steady_clock::now() + timeout;
+                if (++served == dispatch_.max_requests_per_connection) {
+                    std::lock_guard lock(state_->mutex);
+                    ++state_->counters.request_limit_closes;
+                    return;
+                }
             }
             if (result.error != protocol::ParseError::none) {
                 return;
@@ -199,18 +368,6 @@ void TcpServer::handle_connection(Socket& connection) {
             continue;
         }
         return;
-    }
-}
-
-void TcpServer::set_active_descriptor(int descriptor) noexcept {
-    std::lock_guard lock(active_mutex_);
-    active_descriptor_ = descriptor;
-}
-
-void TcpServer::clear_active_descriptor(int descriptor) noexcept {
-    std::lock_guard lock(active_mutex_);
-    if (active_descriptor_ == descriptor) {
-        active_descriptor_ = -1;
     }
 }
 
