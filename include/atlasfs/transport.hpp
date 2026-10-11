@@ -34,7 +34,7 @@ struct TlsConfig {
     std::map<std::string, PeerPolicy, std::less<>> peers;
     std::chrono::milliseconds timeout{std::chrono::seconds(5)};
     // TCP endpoints only; direct ByteStream use may also use Unix sockets.
-    bool tcp_nodelay{false};
+    bool tcp_nodelay{true};
 };
 class TransportError : public std::runtime_error {
 public:

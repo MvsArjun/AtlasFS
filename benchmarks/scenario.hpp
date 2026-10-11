@@ -95,7 +95,7 @@ public:
     net::TlsConfig coordinator{temporary.config({"coordinator", net::PeerRole::coordinator})};
     std::shared_ptr<epoch::Store> authority;
     std::vector<SecureNode> nodes;
-    Cluster(std::uint32_t count, std::uint32_t chunk, bool nodelay = false) {
+    Cluster(std::uint32_t count, std::uint32_t chunk, bool nodelay = true) {
         coordinator.tcp_nodelay = nodelay;
         std::filesystem::create_directory(root() / "coordinator");
         epoch::Store::provision(root() / "coordinator" / "epoch", token);

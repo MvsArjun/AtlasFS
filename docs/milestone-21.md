@@ -209,22 +209,178 @@ workflow uploads all repeated JSON, overhead CSVs, index and compact summaries.
 Actual final counts, run links and source revisions are recorded in the delivery
 report; workflow configuration is not evidence of success.
 
+The instrumented revision `60a749a36bdb19910c4d71ebc7cc4d4165e07a35` passed
+323/323 in [Linux CI](https://github.com/MvsArjun/AtlasFS/actions/runs/38111594966)
+(normal 8.70 s, ASan/UBSan 25.79 s, TSan 21.87 s). The ownership correction
+`1e92eb37525232ebaa266b1cf658f21ef267ca40` passed 324/324 in
+[Linux CI](https://github.com/MvsArjun/AtlasFS/actions/runs/38112095094)
+(normal 7.34 s, ASan/UBSan 25.99 s, TSan 21.32 s). All jobs also validated
+enabled/disabled smoke reports. A separate fresh clone of the latter revision
+passed 324/324 (41.51 s) and 24-row/72-operation smoke, exit 0.
+
 Sixteen new instrumentation regressions cover concurrent totals, saturation,
 snapshot/reset/scopes, timer lifetime, disabled I/O, errno, plaintext layer totals,
 encrypted BIO traffic, deadlines, successful/failing temporary publication,
 destination replacement, restart cleanup, lost-response idempotence, capacity
-and concurrent file lifecycles with descriptor reuse. Ownership review identified
+and concurrent file lifecycles with descriptor reuse, plus TCP_NODELAY on/off.
+Ownership review identified
 that retiring descriptor tracking after kernel close could erase a newly reused
 descriptor's observation. Tracking now retires before close. Five stress rounds
 did not reproduce the race before the fix; the ordering argument, not a claimed
 observed failure, motivated it. Recursive-cleanup errors invalidate accounting
-because deletion may have made partial progress.
+because deletion may have made partial progress. Six Python tooling regressions
+exercise schema, arithmetic, framing, integer types, unavailable accounting and
+explicit transport/config comparison requirements.
 All original checksum/durability/TLS/epoch/repair/CAS tests remain intact.
+
+## Measured Linux baseline
+
+[Characterization run 38111605139](https://github.com/MvsArjun/AtlasFS/actions/runs/38111605139)
+completed successfully at `60a749a36bdb19910c4d71ebc7cc4d4165e07a35` with
+39 sequential reports (13 configurations, three rounds), 10,200 measured cycles,
+351.36 s summed measured-row wall time, zero unexpected errors and zero residual
+temporary bytes. Maximum process-lifetime RSS across these runs was 19,222,528
+bytes; it includes fixture setup, not a per-operation allocation measurement.
+All reports passed schema and arithmetic validation. The full raw reports/index,
+summaries and paired overhead CSVs are in artifact `linux-benchmark-hosted-characterize`
+(artifact ID 11691987052). Compact CSV and two representative raw reports are
+retained in [benchmarks/results/m21](../benchmarks/results/m21/README.md).
+
+The runner exposed Ubuntu 24.04.5 LTS, kernel 6.17.0-1022-azure, AMD EPYC 7763
+with two available logical processors (affinity 0,1), 8,323,969,024 bytes RAM,
+GCC 13.3.0, CMake 3.31.6, Ninja 1.13.2 and OpenSSL 3.0.13. Release flags were
+`-O3 -DNDEBUG`. Scratch storage was `/dev/sda1`, ext4, a reported 75G virtual
+disk; its physical backing and cache behavior are unknown. Mount options were
+`rw,relatime,discard,journal_async_commit,nobarrier,errors=remount-ro,commit=30,data=writeback`.
+In particular, these observations do **not** establish physical power-loss
+durability or controlled-device sync performance. Required application syncs
+remain present. No CPU isolation, frequency control or cache purge was performed.
+Nodes ran in one process with separate roots and loopback TLS, not on separate
+machines or a physical network.
+
+Values below are medians of three per-round measurements, not pooled percentiles.
+The baseline uses default TCP packetization (TCP_NODELAY disabled).
+
+| Workload | Samples per round | ops/s | p50 / p95 / p99 ms |
+| --- | ---: | ---: | --- |
+| Hot local 1 MiB read, metrics on | 60 | 166.33 | 6.01 / 6.10 / 6.15 |
+| R2 replicated 64 KiB read, workers 1 | 80 | 9.61 | 84.57 / 124.12 / 125.00 |
+| Same, workers 2 | 80 | 9.61 | 123.85 / 124.87 / 8320.51 |
+| Same, workers 4 | 80 | 9.61 | 123.91 / 124.17 / 8321.48 |
+| R1 replicated read | 40 | 23.80 | 42.00 / 42.13 / 42.37 |
+| R3 replicated read | 40 | 6.02 | 166.02 / 166.15 / 166.31 |
+| TLS context/TCP/handshake | 80 | 358.63 | 2.78 / 2.84 / 3.02 |
+| Established query RPC | 80 | 8111.48 | 0.12 / 0.13 / 0.14 |
+| Remote 16 KiB repair, verification and CAS | 20 | 11.25 | 88.93 / 89.86 / 90.84 |
+
+Object/chunk/replication configurations, per-case elapsed seconds, CPU, queue,
+I/O, sync, peak-space and startup counters are in the compact CSV. RPC latencies
+include framing/parsing; the handshake workload also includes context/key loading.
+
+### Byte and stage evidence
+
+The representative 80-cycle R2 read consumed 8.3196 s, 0.2227 s process CPU
+(2.68%), and 640 RPCs with 8.2683 s aggregate RPC time. There were no file writes
+or syncs. Logical bytes were 5,242,880; serialized TX 10,587,200; framed/TLS
+application TX 10,617,920; actual encrypted socket TX 10,660,160 (RX equal).
+The 42,240-byte difference is aggregate TLS/protocol-layer overhead within this
+established-connection window, not physical TCP/IP overhead. It is not divided
+into independent per-record and handshake byte costs. Wrapped file reads totaled
+10,606,720 bytes; `/proc/self/io` reported rchar 10,606,836 (including observation
+reads), read_bytes 0 because the working set was hot, and no block writes.
+
+The representative 20-cycle remote-repair batch consumed 1.7763 s. RPC time was
+1.6924 s; file syncs were 200 calls/57.75 ms, directory syncs 220 calls/33.86 ms,
+and renames 200 calls/12.57 ms. Stage totals were publication 873.80 ms,
+verification 818.93 ms, CAS 14.35 ms, completion 12.15 ms. Nested stages and
+RPC totals must not be summed as independent wall-time components.
+Wrapped writes were 393,667 bytes: chunks 327,680, manifests 2,346, catalog
+41,990, journal 21,651. Process block-layer write_bytes was 1,064,960, not the
+same quantity as those application writes. Temporary peak was 16,384 bytes;
+additional apparent-file disk peak above baseline was 338,855 bytes. Peak
+accounting includes publication/rename/replacement and is independently checked
+against final filesystem state; no physical block-allocation peak is claimed.
+
+### Startup and serialization
+
+At 8/32/128 retained objects (32/128/512 chunks, corresponding catalog entries,
+operation records and repair plans), storage reopen p50 was 0.28/0.87/3.31 ms;
+coordinator reopen p50 was 0.45/1.68/6.93 ms. Each point used 20 measured reopens
+and three warmups per round. This is observed scaling at these sizes, not proof
+of a complexity class. Startup validates retained state without executing old
+operations. See raw retained-count fields for each component.
+
+Increasing workers from 1 to 4 did not increase baseline read throughput.
+The coordinator-side workload deliberately holds one admission mutex across
+the shared, non-thread-safe clients and mutable orchestration. `TcpServer::serve`
+also handles an accepted connection synchronously, including its request loop.
+These are distinct serialization boundaries, not multiple active coordinators.
+In workers-4 round 1, queue p50/p95/p99 were 0.00018/0.00233/8237.56 ms, while
+end-to-end p99 was 8321.48 ms: unfair mutex reacquisition can starve one worker
+until almost the batch end. Percentiles with 80 samples have coarse tail resolution.
+
+### Collector overhead
+
+Paired local off/on runs alternate order in round two. Hot 1 MiB read throughput
+was 166.80 versus 166.33 ops/s (0.28% observed reduction); hot 1 KiB read was
+29,297.15 versus 23,810.36 ops/s (18.73% reduction). Local 1 KiB write was
+678.58 versus 627.11 ops/s (7.58% reduction). Clocks, atomics and bounded
+bookkeeping matter most for very short operations. These are shared-runner
+observations, not fixed overhead guarantees or an optimization speedup.
 
 ## Findings and remaining scope
 
-No application speedup is claimed before equivalent Linux rounds are available.
-Instrumentation overhead itself must be reported. A dedicated Linux baseline is
+### Measured packetization improvement
+
+Low CPU use, zero syncs and about 40 ms latency steps implicated transport waits.
+OpenSSL also documents interaction between TLS traffic and Nagle buffering;
+see [SSL_connect documentation](https://docs.openssl.org/3.0/man3/SSL_connect/).
+Rather than removing verification or syncs, a configurable TCP_NODELAY option
+was added only at secure TCP client/server endpoints, before handshake. Direct
+TLS ByteStream Unix sockets and plaintext compatibility sockets are unchanged.
+No framing, timeout, retry, authentication or durable ordering was modified.
+
+[Paired experiment 38112712691](https://github.com/MvsArjun/AtlasFS/actions/runs/38112712691)
+passed at `aacc5ecdb1f97360b8bead71b1c582f3957eed03`: the same Release binary and
+Linux runner executed off/on, on/off, off/on rounds sequentially. Each used
+seed 42, four nodes, R2, 64 KiB objects, 16 KiB chunks, 16 retained objects,
+40 iterations, one worker, four warmups per workload, metrics enabled. Writes
+measured 16 cycles per round; reads and other distributed workloads measured 40.
+All six reports validated: 1,296 measured cycles, 39.49 s summed measured time,
+zero unexpected errors and zero residual temporary bytes. Artifact
+`linux-benchmark-hosted-transport` (ID 11692302899) includes exact command,
+environment and each paired comparison. The fixture, shared runner and cache
+limitations above apply equally to both sides; comparing different jobs' VM
+measurements is not used as optimization evidence.
+
+| Workload | Off ops/s | On ops/s | Off p50 / p95 / p99 ms | On p50 / p95 / p99 ms |
+| --- | ---: | ---: | --- | --- |
+| Replicated read | 9.614 | 451.784 | 84.475 / 124.083 / 124.121 | 2.203 / 2.279 / 2.291 |
+| Replicated write | 5.457 | 52.511 | 183.079 / 186.171 / 186.171 | 18.646 / 21.093 / 21.093 |
+
+These are medians of three per-round values. Read throughput improved 46.99x
+and write throughput 9.62x in this workload. Individual read improvements ranged
+43.45x–47.06x. This intervention supports the packetization hypothesis; packet
+traces isolating delayed ACK behavior were not collected. Read encrypted socket
+TX stayed 5,330,080 bytes per 40-cycle round on both sides. CPU utilization rose
+from 2.76% to 109.43% of one CPU (the process uses coordinator and server threads;
+100% is not a multi-core upper bound). CPU seconds decreased from 0.1150 to
+0.0969. Process-lifetime RSS median was 19,165,184 bytes on both sides. TLS
+setup and tiny established query RPC did not show a comparable improvement:
+their per-round variation remains visible in the checked-in CSVs.
+
+Based on this evidence, secure TCP now defaults to TCP_NODELAY enabled.
+Applications may set `TlsConfig::tcp_nodelay=false`; the benchmark accepts
+`--tcp-nodelay off`. JSON records the policy, and `compare.py` rejects different
+policies unless `--allow-transport-change` is supplied. Run the paired workflow
+with `profile=transport`, or run `linux_run.py --profile transport --rounds 3`.
+The opt-out does not reset externally configured descriptors: it leaves new
+TCP sockets at the OS default. The setting is never applied to non-TCP TLS
+streams. Extra small packets or TCP/IP headers are a possible tradeoff;
+physical packet counts/headers/retransmissions were not measured. No socket
+byte reduction or real-network speedup is claimed.
+
+A dedicated Linux baseline is
 unavailable without a supplied controlled runner; shared observations must not
 be substituted for that missing capacity evidence.
 
@@ -235,4 +391,5 @@ complexity class. Do not remove syncs or freshness/integrity checks to improve a
 graph. Consensus, election, multiple active coordinators, automatic replanning,
 parallel server redesign, cache purging and power-cut/device testing remain out
 of scope. Recommended next step: repeat this profile on an operator-isolated
-Linux host/disk, then select a targeted change using its stage and byte evidence.
+Linux host/disk and physical network, then evaluate bounded admission scheduling
+or an explicitly designed server-dispatch milestone using the queue evidence.

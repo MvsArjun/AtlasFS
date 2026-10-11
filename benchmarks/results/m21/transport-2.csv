@@ -1,0 +1,7 @@
+workload,before_ops_s,after_ops_s,ops_change_pct,before_p50_ms,after_p50_ms
+replicated_write_tls_epoch,5.4569,48.5047,788.86,183.0786,18.6464
+replicated_read_serialized_queue,9.6142,452.4869,4606.46,84.9222,2.2019
+replicated_mixed_serialized_queue,7.8391,133.9987,1609.37,124.0377,2.2084
+tls_context_tcp_handshake,357.8466,357.3318,-0.14,2.7934,2.8058
+tls_established_query_rpc,7929.6560,8384.5560,5.74,0.1231,0.1157
+epoch_duplicate_activation_rpc,7901.6107,7824.2915,-0.98,0.1253,0.1255

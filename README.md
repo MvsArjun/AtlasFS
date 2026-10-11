@@ -166,6 +166,11 @@ The manual Linux workflow supports explicitly labeled hosted observations or an
 operator-controlled self-hosted runner; neither ordinary CI nor loopback traffic
 is a production capacity claim. See [Milestone 21](docs/milestone-21.md) for counter
 layers, temporary-space accounting, limitations and reproducible commands.
+Secure TCP defaults to TCP_NODELAY after a same-runner three-round Linux A/B
+experiment; `TlsConfig::tcp_nodelay=false` or benchmark `--tcp-nodelay off` opts
+out. Replicated-read throughput improved 46.99x in that loopback workload;
+this is not a real-network or production guarantee. Compact results and
+provenance are in [benchmarks/results/m21](benchmarks/results/m21/README.md).
 
 The GitHub Actions workflow uses Ubuntu 24.04 and GCC 13 with separate normal,
 ASan/UBSan, and TSan jobs, serial CTest, and uploaded diagnostics. A workflow file

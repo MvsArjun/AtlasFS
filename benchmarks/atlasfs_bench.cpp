@@ -23,7 +23,7 @@ std::string utc_time() {
 struct Config {
     std::size_t iterations{30}, objects{32}, bytes{65536}, warmup{3};
     bool instrumentation{true};
-    bool nodelay{false};
+    bool nodelay{true};
     std::uint32_t chunk{16384}, replicas{2}, nodes{4}, workers{1};
     std::uint64_t seed{42};
     std::string suite{"all"}, output, label;
