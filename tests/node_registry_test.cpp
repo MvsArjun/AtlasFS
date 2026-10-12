@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -99,6 +100,51 @@ TEST(NodeRegistry, VersionAdvancesOnlyForSuccessfulMembershipChanges) {
     EXPECT_EQ(registry.version(), 2U);
     EXPECT_EQ(registry.remove("node-a"), RegistryError::none);
     EXPECT_EQ(registry.version(), 3U);
+}
+
+TEST(NodeRegistry, ExhaustedVersionRejectsEveryMutationWithoutChangingEvidence) {
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    for (unsigned mutation = 0; mutation < 4; ++mutation) {
+        NodeRegistry registry;
+        ASSERT_EQ(registry.restore({node("node-a")}, maximum), RegistryError::none);
+        const auto before = registry.list();
+        RegistryError result{};
+        if (mutation == 0) result = registry.add(node("node-b"));
+        if (mutation == 1) result = registry.remove("node-a");
+        if (mutation == 2) result = registry.set_state("node-a", NodeState::draining);
+        if (mutation == 3) result = registry.set_health("node-a", NodeHealthState::suspect, 1);
+        EXPECT_EQ(result, RegistryError::version_exhausted) << mutation;
+        EXPECT_EQ(registry.version(), maximum) << mutation;
+        EXPECT_EQ(registry.list(), before) << mutation;
+    }
+}
+
+TEST(NodeRegistry, ExhaustedVersionStillPermitsIdempotentNoOpsAndRejectsInvalidInput) {
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    NodeRegistry registry;
+    ASSERT_EQ(registry.restore({node("node-a")}, maximum), RegistryError::none);
+    const auto before = registry.list();
+    EXPECT_EQ(registry.set_state("node-a", NodeState::active), RegistryError::none);
+    EXPECT_EQ(registry.set_health("node-a", NodeHealthState::healthy, 0), RegistryError::none);
+    EXPECT_EQ(registry.add(node("node-a")), RegistryError::duplicate_node);
+    EXPECT_EQ(registry.add(node("bad/id")), RegistryError::invalid_node);
+    EXPECT_EQ(registry.remove("missing"), RegistryError::unknown_node);
+    EXPECT_EQ(registry.set_state("node-a", static_cast<NodeState>(99)), RegistryError::invalid_node);
+    EXPECT_EQ(registry.set_health("node-a", static_cast<NodeHealthState>(99), 0), RegistryError::invalid_node);
+    EXPECT_EQ(registry.version(), maximum);
+    EXPECT_EQ(registry.list(), before);
+}
+
+TEST(NodeRegistry, LastVersionCanBePublishedExactlyOnce) {
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    NodeRegistry registry;
+    ASSERT_EQ(registry.restore({node("node-a")}, maximum - 1U), RegistryError::none);
+    EXPECT_EQ(registry.set_state("node-a", NodeState::draining), RegistryError::none);
+    EXPECT_EQ(registry.version(), maximum);
+    EXPECT_EQ(registry.remove("node-a"), RegistryError::version_exhausted);
+    ASSERT_TRUE(registry.get("node-a"));
+    EXPECT_EQ(registry.get("node-a")->state, NodeState::draining);
+    EXPECT_EQ(registry.version(), maximum);
 }
 
 }  // namespace

@@ -47,6 +47,17 @@ TEST(CoordinatorOperationRecord, RoundTripsStrictVersionedRepresentation) {
     const auto expected = record();
     EXPECT_EQ(decode_coordinator_operation(encode_coordinator_operation(expected)), expected);
 }
+TEST(CoordinatorOperationRecord, RoundTripsDefinedEpochErrorsAndRejectsUnknownErrors) {
+    for (const auto error : {storage::StoreError::stale_epoch, storage::StoreError::epoch_unresolved}) {
+        auto value = record(); value.participants[0].last_error = error;
+        EXPECT_EQ(decode_coordinator_operation(encode_coordinator_operation(value)), value);
+    }
+    for (const auto number : {-1, 999}) {
+        auto invalid = record();
+        invalid.participants[0].last_error = static_cast<storage::StoreError>(number);
+        EXPECT_THROW(static_cast<void>(encode_coordinator_operation(invalid)), std::invalid_argument);
+    }
+}
 
 TEST(CoordinatorOperationRecord, RejectsTruncationTrailingBytesAndBadCrc) {
     auto bytes = encode_coordinator_operation(record());
@@ -115,6 +126,44 @@ TEST(CoordinatorOperationStore, FailedPublicationNeverEntersTheIndex) {
         CoordinatorOperationStore store(root.path(), [point](auto current) { return current == point; });
         EXPECT_EQ(store.create(record()), CoordinatorRecordError::filesystem_error);
         EXPECT_FALSE(store.get("op-1"));
+        EXPECT_EQ(store.durability_unknown(), point == CoordinatorRecordFaultPoint::directory_sync);
+    }
+}
+TEST(CoordinatorOperationStore, AmbiguousCommitCannotBeOverwrittenFromStaleIndex) {
+    TempRoot root; bool fail_sync = false;
+    CoordinatorOperationStore store(root.path(), [&](auto point) {
+        return fail_sync && point == CoordinatorRecordFaultPoint::directory_sync;
+    });
+    const auto original = record();
+    ASSERT_EQ(store.create(original), CoordinatorRecordError::none);
+    auto committed = original; committed.state = CoordinatorOperationState::committed;
+    fail_sync = true;
+    ASSERT_EQ(store.update(committed), CoordinatorRecordError::filesystem_error);
+    EXPECT_TRUE(store.durability_unknown());
+    EXPECT_EQ(store.get("op-1"), original);
+    fail_sync = false;
+    auto aborted = original; aborted.state = CoordinatorOperationState::aborted;
+    EXPECT_EQ(store.update(aborted), CoordinatorRecordError::filesystem_error);
+    EXPECT_EQ(store.create(original), CoordinatorRecordError::filesystem_error);
+    EXPECT_EQ(store.create(record("op-2")), CoordinatorRecordError::filesystem_error);
+    CoordinatorOperationStore restarted(root.path());
+    EXPECT_FALSE(restarted.durability_unknown());
+    EXPECT_EQ(restarted.get("op-1"), committed);
+    EXPECT_FALSE(restarted.get("op-2"));
+    EXPECT_EQ(restarted.update(aborted), CoordinatorRecordError::conflict);
+}
+TEST(CoordinatorOperationStore, RejectsOversizedTruncatedTrailingAndNonRegularStartupRecords) {
+    for (unsigned corruption = 0; corruption < 4; ++corruption) {
+        TempRoot root; std::filesystem::path path;
+        { CoordinatorOperationStore store(root.path());
+          ASSERT_EQ(store.create(record()), CoordinatorRecordError::none);
+          path = store.operations_directory() / "op-1"; }
+        if (corruption == 0) std::filesystem::resize_file(path, 8U * 1024U * 1024U + 1U);
+        if (corruption == 1) std::filesystem::resize_file(path, std::filesystem::file_size(path) - 1U);
+        if (corruption == 2) std::ofstream(path, std::ios::binary | std::ios::app).put('x');
+        if (corruption == 3) { std::filesystem::remove(path); std::filesystem::create_directory(path); }
+        EXPECT_THROW(CoordinatorOperationStore(root.path()), std::runtime_error) << corruption;
+        EXPECT_TRUE(std::filesystem::exists(path));
     }
 }
 
@@ -151,18 +200,24 @@ public:
     storage::StoreError verify_prepared(std::string_view, std::string_view, std::string_view,
         std::span<const std::uint32_t>) const override { return storage::StoreError::none; }
     storage::StoreError commit(std::string_view, std::string_view, std::string_view) override {
+        ++commits_;
         if (commit_error_ == storage::StoreError::none)
             state_ = replication::OperationState::committed;
         return commit_error_;
     }
     storage::StoreError abort(std::string_view, std::string_view, std::string_view) override { state_ = replication::OperationState::aborted; return storage::StoreError::none; }
-    storage::StoreError finalize(std::string_view, std::string_view, std::string_view) override { return storage::StoreError::none; }
+    storage::StoreError finalize(std::string_view, std::string_view, std::string_view) override {
+        ++finalizes_; return storage::StoreError::none;
+    }
     storage::ChunkResult get_chunk(std::string_view, std::string_view, std::uint32_t) const override { return {}; }
     storage::StoreError remove(std::string_view, std::string_view) override { return storage::StoreError::none; }
     replication::OperationQueryResult query_operation(std::string_view op) const override {
-        ++queries_; return {storage::StoreError::none, std::string(op), state_, 77};
+        ++queries_; return {query_error_, std::string(op), state_, 77};
     }
     mutable unsigned queries_{};
+    unsigned commits_{};
+    unsigned finalizes_{};
+    storage::StoreError query_error_{storage::StoreError::none};
 private:
     std::string id_;
     mutable replication::OperationState state_;
@@ -207,6 +262,63 @@ TEST(DurableRecoveryCoordinator, RestartDoesNotActAndFreshInspectionReplacesStal
     EXPECT_EQ(updated->state, CoordinatorOperationState::committed);
     EXPECT_EQ(updated->participants[1].last_state,
               replication::RecoveryParticipantState::committed);
+}
+TEST(DurableRecoveryCoordinator, PoisonedJournalDoesNotQueryOrActOnCommittedRecord) {
+    TempRoot root; bool fail_sync = false;
+    CoordinatorOperationStore store(root.path(), [&](auto point) {
+        return fail_sync && point == CoordinatorRecordFaultPoint::directory_sync;
+    });
+    auto committed = record(); committed.state = CoordinatorOperationState::committed;
+    ASSERT_EQ(store.create(committed), CoordinatorRecordError::none);
+    fail_sync = true;
+    ASSERT_EQ(store.create(record("op-2")), CoordinatorRecordError::filesystem_error);
+    auto a = std::make_shared<QueryNode>("node-a", replication::OperationState::prepared);
+    auto b = std::make_shared<QueryNode>("node-b", replication::OperationState::prepared);
+    replication::RecoveryCoordinator recovery({a, b});
+    DurableRecoveryCoordinator durable(store, recovery);
+    EXPECT_THROW(static_cast<void>(durable.inspect("op-1")), std::runtime_error);
+    EXPECT_THROW(static_cast<void>(durable.complete("op-1")), std::runtime_error);
+    EXPECT_THROW(static_cast<void>(durable.rollback("op-1")), std::runtime_error);
+    EXPECT_EQ(a->queries_, 0U); EXPECT_EQ(b->queries_, 0U);
+    EXPECT_EQ(store.get("op-1"), committed);
+}
+TEST(DurableRecoveryCoordinator, CompletionOfCommittedHistoryIsIdempotent) {
+    TempRoot root; CoordinatorOperationStore store(root.path());
+    ASSERT_EQ(store.create(record()), CoordinatorRecordError::none);
+    auto a = std::make_shared<QueryNode>("node-a", replication::OperationState::prepared);
+    auto b = std::make_shared<QueryNode>("node-b", replication::OperationState::prepared);
+    replication::RecoveryCoordinator recovery({a, b});
+    DurableRecoveryCoordinator durable(store, recovery);
+    const auto first = durable.complete("op-1"); ASSERT_TRUE(first);
+    ASSERT_EQ(first->status, replication::RecoveryActionStatus::success);
+    ASSERT_EQ(store.get("op-1")->state, CoordinatorOperationState::committed);
+    std::optional<replication::RecoveryActionResult> second;
+    EXPECT_NO_THROW(second = durable.complete("op-1")); ASSERT_TRUE(second);
+    EXPECT_EQ(second->status, replication::RecoveryActionStatus::success);
+    EXPECT_TRUE(second->acted_nodes.empty()); EXPECT_TRUE(second->failed_nodes.empty());
+    EXPECT_EQ(a->commits_, 1U); EXPECT_EQ(b->commits_, 1U);
+    EXPECT_EQ(a->finalizes_, 1U); EXPECT_EQ(b->finalizes_, 1U);
+    EXPECT_EQ(store.get("op-1")->state, CoordinatorOperationState::committed);
+}
+TEST(DurableRecoveryCoordinator, CommittedHistoryDoesNotHideUnavailableParticipant) {
+    TempRoot root; CoordinatorOperationStore store(root.path());
+    auto committed = record(); committed.state = CoordinatorOperationState::committed;
+    ASSERT_EQ(store.create(committed), CoordinatorRecordError::none);
+    auto a = std::make_shared<QueryNode>("node-a", replication::OperationState::committed);
+    auto b = std::make_shared<QueryNode>("node-b", replication::OperationState::committed);
+    b->query_error_ = storage::StoreError::filesystem_error;
+    replication::RecoveryCoordinator recovery({a, b});
+    DurableRecoveryCoordinator durable(store, recovery);
+    std::optional<replication::RecoveryActionResult> result;
+    EXPECT_NO_THROW(result = durable.complete("op-1")); ASSERT_TRUE(result);
+    EXPECT_EQ(result->status, replication::RecoveryActionStatus::rejected);
+    EXPECT_EQ(result->after.classification, replication::RecoveryClassification::unavailable_participant);
+    EXPECT_TRUE(result->acted_nodes.empty());
+    EXPECT_EQ(a->commits_, 0U); EXPECT_EQ(b->commits_, 0U);
+    EXPECT_EQ(a->finalizes_, 0U); EXPECT_EQ(b->finalizes_, 0U);
+    const auto observed = store.get("op-1"); ASSERT_TRUE(observed);
+    EXPECT_EQ(observed->state, CoordinatorOperationState::committed);
+    EXPECT_EQ(observed->participants[1].last_state, replication::RecoveryParticipantState::unavailable);
 }
 
 }  // namespace

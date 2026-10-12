@@ -5,9 +5,13 @@
 #include "atlasfs/epoch_protocol.hpp"
 
 #include <fstream>
+#include <array>
+#include <cerrno>
 #include <fcntl.h>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
 
@@ -27,6 +31,51 @@ net::TlsConfig epoch_client(net::TlsConfig&& config, const epoch::Token& token) 
 }
 bool enrolled(const std::filesystem::path& root) {
     return std::filesystem::exists(root / "epoch") || std::filesystem::exists(root / "epoch.enrolled");
+}
+std::istringstream read_record(const std::filesystem::path& path) {
+    constexpr std::size_t limit = 4096;
+    struct Descriptor {
+        int value;
+        ~Descriptor() { if (value >= 0) metrics::io::close(value); }
+    } file{metrics::io::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)};
+    struct stat status{};
+    if (file.value < 0 || ::fstat(file.value, &status) != 0 || !S_ISREG(status.st_mode) ||
+        status.st_size < 0 || static_cast<std::uint64_t>(status.st_size) > limit)
+        throw std::runtime_error("invalid durable storage operation record");
+    std::array<char, limit + 1> bytes{};
+    std::size_t count{};
+    for (;;) {
+        const auto n = metrics::io::read(file.value, bytes.data() + count, bytes.size() - count);
+        if (n > 0) {
+            count += static_cast<std::size_t>(n);
+            if (count > limit) throw std::runtime_error("oversized durable storage operation record");
+        } else if (n == 0) break;
+        else if (errno != EINTR) throw std::runtime_error("unreadable durable storage operation record");
+    }
+    std::string contents(bytes.data(), count);
+    if (contents.starts_with("RECORD")) {
+        constexpr std::string_view prefix = "RECORD1\n";
+        if (!contents.starts_with(prefix))
+            throw std::runtime_error("unsupported durable storage operation record");
+        const auto end = contents.find('\n', prefix.size());
+        if (end == std::string::npos)
+            throw std::runtime_error("incomplete durable storage operation record");
+        const auto payload = std::string_view(contents).substr(prefix.size(), end + 1 - prefix.size());
+        std::istringstream footer(contents.substr(end + 1));
+        std::string checksum_tag;
+        std::uint32_t checksum{};
+        if (!(footer >> checksum_tag >> checksum) || checksum_tag != "CRC32C" ||
+            checksum != integrity::crc32c(std::as_bytes(std::span(payload))))
+            throw std::runtime_error("corrupt durable storage operation record");
+        footer >> std::ws;
+        if (!footer.eof()) throw std::runtime_error("trailing durable storage operation record fields");
+        contents = payload;
+    }
+    return std::istringstream(std::move(contents));
+}
+void write_record(std::ostream& output, const std::string& payload) {
+    output << "RECORD1\n" << payload << "CRC32C "
+           << integrity::crc32c(std::as_bytes(std::span(payload))) << '\n';
 }
 bool read_epoch(std::istream& input, std::optional<epoch::Token>& token) {
     input >> std::ws;
@@ -402,29 +451,29 @@ void StorageNodeServer::load_records() {
     for (const auto& entry : std::filesystem::directory_iterator(operations_directory_, error)) {
         metrics::add(metrics::Counter::startup_entries);
         if (entry.path().extension() == ".tmp") continue;
-        std::ifstream input(entry.path()); unsigned state{}; Record record{};
+        auto input = read_record(entry.path()); unsigned state{}; Record record{};
         if (input >> state >> record.fingerprint >> record.probe_chunk >>
                 record.object_id >> record.generation_id &&
             state <= static_cast<unsigned>(snp::OperationState::aborted)) {
-            if (fence_ && (!entry.is_regular_file() ||
+            if (!entry.is_regular_file() ||
                 !snp::valid_operation_id(entry.path().filename().string()) ||
                 !storage::ObjectStore::valid_object_id(record.object_id) ||
                 !storage::valid_generation_id(record.generation_id) ||
-                record.probe_chunk >= storage::kMaxChunkCount))
-                throw std::runtime_error("invalid durable fenced operation record");
+                record.probe_chunk >= storage::kMaxChunkCount)
+                throw std::runtime_error("invalid durable storage operation record");
             record.state = static_cast<snp::OperationState>(state);
             if (!read_epoch(input, record.epoch)) throw std::runtime_error("invalid operation epoch binding");
-            metrics::io::observed_record_read(entry.path());
             if (!fence_ && record.state == snp::OperationState::prepared) {
                 const auto visible = node_->get_chunk(record.object_id,
                                                        record.generation_id,
                                                        record.probe_chunk);
                 record.state = visible.error == storage::StoreError::not_found
-                    ? snp::OperationState::aborted : snp::OperationState::committed;
-                static_cast<void>(persist(entry.path().filename().string(), record));
+                    ? snp::OperationState::aborted : visible.error == storage::StoreError::none
+                    ? snp::OperationState::committed : snp::OperationState::unknown;
+                record.persistence_pending = !persist(entry.path().filename().string(), record);
             }
             records_[entry.path().filename().string()] = std::move(record);
-        } else if (fence_) throw std::runtime_error("invalid durable fenced operation record");
+        } else throw std::runtime_error("invalid durable storage operation record");
     }
     if (error) throw std::system_error(error, "scan operation records");
 }
@@ -435,7 +484,7 @@ void StorageNodeServer::load_repair_records() {
     for (const auto& entry : std::filesystem::directory_iterator(repairs_directory_, error)) {
         metrics::add(metrics::Counter::startup_entries);
         if (entry.path().extension() == ".tmp") continue;
-        std::ifstream input(entry.path());
+        auto input = read_record(entry.path());
         unsigned status{};
         RepairRecord record{};
         const auto execution_id = entry.path().filename().string();
@@ -453,7 +502,6 @@ void StorageNodeServer::load_repair_records() {
             throw std::runtime_error("invalid durable repair publication record");
         }
         record.status = static_cast<snp::RepairResponseStatus>(status);
-        metrics::io::observed_record_read(entry.path());
         if (!repair_records_.emplace(execution_id, std::move(record)).second)
             throw std::runtime_error("duplicate durable repair publication record");
     }
@@ -463,11 +511,13 @@ void StorageNodeServer::load_repair_records() {
 bool StorageNodeServer::persist(std::string_view operation_id, const Record& record) {
     const auto temporary = operations_directory_ / (std::string(operation_id) + ".tmp");
     const auto final = operations_directory_ / std::string(operation_id);
-    std::ofstream output(temporary, std::ios::trunc);
-    output << static_cast<unsigned>(record.state) << ' ' << record.fingerprint << ' '
+    std::ostringstream payload;
+    payload << static_cast<unsigned>(record.state) << ' ' << record.fingerprint << ' '
            << record.probe_chunk << ' '
            << record.object_id << ' ' << record.generation_id;
-    write_epoch(output, record.epoch);
+    write_epoch(payload, record.epoch);
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    write_record(output, payload.str());
     output.flush();
     if (!output) return false;
     if (metrics::current()) metrics::io::observed_write(temporary, static_cast<std::uint64_t>(output.tellp()));
@@ -493,11 +543,13 @@ bool StorageNodeServer::persist_repair(
     std::string_view execution_id, const RepairRecord& record) {
     const auto temporary = repairs_directory_ / (std::string(execution_id) + ".tmp");
     const auto final = repairs_directory_ / std::string(execution_id);
-    std::ofstream output(temporary, std::ios::trunc);
-    output << static_cast<unsigned>(record.status) << ' ' << record.fingerprint << ' '
+    std::ostringstream payload;
+    payload << static_cast<unsigned>(record.status) << ' ' << record.fingerprint << ' '
            << record.chunk_index << ' ' << record.plan_id << ' ' << record.object_id
            << ' ' << record.generation_id;
-    write_epoch(output, record.epoch);
+    write_epoch(payload, record.epoch);
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    write_record(output, payload.str());
     output.flush();
     if (!output) return false;
     if (metrics::current()) metrics::io::observed_write(temporary, static_cast<std::uint64_t>(output.tellp()));
@@ -598,11 +650,16 @@ protocol::Message StorageNodeServer::handle(const protocol::Message& request,
             const bool same = found->second.epoch == request_epoch && found->second.fingerprint == fingerprint &&
                 found->second.object_id == decoded->object_id &&
                 found->second.generation_id == decoded->manifest.generation_id;
-            const auto error = !same ? storage::StoreError::operation_conflict :
+            auto error = !same ? storage::StoreError::operation_conflict :
                 found->second.state == snp::OperationState::prepared ? storage::StoreError::none :
                 storage::StoreError::invalid_operation_state;
+            if (error == storage::StoreError::none && found->second.persistence_pending) {
+                found->second.persistence_pending = !persist(decoded->operation_id, found->second);
+                if (found->second.persistence_pending) error = storage::StoreError::result_unknown;
+            }
             return reply(protocol::MessageType::storage_prepare_response,
-                {error, decoded->operation_id, found->second.state,
+                {error, decoded->operation_id, found->second.persistence_pending
+                    ? snp::OperationState::unknown : found->second.state,
                  found->second.fingerprint, {}});
         }
         auto error = node_->prepare(decoded->operation_id, decoded->object_id, decoded->manifest,
@@ -616,8 +673,9 @@ protocol::Message StorageNodeServer::handle(const protocol::Message& request,
                           decoded->chunk_indices.empty() ? 0U : decoded->chunk_indices.front(),
                           decoded->object_id,
                           decoded->manifest.generation_id, request_epoch};
-            if (!persist(decoded->operation_id, record)) error = storage::StoreError::filesystem_error;
-            else records_[decoded->operation_id] = record;
+            record.persistence_pending = !persist(decoded->operation_id, record);
+            if (record.persistence_pending) error = storage::StoreError::result_unknown;
+            records_[decoded->operation_id] = std::move(record);
         }
         return reply(protocol::MessageType::storage_prepare_response,
             {error, decoded->operation_id, error == storage::StoreError::none
@@ -640,7 +698,8 @@ protocol::Message StorageNodeServer::handle(const protocol::Message& request,
     if (request.type == protocol::MessageType::storage_query_request) {
         return reply(protocol::MessageType::storage_query_response,
             {storage::StoreError::none, decoded->operation_id,
-             found == records_.end() ? snp::OperationState::unknown : found->second.state,
+             found == records_.end() || found->second.persistence_pending
+                ? snp::OperationState::unknown : found->second.state,
              found == records_.end() ? 0U : found->second.fingerprint, {}});
     }
     if (request.type == protocol::MessageType::storage_delete_request) {
@@ -660,40 +719,51 @@ protocol::Message StorageNodeServer::handle(const protocol::Message& request,
     if (record.epoch != request_epoch)
         return reply(response_type, {storage::StoreError::stale_epoch,
             decoded->operation_id, record.state, record.fingerprint, {}});
+    const auto desired = request.type == protocol::MessageType::storage_commit_request
+        ? snp::OperationState::committed : snp::OperationState::aborted;
     storage::StoreError error = storage::StoreError::none;
-    if (request.type == protocol::MessageType::storage_commit_request) {
-        if (record.state == snp::OperationState::committed) error = storage::StoreError::none;
-        else if (record.state != snp::OperationState::prepared)
-            error = storage::StoreError::invalid_operation_state;
-        else {
-            error = node_->commit(decoded->operation_id, record.object_id,
-                                  record.generation_id);
-            if (error == storage::StoreError::none) {
-                record.state = snp::OperationState::committed;
-                if (!persist(decoded->operation_id, record)) error = storage::StoreError::filesystem_error;
-                else static_cast<void>(node_->finalize(decoded->operation_id, record.object_id,
-                                                       record.generation_id));
-            }
-        }
+    if (record.state == desired) {
+        // Exact terminal replay only republishes its journal; it never repeats
+        // the physical mutation or turns failed persistence into success.
+        if (record.persistence_pending)
+            record.persistence_pending = !persist(decoded->operation_id, record);
+        if (record.persistence_pending) error = storage::StoreError::result_unknown;
+    } else if (record.state == snp::OperationState::prepared && record.persistence_pending) {
+        error = storage::StoreError::result_unknown;
+    } else if (record.state == snp::OperationState::unknown && !record.pending_intent) {
+        // Surviving durable intent or uncertain physical work is not evidence
+        // that either completion or rollback is safe. No restart inference.
+        error = storage::StoreError::result_unknown;
+    } else if (record.state != snp::OperationState::prepared && record.pending_intent != desired) {
+        error = storage::StoreError::invalid_operation_state;
     } else {
-        if (record.state == snp::OperationState::aborted) error = storage::StoreError::none;
-        else if (record.state != snp::OperationState::prepared)
-            error = storage::StoreError::invalid_operation_state;
-        else {
-            error = node_->abort(decoded->operation_id, record.object_id,
-                                 record.generation_id);
+        // Publish UNKNOWN before physical work so a crash or a failed terminal
+        // journal cannot leave PREPARED evidence authorizing unsafe rollback.
+        record.state = snp::OperationState::unknown;
+        record.pending_intent = desired;
+        if (!persist(decoded->operation_id, record)) {
+            error = storage::StoreError::result_unknown;
+        } else {
+            record.pending_intent.reset();
+            error = desired == snp::OperationState::committed
+                ? node_->commit(decoded->operation_id, record.object_id, record.generation_id)
+                : node_->abort(decoded->operation_id, record.object_id, record.generation_id);
             if (error == storage::StoreError::none) {
-                record.state = snp::OperationState::aborted;
-                if (!persist(decoded->operation_id, record)) error = storage::StoreError::filesystem_error;
-            }
+                record.state = desired;
+                record.persistence_pending = !persist(decoded->operation_id, record);
+                if (record.persistence_pending) error = storage::StoreError::result_unknown;
+            } else error = storage::StoreError::result_unknown;
         }
     }
+    if (error == storage::StoreError::none && desired == snp::OperationState::committed)
+        static_cast<void>(node_->finalize(decoded->operation_id, record.object_id, record.generation_id));
     if (request.type == protocol::MessageType::storage_commit_request &&
         error == storage::StoreError::none && drop_commit_response_once_) {
         drop_commit_response_once_ = false;
         throw std::runtime_error("injected lost commit response");
     }
-    return reply(response_type, {error, decoded->operation_id, record.state,
+    return reply(response_type, {error, decoded->operation_id, record.persistence_pending
+                                 ? snp::OperationState::unknown : record.state,
                                  record.fingerprint, {}});
 }
 

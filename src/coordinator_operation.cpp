@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
-#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <system_error>
@@ -82,7 +81,8 @@ bool valid_record(const CoordinatorOperationRecord& record) {
         if (!NodeRegistry::valid_node_id(participant.node_id) ||
             (!previous.empty() && participant.node_id <= previous) ||
             !valid_participant_state(participant.last_state) ||
-            participant.last_error > storage::StoreError::result_unknown ||
+            participant.last_error < storage::StoreError::none ||
+            participant.last_error > storage::StoreError::epoch_unresolved ||
             participant.chunk_indices.size() > storage::kMaxChunkCount ||
             !std::is_sorted(participant.chunk_indices.begin(), participant.chunk_indices.end()) ||
             std::adjacent_find(participant.chunk_indices.begin(), participant.chunk_indices.end()) !=
@@ -97,6 +97,31 @@ bool valid_record(const CoordinatorOperationRecord& record) {
     return true;
 }
 bool sync_fd(int fd) { int rc; do { rc = metrics::io::fsync(fd); } while (rc < 0 && errno == EINTR); return rc == 0; }
+std::optional<std::vector<std::byte>> read_record(const std::filesystem::path& path) {
+    const int fd = metrics::io::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return std::nullopt;
+    struct stat status{};
+    if (::fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) || status.st_size < 0 ||
+        static_cast<std::uint64_t>(status.st_size) > kMaxRecordSize) {
+        metrics::io::close(fd); return std::nullopt;
+    }
+    std::vector<std::byte> bytes;
+    try { bytes.resize(static_cast<std::size_t>(status.st_size)); }
+    catch (...) { metrics::io::close(fd); throw; }
+    std::size_t offset{}; bool okay = true;
+    while (offset < bytes.size()) {
+        const auto count = metrics::io::read(fd, bytes.data() + offset, bytes.size() - offset);
+        if (count > 0) offset += static_cast<std::size_t>(count);
+        else if (count < 0 && errno == EINTR) continue;
+        else { okay = false; break; }
+    }
+    std::byte extra{}; ssize_t count;
+    do { count = metrics::io::read(fd, &extra, 1); } while (count < 0 && errno == EINTR);
+    if (count != 0) okay = false;
+    if (metrics::io::close(fd) != 0) okay = false;
+    if (!okay) return std::nullopt;
+    return bytes;
+}
 
 }  // namespace
 
@@ -196,11 +221,8 @@ CoordinatorOperationStore::CoordinatorOperationStore(std::filesystem::path root,
         metrics::add(metrics::Counter::startup_entries);
         const auto name = entry.path().filename().string();
         if (name.ends_with(".tmp")) continue;
-        std::ifstream input(entry.path(), std::ios::binary);
-        std::vector<std::byte> bytes;
-        for (char value; input.get(value);) bytes.push_back(static_cast<std::byte>(value));
-        metrics::io::observed_read(bytes.size());
-        const auto record = decode_coordinator_operation(bytes);
+        const auto bytes = read_record(entry.path());
+        const auto record = bytes ? decode_coordinator_operation(*bytes) : std::nullopt;
         if (!record || record->operation_id != name || !records_.emplace(name, *record).second)
             throw std::runtime_error("invalid durable coordinator operation record");
     }
@@ -208,6 +230,7 @@ CoordinatorOperationStore::CoordinatorOperationStore(std::filesystem::path root,
 }
 
 CoordinatorRecordError CoordinatorOperationStore::create(const CoordinatorOperationRecord& record) {
+    if (durability_unknown_) return CoordinatorRecordError::filesystem_error;
     if (!valid_record(record)) return CoordinatorRecordError::invalid_record;
     const auto found = records_.find(record.operation_id);
     if (found != records_.end()) return found->second == record ? CoordinatorRecordError::none
@@ -215,6 +238,7 @@ CoordinatorRecordError CoordinatorOperationStore::create(const CoordinatorOperat
     return persist(record);
 }
 CoordinatorRecordError CoordinatorOperationStore::update(const CoordinatorOperationRecord& record) {
+    if (durability_unknown_) return CoordinatorRecordError::filesystem_error;
     if (!valid_record(record)) return CoordinatorRecordError::invalid_record;
     const auto found = records_.find(record.operation_id);
     if (found == records_.end()) return CoordinatorRecordError::not_found;
@@ -258,6 +282,7 @@ CoordinatorRecordError CoordinatorOperationStore::persist(const CoordinatorOpera
         return CoordinatorRecordError::filesystem_error;
     std::error_code error; metrics::io::rename(temporary, final, error);
     if (error) return CoordinatorRecordError::filesystem_error;
+    durability_unknown_ = true;
     if (fault_injector_ && fault_injector_(CoordinatorRecordFaultPoint::directory_sync))
         return CoordinatorRecordError::filesystem_error;
     const int directory = metrics::io::open(operations_directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -267,6 +292,7 @@ CoordinatorRecordError CoordinatorOperationStore::persist(const CoordinatorOpera
     if (!directory_synced || !directory_closed)
         return CoordinatorRecordError::filesystem_error;
     records_[record.operation_id] = record;
+    durability_unknown_ = false;
     return CoordinatorRecordError::none;
 }
 std::optional<CoordinatorOperationRecord> CoordinatorOperationStore::get(
@@ -280,6 +306,7 @@ std::vector<CoordinatorOperationRecord> CoordinatorOperationStore::list() const 
     for (const auto& [id, record] : records_) { static_cast<void>(id); result.push_back(record); }
     return result;
 }
+bool CoordinatorOperationStore::durability_unknown() const noexcept { return durability_unknown_; }
 const std::filesystem::path& CoordinatorOperationStore::operations_directory() const noexcept {
     return operations_directory_;
 }
@@ -366,18 +393,26 @@ void DurableRecoveryCoordinator::save_report(CoordinatorOperationRecord& record,
 }
 std::optional<replication::RecoveryReport> DurableRecoveryCoordinator::inspect(
     std::string_view operation_id) {
+    if (store_.durability_unknown()) throw std::runtime_error("operation journal durability unknown");
     auto record = store_.get(operation_id); if (!record) return std::nullopt;
     auto report = recovery_.inspect(request_for(*record)); save_report(*record, report); return report;
 }
 std::optional<replication::RecoveryActionResult> DurableRecoveryCoordinator::complete(
     std::string_view operation_id) {
+    if (store_.durability_unknown()) throw std::runtime_error("operation journal durability unknown");
     auto record = store_.get(operation_id); if (!record) return std::nullopt;
-    record->state = CoordinatorOperationState::committing;
-    if (store_.update(*record) != CoordinatorRecordError::none) throw std::runtime_error("persist committing");
+    if (record->state != CoordinatorOperationState::committed) {
+        record->state = CoordinatorOperationState::committing;
+        if (store_.update(*record) != CoordinatorRecordError::none)
+            throw std::runtime_error("persist committing");
+    }
+    // A committed journal remains immutable, but an explicit replay still
+    // takes fresh participant evidence rather than assuming availability.
     auto result = recovery_.complete(request_for(*record)); save_report(*record, result.after); return result;
 }
 std::optional<replication::RecoveryActionResult> DurableRecoveryCoordinator::rollback(
     std::string_view operation_id) {
+    if (store_.durability_unknown()) throw std::runtime_error("operation journal durability unknown");
     auto record = store_.get(operation_id); if (!record) return std::nullopt;
     if (record->state != CoordinatorOperationState::committed) {
         record->state = CoordinatorOperationState::aborting;

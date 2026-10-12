@@ -26,7 +26,7 @@ struct MembershipSnapshot {
 };
 
 enum class MembershipError {
-    none, invalid_node, duplicate_node, unknown_node, persistence_error
+    none, invalid_node, duplicate_node, unknown_node, persistence_error, version_exhausted
 };
 enum class MembershipFaultPoint { record_creation, record_write, record_sync, record_rename,
                                   directory_sync };
@@ -66,14 +66,18 @@ public:
     [[nodiscard]] std::vector<StorageNode> list() const;
     [[nodiscard]] std::vector<StorageNode> eligible_nodes() const;
     [[nodiscard]] std::uint64_t version() const noexcept;
+    // Post-rename synchronization failure makes this instance diagnostic-only.
+    // Close it and reopen surviving state before making any further decision.
+    [[nodiscard]] bool durability_unknown() const noexcept;
     [[nodiscard]] const std::filesystem::path& record_path() const noexcept;
 private:
-    [[nodiscard]] MembershipError publish(const NodeRegistry& candidate);
+    [[nodiscard]] MembershipError publish(NodeRegistry candidate);
     NodeRegistry registry_;
     std::filesystem::path directory_;
     std::filesystem::path record_path_;
     FailureDetectorConfig config_;
     MembershipFaultInjector fault_injector_;
+    bool durability_unknown_{};
 };
 
 }  // namespace atlasfs::metadata

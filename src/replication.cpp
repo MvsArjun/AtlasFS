@@ -93,6 +93,8 @@ storage::StoreError LocalStorageNode::prepare(
     if (const auto found = operations_.find(operation_id); found != operations_.end()) {
         if (found->second.fingerprint != fingerprint)
             return storage::StoreError::operation_conflict;
+        if (found->second.state == OperationState::unknown)
+            return storage::StoreError::result_unknown;
         return found->second.state == OperationState::prepared
             ? storage::StoreError::none : storage::StoreError::invalid_operation_state;
     }
@@ -114,11 +116,13 @@ storage::StoreError LocalStorageNode::commit(std::string_view operation_id,
                                              std::string_view generation_id) {
     const auto found = operations_.find(operation_id);
     if (found == operations_.end()) return storage::StoreError::operation_conflict;
+    if (found->second.state == OperationState::unknown) return storage::StoreError::result_unknown;
     if (found->second.state == OperationState::committed) return storage::StoreError::none;
     if (found->second.state != OperationState::prepared)
         return storage::StoreError::invalid_operation_state;
     const auto error = store_.commit_replica(object_id, generation_id);
     if (error == storage::StoreError::none) found->second.state = OperationState::committed;
+    else if (error == storage::StoreError::result_unknown) found->second.state = OperationState::unknown;
     return error;
 }
 
@@ -127,12 +131,14 @@ storage::StoreError LocalStorageNode::abort(std::string_view operation_id,
                                             std::string_view generation_id) {
     const auto found = operations_.find(operation_id);
     if (found == operations_.end()) return storage::StoreError::operation_conflict;
+    if (found->second.state == OperationState::unknown) return storage::StoreError::result_unknown;
     if (found->second.state == OperationState::aborted) return storage::StoreError::none;
     if (found->second.state != OperationState::prepared &&
         found->second.state != OperationState::committed)
         return storage::StoreError::invalid_operation_state;
     const auto error = store_.abort_replica(object_id, generation_id);
     if (error == storage::StoreError::none) found->second.state = OperationState::aborted;
+    else if (error == storage::StoreError::result_unknown) found->second.state = OperationState::unknown;
     return error;
 }
 

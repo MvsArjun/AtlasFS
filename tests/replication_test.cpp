@@ -1,5 +1,6 @@
 #include "atlasfs/checksum.hpp"
 #include "atlasfs/replication.hpp"
+#include "atlasfs/recovery.hpp"
 
 #include <gtest/gtest.h>
 
@@ -209,6 +210,38 @@ TEST(ReplicaManager, FailedReplacementPreservesOldGeneration) {
     const auto restored = manager.get(old_plan);
     EXPECT_EQ(restored.status, ReplicationStatus::success);
     EXPECT_EQ(restored.data, old_data);
+}
+
+TEST(ReplicaManager, LocalCommitDirectorySyncUnknownDoesNotTriggerRollback) {
+    TemporaryDirectory directory;
+    const auto data = sample_data();
+    const auto plan = make_plan(3, make_manifest("generation-unknown-sync", data));
+    unsigned sync_attempts{};
+    auto nodes = make_nodes(directory.path(), {}, {}, [&](storage::PutFaultPoint point) {
+        return point == storage::PutFaultPoint::directory_sync && ++sync_attempts == 3;
+    });
+    ReplicaManager manager(as_storage_nodes(nodes));
+    const auto result = manager.put(plan, data, "unknown-sync-operation");
+    EXPECT_EQ(result.status, ReplicationStatus::commit_result_unknown);
+    EXPECT_EQ(result.failed_nodes, (std::vector<std::string>{"node-c"}));
+    EXPECT_TRUE(result.rollback_failed_nodes.empty());
+    for (const auto& node : nodes) {
+        const auto visible = node->get_chunk("object", plan.generation_id, 0);
+        EXPECT_EQ(visible.error, storage::StoreError::none);
+        EXPECT_EQ(node->query_operation("unknown-sync-operation").state,
+            node->id() == "node-c" ? OperationState::unknown : OperationState::committed);
+    }
+    EXPECT_EQ(nodes.back()->commit("unknown-sync-operation", "object", plan.generation_id),
+        storage::StoreError::result_unknown);
+    EXPECT_EQ(nodes.back()->abort("unknown-sync-operation", "object", plan.generation_id),
+        storage::StoreError::result_unknown);
+    RecoveryCoordinator recovery(as_storage_nodes(nodes));
+    const auto query = nodes.back()->query_operation("unknown-sync-operation");
+    const auto report = recovery.inspect({"unknown-sync-operation", query.fingerprint,
+        "object", plan.generation_id, {"node-a", "node-b", "node-c"}});
+    EXPECT_EQ(report.classification, RecoveryClassification::unknown_participant);
+    EXPECT_FALSE(report.completion_allowed);
+    EXPECT_FALSE(report.rollback_allowed);
 }
 
 TEST(ReplicaManager, FallsBackFromCorruptAndMissingReplicas) {

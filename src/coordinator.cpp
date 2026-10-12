@@ -48,6 +48,7 @@ CoordinatorError map_error(RegistryError error) {
         case RegistryError::invalid_node: return CoordinatorError::invalid_node;
         case RegistryError::duplicate_node: return CoordinatorError::duplicate_node;
         case RegistryError::unknown_node: return CoordinatorError::unknown_node;
+        case RegistryError::version_exhausted: return CoordinatorError::version_exhausted;
     }
     return CoordinatorError::invalid_node;
 }

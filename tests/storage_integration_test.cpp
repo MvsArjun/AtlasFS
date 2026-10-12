@@ -190,18 +190,31 @@ TEST(StorageIntegration, ReportsChecksumMismatchAndInvalidIdentifier) {
 }
 
 TEST(StorageIntegration, ReportsPersistedCorruptionWithoutReturningData) {
-    TemporaryDirectory directory;
-    const auto input = bytes({1, 2, 3});
-    {
-        RunningStorageServer server(directory.path());
-        net::TcpClient client(server.port());
-        ASSERT_EQ(put(client, 30, "object", input), object_protocol::Status::success);
-        client.close();
-        server.stop_and_rethrow();
-    }
-    const auto object_path = directory.path() / "objects" / "committed" / "object";
-    std::filesystem::resize_file(object_path, std::filesystem::file_size(object_path) - 1U);
-    {
+    for (const bool corrupt_manifest : {true, false}) {
+        TemporaryDirectory directory;
+        const auto input = bytes({1, 2, 3});
+        {
+            RunningStorageServer server(directory.path());
+            net::TcpClient client(server.port());
+            ASSERT_EQ(put(client, 30, "object", input), object_protocol::Status::success);
+            client.close();
+            server.stop_and_rethrow();
+        }
+        std::filesystem::path generation;
+        {
+            ObjectStore store(directory.path());
+            generation = std::filesystem::directory_iterator(store.chunks_directory())->path();
+        }
+        const auto object_path = directory.path() / "objects" / "committed" / "object";
+        if (corrupt_manifest) {
+            std::filesystem::resize_file(object_path, std::filesystem::file_size(object_path) - 1U);
+            EXPECT_THROW(RunningStorageServer(directory.path()), std::runtime_error);
+            EXPECT_TRUE(std::filesystem::exists(object_path));
+            EXPECT_TRUE(std::filesystem::exists(generation / "manifest"));
+            EXPECT_EQ(std::filesystem::file_size(generation / "chunk_000000"), input.size());
+            continue;
+        }
+        std::filesystem::resize_file(generation / "chunk_000000", input.size() - 1U);
         RunningStorageServer server(directory.path());
         net::TcpClient client(server.port());
         const auto result = get(client, 31, "object");

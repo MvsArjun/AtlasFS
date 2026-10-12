@@ -1,8 +1,10 @@
 # AtlasFS
 
-AtlasFS is a C++20/Linux object-storage systems project. The current milestone
-provides a documented binary wire format, incremental stream parser, bounded
-POSIX TCP/OpenSSL mutual TLS transport, and persistent single-node PUT, GET, and DELETE operations.
+AtlasFS is a C++20/Linux object-storage systems project with one coordinator,
+chunked persistent storage, deterministic replication, durable recovery and repair,
+an authoritative replica catalog, epoch fencing, and bounded POSIX TCP/OpenSSL
+mutual-TLS transport. It provides reusable libraries and a benchmark executable,
+not a packaged production daemon. Network listeners currently use loopback.
 Objects survive server restarts and are verified with CRC-32C before being
 returned. Storage splits every logical object into configurable chunks (1 MiB by
 default), protects each chunk and the whole object, and commits through a durable
@@ -64,7 +66,8 @@ reread, and verify repair bytes before atomic publication. Completion requires a
 confirmed physical publication followed by a durable catalog compare-and-swap
 against the plan's evidence. A lost remote response remains explicitly unknown;
 a CAS conflict leaves a physical but non-authoritative replica for operator
-inspection. Historical operation records remain immutable. There is no automatic
+inspection. Historical operation identities and participants remain immutable;
+explicit recovery may refresh observations and lifecycle knowledge. There is no automatic
 approval, execution, retry, replan, source/target reselection, or background
 repair.
 
@@ -94,13 +97,30 @@ version and is published by synchronized temporary-file write, atomic rename,
 and parent-directory synchronization. Corrupt published state stops startup
 without deletion. If the rename succeeds but directory synchronization cannot be
 confirmed, the catalog reports unknown durability and rejects later mutations in
-that process. This current-state catalog is distinct from immutable `ACOP`
+that process. This current-state catalog is distinct from identity-preserving `ACOP`
 operation history and `ARPL` repair journals. Compare-and-swap validates the
 exact global catalog version and full expected replica state before atomically
 publishing one chunk's desired state. Successful mutations advance the global
 version and only the changed record's version. One active coordinator/catalog
 owner and explicit catalog population are required; cross-process writers are
 deliberately deferred.
+
+## Release candidate scope
+
+Milestone 23 audits the final planned single-coordinator architecture. The
+[release-readiness report](docs/release-readiness.md) records actual verification,
+publication provenance, compatibility and operator procedures. The proposed
+candidate is **0.1.0-rc.1 (library/source)**; no formal release or tag is published.
+Passing hosted CI does not establish production capacity or physical power-loss
+durability. Exclusive durable roots, credential permissions, optional CRLs,
+external epoch checkpoints and quiesced upgrades remain operator responsibilities.
+
+Unconfirmed coordinator-store, replica and node-journal publication stays unknown:
+coordinator stores reject
+further mutations in that instance, and node commit/abort intent is persisted
+before physical action. New node journals have versioned whole-record CRC-32C;
+legacy journals remain readable but are not equivalently protected. Do not
+downgrade newly written roots to older binaries. See the report before deployment.
 
 ## Build and test
 

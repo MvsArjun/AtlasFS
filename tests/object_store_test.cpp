@@ -13,6 +13,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
 #include <vector>
@@ -95,6 +96,91 @@ TEST(ObjectStore, SupportsEmptyObjects) {
     EXPECT_TRUE(result.data.empty());
 }
 
+TEST(ObjectStore, ReplicaCommitSyncFailureRemainsUnknownOnDuplicateAndFinalize) {
+    TemporaryDirectory directory;
+    bool fail_sync{};
+    unsigned sync_attempts{};
+    ObjectStore store(directory.path(), 1024, 4, [&](PutFaultPoint point) {
+        if (point != PutFaultPoint::directory_sync) return false;
+        ++sync_attempts;
+        return fail_sync;
+    });
+    const auto data = bytes({1, 2, 3, 4});
+    const ObjectManifest manifest{data.size(), 4, integrity::crc32c(data),
+        "uncertain-generation", {{0, 4, integrity::crc32c(data)}}};
+    const std::vector<std::uint32_t> chunks{0};
+    ASSERT_EQ(store.prepare_replica("object", manifest, chunks, data), StoreError::none);
+    fail_sync = true;
+    EXPECT_EQ(store.commit_replica("object", manifest.generation_id), StoreError::result_unknown);
+    ASSERT_EQ(store.get("object").data, data); // Visibility is not durability evidence.
+    const auto attempts_after_failure = sync_attempts;
+    fail_sync = false;
+    EXPECT_EQ(store.commit_replica("object", manifest.generation_id), StoreError::result_unknown);
+    EXPECT_EQ(store.finalize_replica("object", manifest.generation_id), StoreError::result_unknown);
+    EXPECT_EQ(store.abort_replica("object", manifest.generation_id), StoreError::result_unknown);
+    EXPECT_EQ(sync_attempts, attempts_after_failure);
+    EXPECT_EQ(store.get("object").data, data);
+}
+
+TEST(ObjectStore, UncertainReplicaReplacementDoesNotRollbackOrDiscardPreviousGeneration) {
+    TemporaryDirectory directory;
+    const auto previous_data = bytes({8, 7, 6, 5});
+    const auto replacement = bytes({1, 2, 3, 4});
+    std::string replacement_generation = "uncertain-replacement";
+    {
+        bool fail_sync{};
+        ObjectStore store(directory.path(), 1024, 4, [&](PutFaultPoint point) {
+            return fail_sync && point == PutFaultPoint::directory_sync;
+        });
+        ASSERT_EQ(put(store, "object", previous_data), StoreError::none);
+        const auto previous = manifest_for(store, "object");
+        const ObjectManifest manifest{replacement.size(), 4, integrity::crc32c(replacement),
+            replacement_generation, {{0, 4, integrity::crc32c(replacement)}}};
+        const std::vector<std::uint32_t> chunks{0};
+        ASSERT_EQ(store.prepare_replica("object", manifest, chunks, replacement), StoreError::none);
+        fail_sync = true;
+        EXPECT_EQ(store.commit_replica("object", manifest.generation_id), StoreError::result_unknown);
+        fail_sync = false;
+        EXPECT_EQ(store.abort_replica("object", manifest.generation_id), StoreError::result_unknown);
+        EXPECT_EQ(store.finalize_replica("object", manifest.generation_id), StoreError::result_unknown);
+        EXPECT_TRUE(std::filesystem::exists(store.chunks_directory() / previous.generation_id));
+        EXPECT_EQ(store.get("object").data, replacement);
+    }
+    // Restart inspects the surviving manifest. This is not a physical power-loss test.
+    ObjectStore restarted(directory.path(), 1024, 4);
+    EXPECT_EQ(restarted.get("object").data, replacement);
+    EXPECT_EQ(manifest_for(restarted, "object").generation_id, replacement_generation);
+}
+
+TEST(ObjectStore, ReplicaRollbackSyncFailureCannotReportCommittedOrRetryCleanup) {
+    for (const unsigned failure_sync : {1U, 2U, 3U}) {
+        TemporaryDirectory directory;
+        bool fail_sync{};
+        unsigned syncs{};
+        ObjectStore store(directory.path(), 1024, 4, [&](PutFaultPoint point) {
+            return fail_sync && point == PutFaultPoint::directory_sync &&
+                   ++syncs == (failure_sync == 3U ? 1U : failure_sync);
+        });
+        const auto old_data = bytes({8, 7, 6, 5});
+        ASSERT_EQ(put(store, "object", old_data), StoreError::none);
+        const auto data = bytes({1, 2, 3, 4});
+        const ObjectManifest manifest{data.size(), 4, integrity::crc32c(data),
+            "rollback-generation", {{0, 4, integrity::crc32c(data)}}};
+        const std::vector<std::uint32_t> chunks{0};
+        ASSERT_EQ(store.prepare_replica("object", manifest, chunks, data), StoreError::none);
+        if (failure_sync != 3U) {
+            ASSERT_EQ(store.commit_replica("object", manifest.generation_id), StoreError::none);
+        }
+        fail_sync = true;
+        EXPECT_EQ(store.abort_replica("object", manifest.generation_id), StoreError::result_unknown);
+        EXPECT_EQ(store.get("object").data, old_data);
+        fail_sync = false;
+        EXPECT_EQ(store.commit_replica("object", manifest.generation_id), StoreError::result_unknown);
+        EXPECT_EQ(store.abort_replica("object", manifest.generation_id), StoreError::result_unknown);
+        EXPECT_EQ(store.finalize_replica("object", manifest.generation_id), StoreError::result_unknown);
+    }
+}
+
 TEST(ObjectStore, OverwriteAtomicallyReplacesExistingObject) {
     TemporaryDirectory directory;
     ObjectStore store(directory.path());
@@ -151,9 +237,11 @@ TEST(ObjectStore, RejectsSuppliedChecksumMismatchWithoutTemporaryFiles) {
 
 TEST(ObjectStore, DetectsPersistedDataCorruptionAfterRestart) {
     TemporaryDirectory directory;
+    std::filesystem::path generation;
     {
         ObjectStore store(directory.path());
         ASSERT_EQ(put(store, "x", bytes({1, 2, 3})), StoreError::none);
+        generation = store.chunks_directory() / manifest_for(store, "x").generation_id;
     }
     const auto path = directory.path() / "objects" / "committed" / "x";
     std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
@@ -162,8 +250,13 @@ TEST(ObjectStore, DetectsPersistedDataCorruptionAfterRestart) {
     file.put(static_cast<char>(0xff));
     file.close();
 
-    ObjectStore reopened(directory.path());
-    EXPECT_EQ(reopened.get("x").error, StoreError::corrupt_object);
+    const auto corrupt_manifest = read_file(path);
+    const auto generation_manifest = read_file(generation / "manifest");
+    const auto chunk = read_file(generation / "chunk_000000");
+    EXPECT_THROW(ObjectStore(directory.path()), std::runtime_error);
+    EXPECT_EQ(read_file(path), corrupt_manifest);
+    EXPECT_EQ(read_file(generation / "manifest"), generation_manifest);
+    EXPECT_EQ(read_file(generation / "chunk_000000"), chunk);
 }
 
 TEST(ObjectStore, RejectsUnexpectedDirectoryEntry) {
@@ -305,6 +398,63 @@ TEST(ObjectStore, FailedPutAtEveryInjectedStagePreservesOldObjectAndCleansState)
         }
         EXPECT_EQ(generations, 1U);
     }
+}
+
+TEST(ObjectStore, StartupRejectsCorruptPublishedManifestBeforeReclaimingGenerations) {
+    for (const unsigned corruption : {0U, 1U, 2U}) {
+        TemporaryDirectory directory;
+        std::filesystem::path generation;
+        std::filesystem::path published;
+        std::vector<std::byte> encoded;
+        {
+            ObjectStore store(directory.path(), 1024, 4);
+            ASSERT_EQ(put(store, "kept", bytes({1, 2, 3, 4})), StoreError::none);
+            const auto manifest = manifest_for(store, "kept");
+            generation = store.chunks_directory() / manifest.generation_id;
+            published = store.objects_directory() / "kept";
+            encoded = encode_manifest(manifest);
+        }
+        if (corruption == 0U) {
+            encoded.back() ^= std::byte{1};
+            write_file(published, encoded);
+        } else if (corruption == 1U) {
+            encoded.resize(3);
+            write_file(published, encoded);
+        } else {
+            std::filesystem::remove(published);
+            std::filesystem::create_directory(published);
+        }
+        EXPECT_THROW(ObjectStore(directory.path(), 1024, 4), std::runtime_error);
+        EXPECT_TRUE(std::filesystem::exists(published));
+        EXPECT_TRUE(std::filesystem::exists(generation / "manifest"));
+        EXPECT_TRUE(std::filesystem::exists(generation / "chunk_000000"));
+    }
+}
+
+TEST(ObjectStore, StartupRejectsPublishedFifoWithoutWriterAndPreservesGenerations) {
+    TemporaryDirectory directory;
+    std::filesystem::path published;
+    std::filesystem::path generation;
+    std::filesystem::path orphan;
+    {
+        ObjectStore store(directory.path(), 1024, 4);
+        ASSERT_EQ(put(store, "kept", bytes({1, 2, 3, 4})), StoreError::none);
+        generation = store.chunks_directory() / manifest_for(store, "kept").generation_id;
+        published = store.objects_directory() / "kept";
+        orphan = store.chunks_directory() / "unreferenced-generation";
+        std::filesystem::create_directory(orphan);
+        write_file(orphan / "evidence", bytes({9, 8, 7}));
+    }
+    const auto generation_manifest = read_file(generation / "manifest");
+    const auto chunk = read_file(generation / "chunk_000000");
+    ASSERT_TRUE(std::filesystem::remove(published));
+    ASSERT_EQ(::mkfifo(published.c_str(), 0600), 0);
+    // There is deliberately no FIFO writer: open must not block before fstat.
+    EXPECT_THROW(ObjectStore(directory.path(), 1024, 4), std::runtime_error);
+    EXPECT_EQ(std::filesystem::symlink_status(published).type(), std::filesystem::file_type::fifo);
+    EXPECT_EQ(read_file(generation / "manifest"), generation_manifest);
+    EXPECT_EQ(read_file(generation / "chunk_000000"), chunk);
+    EXPECT_EQ(read_file(orphan / "evidence"), bytes({9, 8, 7}));
 }
 
 TEST(ObjectStore, StartupRemovesTransactionsTemporaryManifestsAndOrphanGenerations) {

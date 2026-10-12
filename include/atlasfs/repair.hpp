@@ -99,12 +99,15 @@ public:
     [[nodiscard]] RepairStoreError update(const RepairPlan& plan);
     [[nodiscard]] std::optional<RepairPlan> get(std::string_view plan_id) const;
     [[nodiscard]] std::vector<RepairPlan> list() const;
+    // Reads retain the prior diagnostic index; mutation requires reopening.
+    [[nodiscard]] bool durability_unknown() const noexcept;
     [[nodiscard]] const std::filesystem::path& plans_directory() const noexcept;
 private:
     [[nodiscard]] RepairStoreError persist(const RepairPlan& plan);
     std::filesystem::path directory_;
     RepairFaultInjector fault_;
     std::map<std::string, RepairPlan, std::less<>> plans_;
+    bool durability_unknown_{};
 };
 
 struct RepairExecutionResult {

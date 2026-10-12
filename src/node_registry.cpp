@@ -1,6 +1,7 @@
 #include "atlasfs/node_registry.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace atlasfs::metadata {
@@ -22,6 +23,10 @@ RegistryError NodeRegistry::add(StorageNode node) {
         !valid_state(node.state) || !valid_health(node.health)) {
         return RegistryError::invalid_node;
     }
+    if (version_ == std::numeric_limits<std::uint64_t>::max()) {
+        return nodes_.contains(node.node_id) ? RegistryError::duplicate_node
+                                             : RegistryError::version_exhausted;
+    }
     auto node_id = node.node_id;
     const auto [iterator, inserted] = nodes_.emplace(std::move(node_id), std::move(node));
     static_cast<void>(iterator);
@@ -41,6 +46,8 @@ RegistryError NodeRegistry::set_health(std::string_view node_id, NodeHealthState
     auto& node = iterator->second;
     if (node.health != health || node.consecutive_failures != consecutive_failures ||
         node.health_current != health_current) {
+        if (version_ == std::numeric_limits<std::uint64_t>::max())
+            return RegistryError::version_exhausted;
         node.health = health;
         node.consecutive_failures = consecutive_failures;
         node.health_current = health_current;
@@ -67,6 +74,8 @@ RegistryError NodeRegistry::remove(std::string_view node_id) {
     if (iterator == nodes_.end()) {
         return RegistryError::unknown_node;
     }
+    if (version_ == std::numeric_limits<std::uint64_t>::max())
+        return RegistryError::version_exhausted;
     nodes_.erase(iterator);
     ++version_;
     return RegistryError::none;
@@ -81,6 +90,8 @@ RegistryError NodeRegistry::set_state(std::string_view node_id, NodeState state)
         return RegistryError::unknown_node;
     }
     if (iterator->second.state != state) {
+        if (version_ == std::numeric_limits<std::uint64_t>::max())
+            return RegistryError::version_exhausted;
         iterator->second.state = state;
         ++version_;
     }

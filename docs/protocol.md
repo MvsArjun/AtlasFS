@@ -130,9 +130,32 @@ QUERY_OPERATION on a new connection can resolve the durable state.
 
 QUERY_OPERATION responses include the durable PREPARE fingerprint in addition to
 the echoed operation ID and state. Recovery clients must compare both values with
-the expected operation identity. UNKNOWN operations have no stored fingerprint.
+the expected operation identity. Absent operations have no stored fingerprint;
+an unresolved operation with durable intent retains its original fingerprint.
 This version-2 field is required by Milestone 8 recovery clients. Version-1
 Milestone 7 payloads are rejected rather than being misinterpreted.
+
+### Node-journal publication (Milestone 23)
+
+This is a persistence change, not a new wire version. New operation and repair
+records use `RECORD1\n`, the existing single payload line (including its newline),
+then `CRC32C <decimal checksum>\n`. CRC-32C covers the complete payload, including
+state, identity, fingerprint and optional epoch. Readers bound records to 4 KiB,
+require regular non-symlink files, and reject unknown wrapper versions, malformed
+footers, corruption and trailing fields. Legacy unwrapped text remains readable
+but lacks whole-record protection. Older binaries are unsupported on upgraded
+journals; some old unfenced readers skip unsupported records, so downgrade is
+not a safe recovery mechanism.
+
+COMMIT/ABORT persist UNKNOWN intent before physical action. Intent publication
+failure causes no physical mutation. If physical success is known but terminal
+journal publication fails, QUERY and the original response remain unknown;
+explicit matching replay in the same process may publish only the terminal
+journal, not repeat the mutation. Opposite transitions are rejected. A surviving
+UNKNOWN record after restart remains unknown and explicit recovery refuses both
+completion and rollback. A surviving valid terminal candidate can resolve an
+after-rename journal ambiguity on reopening; this is surviving-filesystem
+evidence, not proof of physical power-loss durability. No automatic retry occurs.
 
 ### Remote repair publication
 

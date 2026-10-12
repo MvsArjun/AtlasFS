@@ -9,7 +9,8 @@ requests, sends complete frames, and uses `StreamParser` to receive responses.
 parses arbitrary receive chunks in connection-owned parsers, admits handlers
 through one bounded FIFO, and reliably sends encoded responses. `StorageRequestHandler`
 decodes operation payloads and delegates filesystem work to `ObjectStore`. The
-wire-facing path remains single-node; replication is deliberately in-process.
+logical-object handler remains single-node; an in-process coordinator can also
+orchestrate replicated storage through the authenticated storage-node RPC boundary.
 
 AtlasFS also has an in-process control-plane foundation:
 
@@ -51,9 +52,13 @@ TCP path remains a separate transport integration.
 
 The remote path reuses the 24-byte frame and incremental parser. Its storage
 protocol is separate from logical-object PUT/GET/DELETE. A durable operation
-journal fingerprints PREPARE and records PREPARED, COMMITTED, or ABORTED. Exact
+journal fingerprints PREPARE and records UNKNOWN, PREPARED, COMMITTED, or ABORTED. Exact
 duplicates are deterministic; conflicting ID reuse and invalid transitions are
-rejected. On restart unfinished PREPARE is conservatively recovered as ABORTED.
+rejected. Commit/abort durably publish UNKNOWN intent before physical mutation.
+Surviving UNKNOWN intent is not adopted automatically after restart. Fenced
+PREPARED records retain their state; legacy unfenced PREPARED records probe the
+surviving generation (valid means committed, absent means aborted, other errors
+mean unknown). This legacy inference is not an epoch migration procedure.
 If a COMMIT response is lost, the client reports an unknown result and the
 manager does not blindly roll it back; QUERY_OPERATION resolves durable state.
 
@@ -475,9 +480,12 @@ chunks and the protected logical manifest in a private transaction, syncs and
 verifies them, and moves them into the immutable generation namespace. Only after
 all required nodes prepare does the manager commit each node's manifest.
 
-A prepare or commit failure aborts every participant. Already committed nodes
+A confirmed prepare or commit failure attempts rollback of participants. An
+unknown commit result blocks blind rollback. Already committed local nodes
 atomically restore the previous manifest before removing the failed generation;
-rollback deletion failures are reported separately. Reads inspect replicas in
+rollback deletion failures are reported separately. Unconfirmed rollback
+publication stays unknown and cannot later report committed or finalize cleanup
+in that instance. Reads inspect replicas in
 deterministic order, recording missing or corrupt copies while using a later valid
 copy, and verify the reassembled object's CRC-32C. Deletes visit every known node;
 `not_found` is idempotent success and other failures produce `partial_delete`.
@@ -490,8 +498,8 @@ durable operation records. Object data and manifests remain durable.
 ## Intended evolution
 
 Authenticated coordinator-to-node transport is available through explicit TLS
-endpoint configuration. The next dependency is durable operator-facing
-audit/reporting around recovery decisions. Consensus,
+endpoint configuration. The release audit and operator procedures are in
+[release readiness](release-readiness.md). Consensus,
 cross-process catalog writers, automatic retries, automatic repair, and automatic
 operation recovery remain deferred.
 

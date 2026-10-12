@@ -45,6 +45,7 @@ enum class RegistryError {
     invalid_node,
     duplicate_node,
     unknown_node,
+    version_exhausted,
 };
 
 class NodeRegistry {

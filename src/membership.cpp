@@ -6,12 +6,13 @@
 #include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
-#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <system_error>
 #include <type_traits>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 
 namespace atlasfs::metadata {
 namespace {
@@ -68,10 +69,36 @@ MembershipError map_error(RegistryError error) {
         case RegistryError::invalid_node: return MembershipError::invalid_node;
         case RegistryError::duplicate_node: return MembershipError::duplicate_node;
         case RegistryError::unknown_node: return MembershipError::unknown_node;
+        case RegistryError::version_exhausted: return MembershipError::version_exhausted;
     }
     return MembershipError::invalid_node;
 }
 bool sync_fd(int fd) { int result; do { result = metrics::io::fsync(fd); } while (result < 0 && errno == EINTR); return result == 0; }
+std::optional<std::vector<std::byte>> read_record(const std::filesystem::path& path) {
+    const int fd = metrics::io::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return std::nullopt;
+    struct stat status{};
+    if (::fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) || status.st_size < 0 ||
+        static_cast<std::uint64_t>(status.st_size) > kMaxRecordSize) {
+        metrics::io::close(fd); return std::nullopt;
+    }
+    std::vector<std::byte> bytes;
+    try { bytes.resize(static_cast<std::size_t>(status.st_size)); }
+    catch (...) { metrics::io::close(fd); throw; }
+    std::size_t offset{}; bool okay = true;
+    while (offset < bytes.size()) {
+        const auto count = metrics::io::read(fd, bytes.data() + offset, bytes.size() - offset);
+        if (count > 0) offset += static_cast<std::size_t>(count);
+        else if (count < 0 && errno == EINTR) continue;
+        else { okay = false; break; }
+    }
+    std::byte extra{}; ssize_t count;
+    do { count = metrics::io::read(fd, &extra, 1); } while (count < 0 && errno == EINTR);
+    if (count != 0) okay = false;
+    if (metrics::io::close(fd) != 0) okay = false;
+    if (!okay) return std::nullopt;
+    return bytes;
+}
 }
 
 std::vector<std::byte> encode_membership(const MembershipSnapshot& snapshot) {
@@ -126,15 +153,13 @@ DurableMembership::DurableMembership(std::filesystem::path root, FailureDetector
         throw std::invalid_argument("invalid failure threshold");
     std::filesystem::create_directories(directory_);
     if (!std::filesystem::exists(record_path_)) return;
-    std::ifstream input(record_path_, std::ios::binary); std::vector<std::byte> bytes;
-    for (char value; input.get(value);) bytes.push_back(static_cast<std::byte>(value));
-    metrics::io::observed_read(bytes.size());
-    const auto snapshot = decode_membership(bytes);
+    const auto bytes = read_record(record_path_);
+    const auto snapshot = bytes ? decode_membership(*bytes) : std::nullopt;
     if (!snapshot || registry_.restore(snapshot->nodes, snapshot->version) != RegistryError::none)
         throw std::runtime_error("invalid durable membership record");
 }
 
-MembershipError DurableMembership::publish(const NodeRegistry& candidate) {
+MembershipError DurableMembership::publish(NodeRegistry candidate) {
     const MembershipSnapshot snapshot{candidate.version(), candidate.list()};
     std::vector<std::byte> bytes;
     try { bytes = encode_membership(snapshot); } catch (...) { return MembershipError::invalid_node; }
@@ -158,58 +183,73 @@ MembershipError DurableMembership::publish(const NodeRegistry& candidate) {
         return MembershipError::persistence_error;
     std::error_code error; metrics::io::rename(temporary, record_path_, error);
     if (error) return MembershipError::persistence_error;
+    // The visible record may already be durable. Never overwrite it from the
+    // old in-memory version if synchronization or index publication fails.
+    durability_unknown_ = true;
     if (fault_injector_ && fault_injector_(MembershipFaultPoint::directory_sync))
         return MembershipError::persistence_error;
     const int directory = metrics::io::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory < 0) return MembershipError::persistence_error;
     const bool synced = sync_fd(directory); const bool closed = metrics::io::close(directory) == 0;
-    return synced && closed ? MembershipError::none : MembershipError::persistence_error;
+    if (!synced || !closed) return MembershipError::persistence_error;
+    registry_ = std::move(candidate);
+    durability_unknown_ = false;
+    return MembershipError::none;
 }
 
 MembershipError DurableMembership::add(StorageNode node) {
+    if (durability_unknown_) return MembershipError::persistence_error;
     NodeRegistry candidate = registry_; const auto error = candidate.add(std::move(node));
     if (error != RegistryError::none) return map_error(error);
-    const auto persisted = publish(candidate); if (persisted != MembershipError::none) return persisted;
-    registry_ = std::move(candidate); return MembershipError::none;
+    return publish(std::move(candidate));
 }
 MembershipError DurableMembership::remove(std::string_view node_id) {
+    if (durability_unknown_) return MembershipError::persistence_error;
     NodeRegistry candidate = registry_; const auto error = candidate.remove(node_id);
     if (error != RegistryError::none) return map_error(error);
-    const auto persisted = publish(candidate); if (persisted != MembershipError::none) return persisted;
-    registry_ = std::move(candidate); return MembershipError::none;
+    return publish(std::move(candidate));
 }
 MembershipError DurableMembership::set_state(std::string_view node_id, NodeState state) {
+    if (durability_unknown_) return MembershipError::persistence_error;
     NodeRegistry candidate = registry_; const auto before = candidate.version();
     const auto error = candidate.set_state(node_id, state);
     if (error != RegistryError::none) return map_error(error);
     if (candidate.version() == before) return MembershipError::none;
-    const auto persisted = publish(candidate); if (persisted != MembershipError::none) return persisted;
-    registry_ = std::move(candidate); return MembershipError::none;
+    return publish(std::move(candidate));
 }
 HeartbeatStatus DurableMembership::check_node(std::string_view node_id, HeartbeatClient& client) {
+    if (durability_unknown_) return HeartbeatStatus::persistence_error;
     const auto current = registry_.get(node_id);
     if (!current) return HeartbeatStatus::identity_mismatch;
     auto result = client.check(current->endpoint);
     if (result.status == HeartbeatStatus::success && result.responding_node_id != node_id)
         result.status = HeartbeatStatus::identity_mismatch;
     NodeRegistry candidate = registry_;
+    RegistryError mutation;
     if (result.status == HeartbeatStatus::success) {
-        static_cast<void>(candidate.set_health(node_id, NodeHealthState::healthy, 0, true));
+        mutation = candidate.set_health(node_id, NodeHealthState::healthy, 0, true);
     } else {
         const auto maximum = std::numeric_limits<std::uint32_t>::max();
         const auto failures = current->consecutive_failures == maximum
             ? maximum : current->consecutive_failures + 1U;
         const auto health = failures >= config_.failure_threshold
             ? NodeHealthState::unavailable : NodeHealthState::suspect;
-        static_cast<void>(candidate.set_health(node_id, health, failures, true));
+        mutation = candidate.set_health(node_id, health, failures, true);
     }
-    if (publish(candidate) != MembershipError::none) return HeartbeatStatus::persistence_error;
-    registry_ = std::move(candidate); return result.status;
+    // A fresh observation requires new monotonic evidence. Exhaustion cannot
+    // be reported as healthy or publish the unchanged, stale prior record.
+    if (mutation != RegistryError::none) return HeartbeatStatus::persistence_error;
+    if (candidate.version() == registry_.version()) return result.status;
+    if (publish(std::move(candidate)) != MembershipError::none) return HeartbeatStatus::persistence_error;
+    return result.status;
 }
 std::optional<StorageNode> DurableMembership::get(std::string_view id) const { return registry_.get(id); }
 std::vector<StorageNode> DurableMembership::list() const { return registry_.list(); }
-std::vector<StorageNode> DurableMembership::eligible_nodes() const { return registry_.eligible_nodes(); }
+std::vector<StorageNode> DurableMembership::eligible_nodes() const {
+    return durability_unknown_ ? std::vector<StorageNode>{} : registry_.eligible_nodes();
+}
 std::uint64_t DurableMembership::version() const noexcept { return registry_.version(); }
+bool DurableMembership::durability_unknown() const noexcept { return durability_unknown_; }
 const std::filesystem::path& DurableMembership::record_path() const noexcept { return record_path_; }
 
 }  // namespace atlasfs::metadata

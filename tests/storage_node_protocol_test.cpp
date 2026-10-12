@@ -1,5 +1,6 @@
 #include "atlasfs/checksum.hpp"
 #include "atlasfs/remote_storage_node.hpp"
+#include "atlasfs/recovery.hpp"
 #include "atlasfs/storage_node_protocol.hpp"
 
 #include <gtest/gtest.h>
@@ -7,6 +8,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <thread>
 #include <unistd.h>
@@ -51,6 +53,55 @@ metadata::PlacementPlan plan_for(const storage::ObjectManifest& value) {
         metadata::CoordinatorError::none);
     return *coordinator.place_object({"object", value}).plan;
 }
+
+class RunningStorageServer {
+public:
+    RunningStorageServer(std::shared_ptr<StorageNode> node,
+                         const std::filesystem::path& journal)
+        : server(std::move(node), journal), thread([this] { server.serve(); }) {}
+    ~RunningStorageServer() { server.stop(); thread.join(); }
+    StorageNodeServer server;
+private:
+    std::thread thread;
+};
+
+class ObservedStorageNode final : public StorageNode {
+public:
+    explicit ObservedStorageNode(std::shared_ptr<LocalStorageNode> value) : local(std::move(value)) {}
+    std::string_view id() const noexcept override { return local->id(); }
+    storage::StoreError prepare(std::string_view operation, std::string_view object,
+        const storage::ObjectManifest& value, std::span<const std::uint32_t> chunks,
+        std::span<const std::byte> bytes) override {
+        ++prepares; return local->prepare(operation, object, value, chunks, bytes);
+    }
+    storage::StoreError verify_prepared(std::string_view operation, std::string_view object,
+        std::string_view generation, std::span<const std::uint32_t> chunks) const override {
+        return local->verify_prepared(operation, object, generation, chunks);
+    }
+    storage::StoreError commit(std::string_view operation, std::string_view object,
+        std::string_view generation) override {
+        ++commits; if (before_commit) before_commit();
+        return local->commit(operation, object, generation);
+    }
+    storage::StoreError abort(std::string_view operation, std::string_view object,
+        std::string_view generation) override {
+        ++aborts; if (before_abort) before_abort();
+        return local->abort(operation, object, generation);
+    }
+    storage::StoreError finalize(std::string_view operation, std::string_view object,
+        std::string_view generation) override { return local->finalize(operation, object, generation); }
+    storage::ChunkResult get_chunk(std::string_view object, std::string_view generation,
+        std::uint32_t index) const override { return local->get_chunk(object, generation, index); }
+    storage::StoreError remove(std::string_view object, std::string_view generation) override {
+        return local->remove(object, generation);
+    }
+    OperationQueryResult query_operation(std::string_view operation) const override {
+        return local->query_operation(operation);
+    }
+    std::shared_ptr<LocalStorageNode> local;
+    std::function<void()> before_commit, before_abort;
+    std::atomic_uint prepares{}, commits{}, aborts{};
+};
 
 TEST(StorageNodeProtocol, RoundTripsAllBoundedPayloadShapes) {
     namespace snp = storage_node_protocol;
@@ -294,6 +345,297 @@ TEST(StorageNodeProtocol, DuplicatePrepareCommitAndConflictAreDeterministic) {
               std::vector<std::byte>{std::byte{5}});
     EXPECT_EQ(remote.remove("object", first.generation_id), storage::StoreError::none);
     server.stop(); thread.join();
+}
+
+TEST(StorageNodeProtocol, CommitJournalFailureCannotBecomeSuccessThroughReplayOrQuery) {
+    TempRoot root;
+    auto local = std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4);
+    const auto journal = root.path() / "journal";
+    const auto temporary = journal / "operations" / "op-persist.tmp";
+    const auto value = manifest();
+    auto observed = std::make_shared<ObservedStorageNode>(local);
+    observed->before_commit = [&] { std::filesystem::create_directory(temporary); };
+    {
+        RunningStorageServer running(observed, journal);
+        RemoteStorageNodeClient remote("node-a", running.server.port());
+        ASSERT_EQ(remote.prepare("op-persist", "object", value,
+            std::vector<std::uint32_t>{0, 1}, data()), storage::StoreError::none);
+        EXPECT_EQ(remote.commit("op-persist", "object", value.generation_id),
+                  storage::StoreError::result_unknown);
+        EXPECT_EQ(remote.query("op-persist"), storage_node_protocol::OperationState::unknown);
+        EXPECT_EQ(remote.commit("op-persist", "object", value.generation_id),
+                  storage::StoreError::result_unknown);
+        EXPECT_EQ(remote.abort("op-persist", "object", value.generation_id),
+                  storage::StoreError::invalid_operation_state);
+        EXPECT_EQ(remote.get_chunk("object", value.generation_id, 1).data,
+                  std::vector<std::byte>{std::byte{5}});
+        ASSERT_TRUE(std::filesystem::remove(temporary));
+        EXPECT_EQ(remote.commit("op-persist", "object", value.generation_id),
+                  storage::StoreError::none);
+        EXPECT_EQ(remote.query("op-persist"), storage_node_protocol::OperationState::committed);
+        EXPECT_EQ(observed->commits.load(), 1U);
+        EXPECT_EQ(observed->aborts.load(), 0U);
+    }
+    RunningStorageServer restarted(local, journal);
+    RemoteStorageNodeClient remote("node-a", restarted.server.port());
+    EXPECT_EQ(remote.query("op-persist"), storage_node_protocol::OperationState::committed);
+    EXPECT_EQ(remote.commit("op-persist", "object", value.generation_id), storage::StoreError::none);
+}
+
+TEST(StorageNodeProtocol, AbortJournalFailureCannotBecomeSuccessThroughReplayOrQuery) {
+    TempRoot root;
+    auto local = std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4);
+    const auto journal = root.path() / "journal";
+    const auto temporary = journal / "operations" / "op-abort.tmp";
+    const auto value = manifest();
+    auto observed = std::make_shared<ObservedStorageNode>(local);
+    observed->before_abort = [&] { std::filesystem::create_directory(temporary); };
+    {
+        RunningStorageServer running(observed, journal);
+        RemoteStorageNodeClient remote("node-a", running.server.port());
+        ASSERT_EQ(remote.prepare("op-abort", "object", value,
+            std::vector<std::uint32_t>{0, 1}, data()), storage::StoreError::none);
+        EXPECT_EQ(remote.abort("op-abort", "object", value.generation_id),
+                  storage::StoreError::result_unknown);
+        EXPECT_EQ(remote.query("op-abort"), storage_node_protocol::OperationState::unknown);
+        EXPECT_EQ(remote.abort("op-abort", "object", value.generation_id),
+                  storage::StoreError::result_unknown);
+        EXPECT_EQ(remote.commit("op-abort", "object", value.generation_id),
+                  storage::StoreError::invalid_operation_state);
+        ASSERT_TRUE(std::filesystem::remove(temporary));
+        EXPECT_EQ(remote.abort("op-abort", "object", value.generation_id),
+                  storage::StoreError::none);
+        EXPECT_EQ(remote.query("op-abort"), storage_node_protocol::OperationState::aborted);
+        EXPECT_EQ(observed->aborts.load(), 1U);
+        EXPECT_EQ(observed->commits.load(), 0U);
+    }
+    RunningStorageServer restarted(local, journal);
+    RemoteStorageNodeClient remote("node-a", restarted.server.port());
+    EXPECT_EQ(remote.query("op-abort"), storage_node_protocol::OperationState::aborted);
+    EXPECT_EQ(remote.abort("op-abort", "object", value.generation_id), storage::StoreError::none);
+}
+
+TEST(StorageNodeProtocol, PrepareJournalFailureRequiresOriginalPrepareBeforeMutation) {
+    TempRoot root;
+    auto local = std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4);
+    const auto journal = root.path() / "journal";
+    const auto temporary = journal / "operations" / "op-prepare.tmp";
+    const auto value = manifest();
+    RunningStorageServer running(local, journal);
+    RemoteStorageNodeClient remote("node-a", running.server.port());
+    ASSERT_TRUE(std::filesystem::create_directory(temporary));
+    EXPECT_EQ(remote.prepare("op-prepare", "object", value,
+        std::vector<std::uint32_t>{0, 1}, data()), storage::StoreError::result_unknown);
+    EXPECT_EQ(remote.query("op-prepare"), storage_node_protocol::OperationState::unknown);
+    EXPECT_EQ(remote.commit("op-prepare", "object", value.generation_id),
+              storage::StoreError::result_unknown);
+    EXPECT_EQ(remote.abort("op-prepare", "object", value.generation_id),
+              storage::StoreError::result_unknown);
+    EXPECT_EQ(remote.prepare("op-prepare", "object", value,
+        std::vector<std::uint32_t>{0, 1}, data()), storage::StoreError::result_unknown);
+    auto changed = value;
+    ++changed.object_checksum;
+    EXPECT_EQ(remote.prepare("op-prepare", "object", changed,
+        std::vector<std::uint32_t>{0, 1}, data()), storage::StoreError::operation_conflict);
+    ASSERT_TRUE(std::filesystem::remove(temporary));
+    EXPECT_EQ(remote.prepare("op-prepare", "object", value,
+        std::vector<std::uint32_t>{0, 1}, data()), storage::StoreError::none);
+    EXPECT_EQ(remote.query("op-prepare"), storage_node_protocol::OperationState::prepared);
+    EXPECT_EQ(remote.commit("op-prepare", "object", value.generation_id), storage::StoreError::none);
+}
+
+TEST(StorageNodeProtocol, CommitIntentMustBeDurableBeforePhysicalExecution) {
+    TempRoot root;
+    const auto journal = root.path() / "journal";
+    const auto temporary = journal / "operations" / "op-intent.tmp";
+    auto observed = std::make_shared<ObservedStorageNode>(
+        std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4));
+    const auto value = manifest();
+    RunningStorageServer running(observed, journal);
+    RemoteStorageNodeClient remote("node-a", running.server.port());
+    ASSERT_EQ(remote.prepare("op-intent", "object", value,
+        std::vector<std::uint32_t>{0, 1}, data()), storage::StoreError::none);
+    ASSERT_TRUE(std::filesystem::create_directory(temporary));
+    EXPECT_EQ(remote.commit("op-intent", "object", value.generation_id),
+              storage::StoreError::result_unknown);
+    EXPECT_EQ(remote.query("op-intent"), storage_node_protocol::OperationState::unknown);
+    EXPECT_EQ(remote.commit("op-intent", "object", value.generation_id),
+              storage::StoreError::result_unknown);
+    EXPECT_EQ(observed->commits.load(), 0U);
+    EXPECT_EQ(remote.abort("op-intent", "object", value.generation_id),
+              storage::StoreError::invalid_operation_state);
+    EXPECT_EQ(observed->aborts.load(), 0U);
+    ASSERT_TRUE(std::filesystem::remove(temporary));
+    EXPECT_EQ(remote.commit("op-intent", "object", value.generation_id), storage::StoreError::none);
+    EXPECT_EQ(observed->commits.load(), 1U);
+}
+
+TEST(StorageNodeProtocol, TerminalJournalFailureRemainsUnknownAfterProcessRestart) {
+    for (const bool commit : {true, false}) {
+        SCOPED_TRACE(commit ? "commit" : "abort");
+        TempRoot root;
+        const auto journal = root.path() / "journal";
+        const auto temporary = journal / "operations" / "op-restart.tmp";
+        const auto value = manifest();
+        {
+            auto observed = std::make_shared<ObservedStorageNode>(
+                std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4));
+            auto block_terminal_journal = [&] { std::filesystem::create_directory(temporary); };
+            if (commit) observed->before_commit = block_terminal_journal;
+            else observed->before_abort = block_terminal_journal;
+            RunningStorageServer running(observed, journal);
+            RemoteStorageNodeClient remote("node-a", running.server.port());
+            ASSERT_EQ(remote.prepare("op-restart", "object", value,
+                std::vector<std::uint32_t>{0, 1}, data()), storage::StoreError::none);
+            EXPECT_EQ(commit ? remote.commit("op-restart", "object", value.generation_id)
+                : remote.abort("op-restart", "object", value.generation_id),
+                storage::StoreError::result_unknown);
+            EXPECT_EQ(remote.query("op-restart"), storage_node_protocol::OperationState::unknown);
+        }
+        ASSERT_TRUE(std::filesystem::remove(temporary));
+        auto restarted_node = std::make_shared<LocalStorageNode>(
+            "node-a", root.path() / "store", 1024, 4);
+        RunningStorageServer restarted(restarted_node, journal);
+        auto remote = std::make_shared<RemoteStorageNodeClient>("node-a", restarted.server.port());
+        EXPECT_EQ(remote->query("op-restart"), storage_node_protocol::OperationState::unknown);
+        EXPECT_EQ(remote->commit("op-restart", "object", value.generation_id), storage::StoreError::result_unknown);
+        EXPECT_EQ(remote->abort("op-restart", "object", value.generation_id), storage::StoreError::result_unknown);
+        RecoveryCoordinator recovery({remote});
+        const auto fingerprint = integrity::crc32c(storage_node_protocol::encode_prepare(
+            {"op-restart", "object", value, {0, 1}, data()}));
+        const RecoveryRequest request{"op-restart", fingerprint, "object", value.generation_id, {"node-a"}};
+        const auto report = recovery.inspect(request);
+        EXPECT_EQ(report.classification, RecoveryClassification::unknown_participant);
+        EXPECT_FALSE(report.completion_allowed);
+        EXPECT_FALSE(report.rollback_allowed);
+        EXPECT_EQ(recovery.complete(request).status, RecoveryActionStatus::rejected);
+        EXPECT_EQ(recovery.rollback(request).status, RecoveryActionStatus::rejected);
+        EXPECT_EQ(remote->get_chunk("object", value.generation_id, 1).error,
+                  commit ? storage::StoreError::none : storage::StoreError::not_found);
+    }
+}
+
+TEST(StorageNodeProtocol, PhysicalCommitDurabilityUnknownNeverRevertsToPreparedEvidence) {
+    TempRoot root;
+    std::atomic_bool fail_sync{};
+    auto local = std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4,
+        [&](storage::PutFaultPoint point) {
+            return fail_sync.load() && point == storage::PutFaultPoint::directory_sync;
+        });
+    const auto journal = root.path() / "journal";
+    const auto value = manifest();
+    {
+        RunningStorageServer running(local, journal);
+        RemoteStorageNodeClient remote("node-a", running.server.port());
+        ASSERT_EQ(remote.prepare("op-sync", "object", value,
+            std::vector<std::uint32_t>{0, 1}, data()), storage::StoreError::none);
+        fail_sync.store(true);
+        EXPECT_EQ(remote.commit("op-sync", "object", value.generation_id), storage::StoreError::result_unknown);
+        fail_sync.store(false);
+        EXPECT_EQ(remote.query("op-sync"), storage_node_protocol::OperationState::unknown);
+        EXPECT_EQ(remote.commit("op-sync", "object", value.generation_id), storage::StoreError::result_unknown);
+        EXPECT_EQ(remote.abort("op-sync", "object", value.generation_id), storage::StoreError::result_unknown);
+        EXPECT_EQ(remote.get_chunk("object", value.generation_id, 1).data,
+                  std::vector<std::byte>{std::byte{5}});
+    }
+    auto restarted_node = std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4);
+    RunningStorageServer restarted(restarted_node, journal);
+    RemoteStorageNodeClient remote("node-a", restarted.server.port());
+    EXPECT_EQ(remote.query("op-sync"), storage_node_protocol::OperationState::unknown);
+    EXPECT_EQ(remote.commit("op-sync", "object", value.generation_id), storage::StoreError::result_unknown);
+    EXPECT_EQ(remote.abort("op-sync", "object", value.generation_id), storage::StoreError::result_unknown);
+}
+
+TEST(StorageNodeProtocol, ProtectedOperationJournalRejectsStateCorruptionAndMalformedWrapper) {
+    const std::string payload = "0 42 0 object generation-rpc\n";
+    const auto checksum = integrity::crc32c(std::as_bytes(std::span(payload)));
+    const auto valid = "RECORD1\n" + payload + "CRC32C " + std::to_string(checksum) + "\n";
+    auto changed_state = valid;
+    changed_state[std::string("RECORD1\n").size()] = '2';
+    const std::string incomplete_payload = "0 42 0 object\n";
+    const auto incomplete_checksum = integrity::crc32c(std::as_bytes(std::span(incomplete_payload)));
+    for (const auto& malformed : {
+            changed_state, "RECORD2\n" + payload + "CRC32C " + std::to_string(checksum) + "\n",
+            "RECORD1\n" + payload, valid + "trailing\n",
+            "RECORD1\n" + payload + "CRC32C\n",
+            "RECORD1\n" + payload + "CRC32C " + std::to_string(checksum + 1U) + "\n",
+            "RECORD1\n" + incomplete_payload + "CRC32C " + std::to_string(incomplete_checksum) + "\n"}) {
+        TempRoot root;
+        const auto operations = root.path() / "journal" / "operations";
+        std::filesystem::create_directories(operations);
+        { std::ofstream output(operations / "op-corrupt", std::ios::binary); output << malformed; }
+        auto local = std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4);
+        EXPECT_THROW(StorageNodeServer(local, root.path() / "journal"), std::runtime_error);
+    }
+}
+
+TEST(StorageNodeProtocol, ProtectedRepairJournalRejectsStatusCorruption) {
+    TempRoot root;
+    auto local = std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4);
+    const auto journal = root.path() / "journal";
+    const auto value = manifest();
+    {
+        RunningStorageServer running(local, journal);
+        RemoteStorageNodeClient remote("node-a", running.server.port());
+        // A rejected publication must not become published after a status-bit
+        // alteration that leaves the request fingerprint and IDs untouched.
+        EXPECT_EQ(remote.publish_repair("plan", "execution", "node-a", "object", value,
+            value.chunks[1], std::vector<std::byte>{std::byte{4}}).status,
+            RepairPublishStatus::checksum_mismatch);
+    }
+    {
+        std::fstream record(journal / "repairs" / "execution",
+            std::ios::in | std::ios::out | std::ios::binary);
+        ASSERT_TRUE(record);
+        record.seekp(std::string("RECORD1\n").size()); record.put('0');
+    }
+    EXPECT_THROW(StorageNodeServer(local, journal), std::runtime_error);
+}
+
+TEST(StorageNodeProtocol, NodeJournalReadsAreBoundedAndRequireRegularFiles) {
+    for (const bool directory : {false, true}) {
+        TempRoot root;
+        const auto operations = root.path() / "journal" / "operations";
+        std::filesystem::create_directories(operations);
+        if (directory) std::filesystem::create_directory(operations / "op-invalid");
+        else { std::ofstream output(operations / "op-invalid", std::ios::binary);
+               output << std::string(4097, '0'); }
+        auto local = std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4);
+        EXPECT_THROW(StorageNodeServer(local, root.path() / "journal"), std::runtime_error);
+    }
+}
+
+TEST(StorageNodeProtocol, LegacyUnknownRecordRemainsReadableButNeverAuthorizesMutation) {
+    TempRoot root;
+    const auto journal = root.path() / "journal";
+    const auto operations = journal / "operations";
+    std::filesystem::create_directories(operations);
+    { std::ofstream output(operations / "op-legacy"); output << "0 42 0 object generation-rpc\n"; }
+    auto local = std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4);
+    RunningStorageServer running(local, journal);
+    RemoteStorageNodeClient remote("node-a", running.server.port());
+    EXPECT_EQ(remote.query("op-legacy"), storage_node_protocol::OperationState::unknown);
+    EXPECT_EQ(remote.commit("op-legacy", "object", "generation-rpc"), storage::StoreError::result_unknown);
+    EXPECT_EQ(remote.abort("op-legacy", "object", "generation-rpc"), storage::StoreError::result_unknown);
+}
+
+TEST(StorageNodeProtocol, LegacyPreparedProbeCorruptionIsUnknownRatherThanCommitted) {
+    TempRoot root;
+    const auto journal = root.path() / "journal";
+    const auto operations = journal / "operations";
+    std::filesystem::create_directories(operations);
+    auto local = std::make_shared<LocalStorageNode>("node-a", root.path() / "store", 1024, 4);
+    const auto value = manifest();
+    ASSERT_EQ(local->prepare("op-legacy", "object", value, std::vector<std::uint32_t>{0, 1}, data()),
+              storage::StoreError::none);
+    ASSERT_EQ(local->commit("op-legacy", "object", value.generation_id), storage::StoreError::none);
+    { std::ofstream output(operations / "op-legacy"); output << "1 42 0 object generation-rpc\n"; }
+    { std::ofstream output(local->store().chunks_directory() / value.generation_id / "chunk_000000",
+        std::ios::binary | std::ios::trunc); output << "bad!"; }
+    RunningStorageServer running(local, journal);
+    RemoteStorageNodeClient remote("node-a", running.server.port());
+    EXPECT_EQ(remote.query("op-legacy"), storage_node_protocol::OperationState::unknown);
+    EXPECT_EQ(remote.commit("op-legacy", "object", value.generation_id), storage::StoreError::result_unknown);
 }
 
 TEST(StorageNodeProtocol, LostCommitResponseIsUnknownAndDurableQueryResolvesIt) {

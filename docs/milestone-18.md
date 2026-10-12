@@ -160,8 +160,10 @@ Legacy constructors intentionally remain plaintext for existing local tests and
 development callers. Production migration must update **both** remote client and
 storage-server constructors to supply `TlsConfig`, remove plaintext listeners,
 and audit generic TLS handlers for policy enforcement. No process-wide secure
-default or runtime daemon/config-file loader is introduced. Current listeners
-remain sequential and loopback-only. Handshake deadlines limit stalled peers,
+default or runtime daemon/config-file loader is introduced. Listeners
+were sequential and loopback-only in Milestone 18. Milestone 22 adds bounded
+independent connection I/O, while handlers remain serialized and listeners
+remain loopback-only. Handshake deadlines limit stalled peers,
 but do not provide rate limiting or protection against aggregate connection DoS.
 
 ## Failure and authority

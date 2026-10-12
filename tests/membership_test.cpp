@@ -5,6 +5,8 @@
 
 #include <atomic>
 #include <fstream>
+#include <iterator>
+#include <limits>
 #include <unistd.h>
 
 namespace atlasfs::metadata {
@@ -37,6 +39,17 @@ public:
     HeartbeatResult check(const NodeEndpoint&) override { ++calls; return result; }
     unsigned calls{};
 };
+void write_snapshot(const std::filesystem::path& path, const MembershipSnapshot& snapshot) {
+    const auto bytes = encode_membership(snapshot);
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    output.close();
+    ASSERT_TRUE(output);
+}
+std::vector<char> read_bytes(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
 
 TEST(MembershipSerialization, EmptyAndMultipleNodesRoundTrip) {
     EXPECT_EQ(decode_membership(encode_membership({7, {}})), (MembershipSnapshot{7, {}}));
@@ -81,6 +94,54 @@ TEST(DurableMembership, RejectedMutationDoesNotAdvanceVersion) {
     EXPECT_EQ(membership.remove("missing"), MembershipError::unknown_node);
     EXPECT_EQ(membership.version(), 0U);
 }
+TEST(DurableMembership, ExhaustedVersionRejectsMutationAndPreservesDurableStateAcrossRestart) {
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    TempRoot root;
+    std::filesystem::path path;
+    { DurableMembership initial(root.path());
+      ASSERT_EQ(initial.add(node("a")), MembershipError::none); path = initial.record_path(); }
+    write_snapshot(path, {maximum, {node("a")}});
+    const auto durable_before = read_bytes(path);
+    {
+        DurableMembership membership(root.path());
+        const auto before = membership.list();
+        EXPECT_EQ(membership.add(node("b")), MembershipError::version_exhausted);
+        EXPECT_EQ(membership.remove("a"), MembershipError::version_exhausted);
+        EXPECT_EQ(membership.set_state("a", NodeState::draining), MembershipError::version_exhausted);
+        EXPECT_EQ(membership.set_state("a", NodeState::active), MembershipError::none);
+        EXPECT_EQ(membership.version(), maximum);
+        EXPECT_EQ(membership.list(), before);
+        EXPECT_FALSE(membership.durability_unknown());
+        EXPECT_EQ(read_bytes(path), durable_before);
+    }
+    DurableMembership restarted(root.path());
+    EXPECT_EQ(restarted.version(), maximum);
+    ASSERT_EQ(restarted.list().size(), 1U);
+    EXPECT_EQ(restarted.list()[0].node_id, "a");
+    EXPECT_EQ(restarted.list()[0].state, NodeState::active);
+    EXPECT_EQ(restarted.add(node("b")), MembershipError::version_exhausted);
+    EXPECT_EQ(read_bytes(path), durable_before);
+}
+TEST(FailureDetector, ExhaustedVersionCannotMakeRestartHealthFreshOrPersistWrappedEvidence) {
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    TempRoot root;
+    std::filesystem::path path;
+    { DurableMembership initial(root.path());
+      ASSERT_EQ(initial.add(node("a")), MembershipError::none); path = initial.record_path(); }
+    write_snapshot(path, {maximum, {node("a")}});
+    const auto durable_before = read_bytes(path);
+    for (const auto status : {HeartbeatStatus::success, HeartbeatStatus::timeout}) {
+        DurableMembership membership(root.path());
+        const auto before = membership.list();
+        FakeHeartbeat heartbeat({status, "a"});
+        EXPECT_EQ(membership.check_node("a", heartbeat), HeartbeatStatus::persistence_error);
+        EXPECT_EQ(heartbeat.calls, 1U);
+        EXPECT_EQ(membership.version(), maximum);
+        EXPECT_EQ(membership.list(), before);
+        EXPECT_TRUE(membership.eligible_nodes().empty());
+        EXPECT_EQ(read_bytes(path), durable_before);
+    }
+}
 TEST(DurableMembership, PublicationFailuresDoNotExposeCandidate) {
     for (const auto point : {MembershipFaultPoint::record_creation,
          MembershipFaultPoint::record_write, MembershipFaultPoint::record_sync,
@@ -89,6 +150,46 @@ TEST(DurableMembership, PublicationFailuresDoNotExposeCandidate) {
             [point](auto current) { return point == current; });
         EXPECT_EQ(membership.add(node("a")), MembershipError::persistence_error);
         EXPECT_FALSE(membership.get("a")); EXPECT_EQ(membership.version(), 0U);
+        EXPECT_EQ(membership.durability_unknown(), point == MembershipFaultPoint::directory_sync);
+    }
+}
+TEST(DurableMembership, AmbiguousPublicationCannotReuseVersionOrRunHeartbeat) {
+    TempRoot root; bool fail_sync = false;
+    DurableMembership membership(root.path(), {}, [&](auto point) {
+        return fail_sync && point == MembershipFaultPoint::directory_sync;
+    });
+    ASSERT_EQ(membership.add(node("a")), MembershipError::none);
+    fail_sync = true;
+    ASSERT_EQ(membership.add(node("b")), MembershipError::persistence_error);
+    EXPECT_TRUE(membership.durability_unknown());
+    EXPECT_TRUE(membership.eligible_nodes().empty());
+    EXPECT_EQ(membership.version(), 1U);
+    fail_sync = false;
+    EXPECT_EQ(membership.add(node("c")), MembershipError::persistence_error);
+    EXPECT_EQ(membership.set_state("a", NodeState::active), MembershipError::persistence_error);
+    EXPECT_EQ(membership.remove("a"), MembershipError::persistence_error);
+    FakeHeartbeat heartbeat({HeartbeatStatus::success, "a"});
+    EXPECT_EQ(membership.check_node("a", heartbeat), HeartbeatStatus::persistence_error);
+    EXPECT_EQ(heartbeat.calls, 0U);
+    DurableMembership restarted(root.path());
+    EXPECT_FALSE(restarted.durability_unknown());
+    EXPECT_EQ(restarted.version(), 2U);
+    EXPECT_TRUE(restarted.get("a")); EXPECT_TRUE(restarted.get("b"));
+    EXPECT_FALSE(restarted.get("c"));
+    EXPECT_EQ(restarted.add(node("c")), MembershipError::none);
+    EXPECT_EQ(restarted.version(), 3U);
+}
+TEST(DurableMembership, RejectsOversizedTruncatedTrailingAndNonRegularStartupRecords) {
+    for (unsigned corruption = 0; corruption < 4; ++corruption) {
+        TempRoot root; std::filesystem::path path;
+        { DurableMembership store(root.path());
+          ASSERT_EQ(store.add(node("a")), MembershipError::none); path = store.record_path(); }
+        if (corruption == 0) std::filesystem::resize_file(path, 2U * 1024U * 1024U + 1U);
+        if (corruption == 1) std::filesystem::resize_file(path, std::filesystem::file_size(path) - 1U);
+        if (corruption == 2) std::ofstream(path, std::ios::binary | std::ios::app).put('x');
+        if (corruption == 3) { std::filesystem::remove(path); std::filesystem::create_directory(path); }
+        EXPECT_THROW(DurableMembership(root.path()), std::runtime_error) << corruption;
+        EXPECT_TRUE(std::filesystem::exists(path));
     }
 }
 TEST(DurableMembership, CorruptRecordStopsStartupWithoutDeletion) {

@@ -61,6 +61,9 @@ jobs:
       - name: Repeat bounded admission, dispatch and durable scheduling regressions
         if: matrix.mode == 'normal'
         run: ctest --test-dir build -R 'AdmissionQueue|Dispatch|SchedulingIntegration' --repeat until-fail:10 --output-on-failure --timeout 60
+      - name: Repeat release persistence, repair and recovery boundaries
+        if: matrix.mode == 'normal'
+        run: ctest --test-dir build -R 'CoordinatorOperationRecord|CoordinatorOperationStore|DurableRecoveryCoordinator|DurableMembership|FailureDetector|NodeRegistry|RepairPlanStore|RepairExecutor|StorageNodeProtocol|ObjectStore|StorageIntegration.ReportsPersistedCorruption|ReplicaManager\.LocalCommitDirectorySyncUnknown' --repeat until-fail:10 --output-on-failure --timeout 60
       - name: Production-only build
         if: matrix.mode == 'normal'
         run: cmake -S . -B build-production -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DATLASFS_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER=g++-13 && cmake --build build-production --parallel 4

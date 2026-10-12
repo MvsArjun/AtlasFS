@@ -88,6 +88,7 @@ public:
         std::string_view) override { return storage::StoreError::none; }
     storage::ChunkResult get_chunk(std::string_view, std::string_view,
         std::uint32_t) const override {
+        ++reads;
         return chunk_ ? *chunk_ : storage::ChunkResult{storage::StoreError::not_found, {}, {}, {}};
     }
     storage::StoreError remove(std::string_view, std::string_view) override {
@@ -116,6 +117,7 @@ public:
         replication::RepairPublishStatus::published};
     std::function<void()> after_repair;
     unsigned repairs{};
+    mutable unsigned reads{};
 };
 
 struct ExecutionFixture {
@@ -234,7 +236,102 @@ TEST(RepairPlanStore, PublicationFailuresNeverEnterLiveIndex) {
         TempRoot root; RepairPlanStore store(root.path(), [point](auto current) { return point == current; });
         const auto value = sample(); EXPECT_EQ(store.create(value), RepairStoreError::filesystem_error);
         EXPECT_FALSE(store.get(value.plan_id));
+        EXPECT_EQ(store.durability_unknown(), point == RepairFaultPoint::directory_sync);
     }
+}
+TEST(RepairPlanStore, AmbiguousEpochBindingCannotBeReplacedFromStaleIndex) {
+    TempRoot root; bool fail_sync = false;
+    RepairPlanStore store(root.path(), [&](auto point) {
+        return fail_sync && point == RepairFaultPoint::directory_sync;
+    });
+    auto approved = sample();
+    ASSERT_EQ(store.create(approved), RepairStoreError::none);
+    approved.state = RepairPlanState::approved;
+    ASSERT_EQ(store.update(approved), RepairStoreError::none);
+    auto executing = approved; executing.state = RepairPlanState::executing;
+    executing.execution_id = "execution-original";
+    executing.execution_epoch = epoch::Token{"authority", 1, "coordinator", "activation"};
+    fail_sync = true;
+    ASSERT_EQ(store.update(executing), RepairStoreError::filesystem_error);
+    EXPECT_TRUE(store.durability_unknown());
+    EXPECT_EQ(store.get(approved.plan_id), approved);
+    fail_sync = false;
+    auto replacement = executing; replacement.execution_id = "execution-replacement";
+    replacement.execution_epoch = epoch::Token{"authority", 2, "replacement", "next"};
+    EXPECT_EQ(store.update(replacement), RepairStoreError::filesystem_error);
+    EXPECT_EQ(store.update(approved), RepairStoreError::filesystem_error);
+    auto another = sample(); another.plan_id = "repair-another";
+    EXPECT_EQ(store.create(another), RepairStoreError::filesystem_error);
+    RepairPlanStore restarted(root.path());
+    EXPECT_FALSE(restarted.durability_unknown());
+    EXPECT_EQ(restarted.get(approved.plan_id), executing);
+    EXPECT_FALSE(restarted.get(another.plan_id));
+    EXPECT_EQ(restarted.update(replacement), RepairStoreError::conflict);
+}
+TEST(RepairPlanStore, AmbiguousCompletionCannotLoseRecordedResults) {
+    TempRoot root; bool fail_sync = false;
+    RepairPlanStore store(root.path(), [&](auto point) {
+        return fail_sync && point == RepairFaultPoint::directory_sync;
+    });
+    auto value = sample(); ASSERT_EQ(store.create(value), RepairStoreError::none);
+    value.state = RepairPlanState::approved; ASSERT_EQ(store.update(value), RepairStoreError::none);
+    value.state = RepairPlanState::executing; value.execution_id = "execution-original";
+    ASSERT_EQ(store.update(value), RepairStoreError::none);
+    const auto executing = value;
+    value.state = RepairPlanState::completed;
+    value.transfer_succeeded = value.verification_succeeded = value.publication_succeeded =
+        value.metadata_committed = true;
+    fail_sync = true;
+    ASSERT_EQ(store.update(value), RepairStoreError::filesystem_error);
+    fail_sync = false;
+    EXPECT_EQ(store.update(executing), RepairStoreError::filesystem_error);
+    RepairPlanStore restarted(root.path());
+    EXPECT_EQ(restarted.get(value.plan_id), value);
+    EXPECT_EQ(restarted.update(executing), RepairStoreError::conflict);
+}
+TEST(RepairPlanStore, RejectsOversizedTruncatedTrailingAndNonRegularStartupRecords) {
+    for (unsigned corruption = 0; corruption < 4; ++corruption) {
+        TempRoot root; std::filesystem::path path;
+        { RepairPlanStore store(root.path()); const auto value = sample();
+          ASSERT_EQ(store.create(value), RepairStoreError::none);
+          path = store.plans_directory() / value.plan_id; }
+        if (corruption == 0) std::filesystem::resize_file(path, 1024U * 1024U + 1U);
+        if (corruption == 1) std::filesystem::resize_file(path, std::filesystem::file_size(path) - 1U);
+        if (corruption == 2) std::ofstream(path, std::ios::binary | std::ios::app).put('x');
+        if (corruption == 3) { std::filesystem::remove(path); std::filesystem::create_directory(path); }
+        EXPECT_THROW(RepairPlanStore(root.path()), std::runtime_error) << corruption;
+        EXPECT_TRUE(std::filesystem::exists(path));
+    }
+}
+TEST(RepairExecutor, PoisonedPlanJournalDoesNotReadPublishOrCommit) {
+    TempRoot root; ExecutionFixture fixture; bool fail_sync = false;
+    metadata::DurableReplicaCatalog catalog(root.path());
+    ASSERT_EQ(seed_catalog(catalog, fixture.placement), metadata::ReplicaCatalogError::none);
+    RepairPlanStore store(root.path(), [&](auto point) {
+        return fail_sync && point == RepairFaultPoint::directory_sync;
+    });
+    auto plan = execution_plan(fixture, catalog);
+    ASSERT_EQ(store.create(plan), RepairStoreError::none);
+    plan.state = RepairPlanState::approved;
+    ASSERT_EQ(store.update(plan), RepairStoreError::none);
+    auto another = plan; another.plan_id = "repair-another"; another.state = RepairPlanState::planned;
+    fail_sync = true;
+    ASSERT_EQ(store.create(another), RepairStoreError::filesystem_error);
+    auto source = std::make_shared<FakeRepairNode>("a");
+    auto target = std::make_shared<FakeRepairNode>("d");
+    RepairExecutor executor(store, catalog, {source, target});
+    const auto placement_before = fixture.placement;
+    const auto catalog_before = catalog.snapshot();
+    EXPECT_EQ(executor.execute(plan.plan_id, fixture.placement, fixture.members).error,
+              RepairExecutionError::persistence_failure);
+    EXPECT_EQ(executor.reconcile(plan.plan_id, fixture.placement, fixture.members).error,
+              RepairExecutionError::persistence_failure);
+    EXPECT_EQ(executor.approve(plan.plan_id), RepairStoreError::filesystem_error);
+    EXPECT_EQ(executor.cancel(plan.plan_id), RepairStoreError::filesystem_error);
+    EXPECT_EQ(source->reads, 0U); EXPECT_EQ(target->reads, 0U); EXPECT_EQ(target->repairs, 0U);
+    EXPECT_EQ(catalog.snapshot(), catalog_before);
+    EXPECT_EQ(fixture.placement.chunks, placement_before.chunks);
+    EXPECT_EQ(store.get(plan.plan_id), plan);
 }
 TEST(RepairPlanStore, CorruptPublishedPlanStopsStartupWithoutDeletion) {
     TempRoot root; std::filesystem::path path; auto value = sample();

@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
-#include <fstream>
 #include <iomanip>
 #include <iterator>
 #include <limits>
@@ -16,6 +15,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <type_traits>
+#include <sys/stat.h>
 #include <utility>
 #include <unistd.h>
 
@@ -161,6 +161,31 @@ std::string execution_id(std::string_view plan) {
     return output.str();
 }
 bool sync_fd(int fd) { int result; do { result = metrics::io::fsync(fd); } while (result < 0 && errno == EINTR); return result == 0; }
+std::optional<std::vector<std::byte>> read_record(const std::filesystem::path& path) {
+    const int fd = metrics::io::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return std::nullopt;
+    struct stat status{};
+    if (::fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) || status.st_size < 0 ||
+        static_cast<std::uint64_t>(status.st_size) > kMaxRecordSize) {
+        metrics::io::close(fd); return std::nullopt;
+    }
+    std::vector<std::byte> bytes;
+    try { bytes.resize(static_cast<std::size_t>(status.st_size)); }
+    catch (...) { metrics::io::close(fd); throw; }
+    std::size_t offset{}; bool okay = true;
+    while (offset < bytes.size()) {
+        const auto count = metrics::io::read(fd, bytes.data() + offset, bytes.size() - offset);
+        if (count > 0) offset += static_cast<std::size_t>(count);
+        else if (count < 0 && errno == EINTR) continue;
+        else { okay = false; break; }
+    }
+    std::byte extra{}; ssize_t count;
+    do { count = metrics::io::read(fd, &extra, 1); } while (count < 0 && errno == EINTR);
+    if (count != 0) okay = false;
+    if (metrics::io::close(fd) != 0) okay = false;
+    if (!okay) return std::nullopt;
+    return bytes;
+}
 }
 
 PlanningResult RepairPlanner::plan(const metadata::PlacementPlan& placement,
@@ -381,16 +406,15 @@ RepairPlanStore::RepairPlanStore(std::filesystem::path root, RepairFaultInjector
     for (const auto& entry : std::filesystem::directory_iterator(directory_, error)) {
         metrics::add(metrics::Counter::startup_entries);
         const auto name = entry.path().filename().string(); if (name.ends_with(".tmp")) continue;
-        std::ifstream input(entry.path(), std::ios::binary); std::vector<std::byte> bytes;
-        for (char c; input.get(c);) bytes.push_back(static_cast<std::byte>(c));
-        metrics::io::observed_read(bytes.size());
-        const auto value = decode_repair_plan(bytes);
+        const auto bytes = read_record(entry.path());
+        const auto value = bytes ? decode_repair_plan(*bytes) : std::nullopt;
         if (!value || value->plan_id != name || !plans_.emplace(name, *value).second)
             throw std::runtime_error("invalid durable repair plan");
     }
     if (error) throw std::system_error(error, "scan repair plans");
 }
 RepairStoreError RepairPlanStore::create(const RepairPlan& value) {
+    if (durability_unknown_) return RepairStoreError::filesystem_error;
     if (!valid_plan(value)) return RepairStoreError::invalid_record;
     if (value.catalog_version == 0) return RepairStoreError::invalid_record;
     if (value.state != RepairPlanState::planned &&
@@ -400,6 +424,7 @@ RepairStoreError RepairPlanStore::create(const RepairPlan& value) {
     return persist(value);
 }
 RepairStoreError RepairPlanStore::update(const RepairPlan& value) {
+    if (durability_unknown_) return RepairStoreError::filesystem_error;
     if (!valid_plan(value)) return RepairStoreError::invalid_record;
     const auto found = plans_.find(value.plan_id);
     if (found == plans_.end()) return RepairStoreError::conflict;
@@ -456,12 +481,15 @@ RepairStoreError RepairPlanStore::persist(const RepairPlan& value) {
     if (fault_ && fault_(RepairFaultPoint::record_rename)) return RepairStoreError::filesystem_error;
     std::error_code error; metrics::io::rename(temporary, final, error);
     if (error) return RepairStoreError::filesystem_error;
+    durability_unknown_ = true;
     if (fault_ && fault_(RepairFaultPoint::directory_sync)) return RepairStoreError::filesystem_error;
     const int directory = metrics::io::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory < 0) return RepairStoreError::filesystem_error;
     const bool synced = sync_fd(directory); const bool closed = metrics::io::close(directory) == 0;
     if (!synced || !closed) return RepairStoreError::filesystem_error;
-    plans_[value.plan_id] = value; return RepairStoreError::none;
+    plans_[value.plan_id] = value;
+    durability_unknown_ = false;
+    return RepairStoreError::none;
 }
 std::optional<RepairPlan> RepairPlanStore::get(std::string_view id) const {
     const auto found = plans_.find(id);
@@ -476,6 +504,7 @@ std::vector<RepairPlan> RepairPlanStore::list() const {
     }
     return result;
 }
+bool RepairPlanStore::durability_unknown() const noexcept { return durability_unknown_; }
 const std::filesystem::path& RepairPlanStore::plans_directory() const noexcept { return directory_; }
 
 RepairExecutor::RepairExecutor(RepairPlanStore& plans,
@@ -491,6 +520,7 @@ RepairExecutor::RepairExecutor(RepairPlanStore& plans,
 
 RepairStoreError RepairExecutor::approve(std::string_view plan_id_value) {
     const std::scoped_lock lock(execution_mutex_);
+    if (plans_.durability_unknown()) return RepairStoreError::filesystem_error;
     std::unique_ptr<epoch::Guard> guard;
     try { guard = catalog_.authorize_epoch(); } catch (const epoch::Error&) { return RepairStoreError::conflict; }
     auto plan = plans_.get(plan_id_value);
@@ -503,6 +533,7 @@ RepairStoreError RepairExecutor::approve(std::string_view plan_id_value) {
 
 RepairStoreError RepairExecutor::cancel(std::string_view plan_id_value) {
     const std::scoped_lock lock(execution_mutex_);
+    if (plans_.durability_unknown()) return RepairStoreError::filesystem_error;
     std::unique_ptr<epoch::Guard> guard;
     try { guard = catalog_.authorize_epoch(); } catch (const epoch::Error&) { return RepairStoreError::conflict; }
     auto plan = plans_.get(plan_id_value);
@@ -528,6 +559,8 @@ RepairExecutionResult RepairExecutor::execute_locked(std::string_view plan_id_va
     metadata::PlacementPlan& placement, const metadata::MembershipSnapshot& membership,
     bool recovering) {
     auto plan = plans_.get(plan_id_value);
+    if (plans_.durability_unknown())
+        return {RepairExecutionError::persistence_failure, plan ? plan->state : RepairPlanState::planned};
     if (!plan) return {RepairExecutionError::plan_not_found, RepairPlanState::planned};
     std::unique_ptr<epoch::Guard> epoch_guard;
     try { epoch_guard = catalog_.authorize_epoch(); } catch (const epoch::Error& error) {

@@ -82,6 +82,10 @@ private:
         std::string object_id;
         std::string generation_id;
         std::optional<epoch::Token> epoch;
+        // Volatile evidence only: terminal/prepare journal publication has not
+        // completed, or a mutation intent has not yet authorized physical work.
+        bool persistence_pending{};
+        std::optional<storage_node_protocol::OperationState> pending_intent{};
     };
     struct RepairRecord {
         storage_node_protocol::RepairResponseStatus status{

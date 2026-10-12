@@ -60,6 +60,7 @@ enum class CoordinatorError {
     invalid_object_metadata,
     invalid_generation,
     invalid_membership,
+    version_exhausted,
 };
 
 struct PlacementResult {

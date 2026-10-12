@@ -93,7 +93,8 @@ std::string chunk_filename(std::uint32_t index) {
 
 std::optional<std::vector<std::byte>> read_regular_file(const std::filesystem::path& path,
                                                         std::size_t maximum_size) {
-    FileDescriptor file(metrics::io::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    FileDescriptor file(metrics::io::open(path.c_str(),
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
     if (!file.valid()) { return std::nullopt; }
     struct stat metadata {};
     if (::fstat(file.get(), &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
@@ -300,6 +301,7 @@ StoreError ObjectStore::commit_replica(std::string_view object_id,
     const auto key = pending_key(object_id, generation_id);
     const auto pending = pending_replicas_.find(key);
     if (pending == pending_replicas_.end()) { return StoreError::not_found; }
+    if (pending->second.durability_unknown) { return StoreError::result_unknown; }
     if (pending->second.committed) { return StoreError::none; }
     const auto temporary = objects_directory_ / (".atlasfs-tmp-" + std::string(generation_id));
     std::error_code error;
@@ -314,9 +316,11 @@ StoreError ObjectStore::commit_replica(std::string_view object_id,
     if (error) { return StoreError::filesystem_error; }
     cleanup.release();
     pending->second.committed = true;
+    pending->second.durability_unknown = true;
     if (sync_directory(objects_directory_) != StoreError::none) {
-        return StoreError::filesystem_error;
+        return StoreError::result_unknown;
     }
+    pending->second.durability_unknown = false;
     return StoreError::none;
 }
 
@@ -353,6 +357,7 @@ StoreError ObjectStore::abort_replica(std::string_view object_id,
     const auto key = pending_key(object_id, generation_id);
     const auto pending = pending_replicas_.find(key);
     if (pending == pending_replicas_.end()) { return StoreError::not_found; }
+    if (pending->second.durability_unknown) { return StoreError::result_unknown; }
     if (should_fail(PutFaultPoint::rollback_deletion)) {
         return StoreError::filesystem_error;
     }
@@ -373,13 +378,15 @@ StoreError ObjectStore::abort_replica(std::string_view object_id,
         } else if (metrics::io::unlink(object_path(object_id).c_str()) != 0 && errno != ENOENT) {
             return StoreError::filesystem_error;
         }
+        pending->second.durability_unknown = true;
         if (sync_directory(objects_directory_) != StoreError::none) {
-            return StoreError::filesystem_error;
+            return StoreError::result_unknown;
         }
     }
+    pending->second.durability_unknown = true;
     metrics::io::remove_all(chunks_directory_ / std::string(generation_id), error);
     if (error || sync_directory(chunks_directory_) != StoreError::none) {
-        return StoreError::filesystem_error;
+        return StoreError::result_unknown;
     }
     pending_replicas_.erase(pending);
     return StoreError::none;
@@ -388,6 +395,9 @@ StoreError ObjectStore::abort_replica(std::string_view object_id,
 StoreError ObjectStore::finalize_replica(std::string_view object_id,
                                          std::string_view generation_id) {
     const auto pending = pending_replicas_.find(pending_key(object_id, generation_id));
+    if (pending != pending_replicas_.end() && pending->second.durability_unknown) {
+        return StoreError::result_unknown;
+    }
     if (pending == pending_replicas_.end() || !pending->second.committed) {
         return StoreError::not_found;
     }
@@ -661,12 +671,14 @@ void ObjectStore::clean_incomplete_state() {
             removals.push_back(it->path());
             continue;
         }
-        if (const auto encoded = read_regular_file(it->path(), kMaximumManifestSize)) {
-            if (const auto manifest = decode_manifest(*encoded, max_object_size_)) {
-                referenced.insert(manifest->generation_id);
-            }
-        }
+        const auto encoded = read_regular_file(it->path(), kMaximumManifestSize);
+        const auto manifest = encoded ? decode_manifest(*encoded, max_object_size_) : std::nullopt;
+        // An unreadable reference is not evidence that its generation is orphaned.
+        // Validate every published manifest before reclaiming any generation data.
+        if (!manifest) { throw std::runtime_error("invalid published AtlasFS manifest"); }
+        referenced.insert(manifest->generation_id);
     }
+    if (error) { throw std::system_error(error, "scan AtlasFS manifests"); }
     for (const auto& path : removals) {
         metrics::io::remove_all(path, error);
         if (error) { break; }

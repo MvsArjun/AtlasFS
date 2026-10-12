@@ -121,6 +121,7 @@ private:
         std::optional<std::vector<std::byte>> previous_manifest;
         std::vector<std::byte> manifest;
         bool committed{};
+        bool durability_unknown{};
     };
     [[nodiscard]] static std::string pending_key(std::string_view object_id,
                                                  std::string_view generation_id);

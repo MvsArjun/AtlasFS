@@ -71,12 +71,15 @@ public:
     [[nodiscard]] std::optional<CoordinatorOperationRecord> get(
         std::string_view operation_id) const;
     [[nodiscard]] std::vector<CoordinatorOperationRecord> list() const;
+    // Reads retain the prior diagnostic index; mutation requires reopening.
+    [[nodiscard]] bool durability_unknown() const noexcept;
     [[nodiscard]] const std::filesystem::path& operations_directory() const noexcept;
 private:
     [[nodiscard]] CoordinatorRecordError persist(const CoordinatorOperationRecord& record);
     std::filesystem::path operations_directory_;
     CoordinatorRecordFaultInjector fault_injector_;
     std::map<std::string, CoordinatorOperationRecord, std::less<>> records_;
+    bool durability_unknown_{};
 };
 
 class DurableReplicaManager {
