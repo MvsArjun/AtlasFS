@@ -1,0 +1,240 @@
+{
+  "profile": "characterize",
+  "runner_class": "shared",
+  "runs": [
+    {
+      "case": "local-off",
+      "round": 1,
+      "run_id": "b791f6b8-3569-44ce-9699-a2643901631e",
+      "file": "local-off-1.json"
+    },
+    {
+      "case": "local-on",
+      "round": 1,
+      "run_id": "e206b6b3-f41d-434a-b49d-9ba3a50e5d68",
+      "file": "local-on-1.json"
+    },
+    {
+      "case": "workers-1",
+      "round": 1,
+      "run_id": "566c021d-6614-4d63-8806-7a52177c6a5f",
+      "file": "workers-1-1.json"
+    },
+    {
+      "case": "workers-2",
+      "round": 1,
+      "run_id": "6b0789a0-ec81-4445-be81-2026c9b7945a",
+      "file": "workers-2-1.json"
+    },
+    {
+      "case": "workers-4",
+      "round": 1,
+      "run_id": "ae5a69a8-cf53-4b39-9a1c-e13cf06cf59d",
+      "file": "workers-4-1.json"
+    },
+    {
+      "case": "retained-8",
+      "round": 1,
+      "run_id": "ccbec10b-d632-4bde-8dac-d3b047dfd844",
+      "file": "retained-8-1.json"
+    },
+    {
+      "case": "retained-32",
+      "round": 1,
+      "run_id": "46b5b9fe-b676-4251-9184-2c9b7681d761",
+      "file": "retained-32-1.json"
+    },
+    {
+      "case": "retained-128",
+      "round": 1,
+      "run_id": "3f64eaa1-db81-4d7d-b754-91276bf12f2b",
+      "file": "retained-128-1.json"
+    },
+    {
+      "case": "chunks-4096",
+      "round": 1,
+      "run_id": "a8decce3-bf7c-4469-b912-2ce4146f5e69",
+      "file": "chunks-4096-1.json"
+    },
+    {
+      "case": "chunks-65536",
+      "round": 1,
+      "run_id": "f017a6ab-8913-4786-8233-d5bb8e6f1d39",
+      "file": "chunks-65536-1.json"
+    },
+    {
+      "case": "replicas-1",
+      "round": 1,
+      "run_id": "31cc87a8-1769-4d15-82a2-9ec801cb9ae7",
+      "file": "replicas-1-1.json"
+    },
+    {
+      "case": "replicas-3",
+      "round": 1,
+      "run_id": "85569396-47bc-457f-a4d9-57ba658b6921",
+      "file": "replicas-3-1.json"
+    },
+    {
+      "case": "fault",
+      "round": 1,
+      "run_id": "98615ad7-b866-4d72-afc3-cef1f867f694",
+      "file": "fault-1.json"
+    },
+    {
+      "case": "local-on",
+      "round": 2,
+      "run_id": "de4460d4-d48c-404b-ad74-bf4e96be25c6",
+      "file": "local-on-2.json"
+    },
+    {
+      "case": "local-off",
+      "round": 2,
+      "run_id": "92ca6bde-5b6e-4c7f-92c9-6afe65bd4f19",
+      "file": "local-off-2.json"
+    },
+    {
+      "case": "workers-1",
+      "round": 2,
+      "run_id": "85cf9a46-b55e-4aed-8fe7-e6dccd0ab645",
+      "file": "workers-1-2.json"
+    },
+    {
+      "case": "workers-2",
+      "round": 2,
+      "run_id": "e2aa6041-3639-4e4c-8bf3-0e168dffa86a",
+      "file": "workers-2-2.json"
+    },
+    {
+      "case": "workers-4",
+      "round": 2,
+      "run_id": "744473a4-aac7-4d9e-93e3-85ef4ce16978",
+      "file": "workers-4-2.json"
+    },
+    {
+      "case": "retained-8",
+      "round": 2,
+      "run_id": "7c841994-af28-4cd4-8224-0192263c92ee",
+      "file": "retained-8-2.json"
+    },
+    {
+      "case": "retained-32",
+      "round": 2,
+      "run_id": "671455dd-b806-4a03-8dde-6bedb901c91a",
+      "file": "retained-32-2.json"
+    },
+    {
+      "case": "retained-128",
+      "round": 2,
+      "run_id": "30df578d-c97d-40d5-bedc-e2332f827a99",
+      "file": "retained-128-2.json"
+    },
+    {
+      "case": "chunks-4096",
+      "round": 2,
+      "run_id": "e1b51dc8-94eb-452e-a804-b10def3d905a",
+      "file": "chunks-4096-2.json"
+    },
+    {
+      "case": "chunks-65536",
+      "round": 2,
+      "run_id": "361bd08d-2706-4dc3-8dde-a3101a4b7059",
+      "file": "chunks-65536-2.json"
+    },
+    {
+      "case": "replicas-1",
+      "round": 2,
+      "run_id": "a5618d95-d902-46e4-bca9-f7220d9c0444",
+      "file": "replicas-1-2.json"
+    },
+    {
+      "case": "replicas-3",
+      "round": 2,
+      "run_id": "760a39c2-a118-4945-a219-7d1d14744aa9",
+      "file": "replicas-3-2.json"
+    },
+    {
+      "case": "fault",
+      "round": 2,
+      "run_id": "dacdca45-3a4c-4985-be2a-fe92d131ca56",
+      "file": "fault-2.json"
+    },
+    {
+      "case": "local-off",
+      "round": 3,
+      "run_id": "00b0f742-00a8-4a4f-b84e-973b46c5aada",
+      "file": "local-off-3.json"
+    },
+    {
+      "case": "local-on",
+      "round": 3,
+      "run_id": "1c16eee4-5fec-46c9-9b18-26844508f5f0",
+      "file": "local-on-3.json"
+    },
+    {
+      "case": "workers-1",
+      "round": 3,
+      "run_id": "06dde23b-4e53-4614-94f8-78882d1ac0c2",
+      "file": "workers-1-3.json"
+    },
+    {
+      "case": "workers-2",
+      "round": 3,
+      "run_id": "54e44cb3-f5ec-4a09-99d2-d0d007af45b6",
+      "file": "workers-2-3.json"
+    },
+    {
+      "case": "workers-4",
+      "round": 3,
+      "run_id": "d26767d8-f48d-41ec-8a94-6d7e5c78bd54",
+      "file": "workers-4-3.json"
+    },
+    {
+      "case": "retained-8",
+      "round": 3,
+      "run_id": "0dbc13e1-3511-4c45-83c8-a2c5b062cabb",
+      "file": "retained-8-3.json"
+    },
+    {
+      "case": "retained-32",
+      "round": 3,
+      "run_id": "d86a4d17-8b6a-4181-be8f-dc7b4923d8c2",
+      "file": "retained-32-3.json"
+    },
+    {
+      "case": "retained-128",
+      "round": 3,
+      "run_id": "ece000f3-e64f-4925-b12b-9054708bcc12",
+      "file": "retained-128-3.json"
+    },
+    {
+      "case": "chunks-4096",
+      "round": 3,
+      "run_id": "1e376acb-1438-4ef0-8426-39808c311e66",
+      "file": "chunks-4096-3.json"
+    },
+    {
+      "case": "chunks-65536",
+      "round": 3,
+      "run_id": "3e311b16-6cbf-4165-8535-2b170df4f575",
+      "file": "chunks-65536-3.json"
+    },
+    {
+      "case": "replicas-1",
+      "round": 3,
+      "run_id": "4424ba38-04bd-4f31-9116-92398c378872",
+      "file": "replicas-1-3.json"
+    },
+    {
+      "case": "replicas-3",
+      "round": 3,
+      "run_id": "24cf5d21-9cf8-4d39-9ecd-d6ab9e0a52a1",
+      "file": "replicas-3-3.json"
+    },
+    {
+      "case": "fault",
+      "round": 3,
+      "run_id": "fd5d069c-6d83-460d-aafc-3be1efed0971",
+      "file": "fault-3.json"
+    }
+  ]
+}

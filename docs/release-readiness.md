@@ -42,8 +42,12 @@ Normal also passed Cppcheck, production-only Release, 70 TLS, 310 epoch and
 420 scheduling repeated executions. The local baseline reproduced 365/365 in
 42.30 seconds with exit 0 and a production-only Release build.
 
-Audit/final publication SHAs and actual post-fix CI evidence are recorded in the
-verification ledger when available; baseline success is not substituted for them.
+The audited runtime/test/workflow revision is
+`cfab4ff2035de439ee79ee20c9009deccdef5abd`, normally pushed to `origin/master`.
+The independent remote clone used that exact clean revision. Later delivery
+changes only release evidence/documentation and retained benchmark reports;
+runtime and test trees are unchanged. Final delivery SHA/CI are checked again
+and reported in the publication handoff; baseline success is not substituted.
 
 ## Confirmed defects and focused fixes
 
@@ -120,10 +124,11 @@ result is claimed.
 | Local Debug/full CTest | Final integrated working tree: 399/399, 43.82 s, exit 0; 34 added tests and two strengthened tests |
 | Production Release and Cppcheck | Final runtime build passed, `BUILD_TESTING=OFF`, benchmarks ON; Cppcheck 25 translation units, no diagnostics, exit 0 |
 | Local repeated integration/smoke/schema/tool checks | 118 storage/persistence/recovery/repair tests ×10 = 1,180 executions, 86.35 s, exit 0. TLS 7×10 = 70 (9.07 s), epochs 31×10 = 310 (43.12 s), scheduling 42×10 = 420 (35.38 s) also passed during integration; exact final-source repeats run in CI. Both smoke modes: 27 workloads/81 cycles each; 14 tool tests and all 98 retained historical JSON reports validated, exit 0. |
-| Linux normal/ASan/UBSan/TSan | Pending actual published-revision CI |
-| Fresh remote clone | Pending candidate publication |
-| Representative Linux characterization | Pending source-bound workflow result |
-| Final diff/docs/remote/clean tree | Pending final publication |
+| Linux normal/ASan/UBSan/TSan | [38204466311](https://github.com/MvsArjun/AtlasFS/actions/runs/38204466311), exact `cfab4ff`, all completed success: 399/399 each, normal 8.42 s, ASan/UBSan 31.90 s, TSan 19.28 s; exit 0, no sanitizer diagnostics |
+| Linux repeated/static/production/smoke checks | Same run: 70 TLS, 310 epoch, 420 scheduling, 1,180 persistence/storage/repair/recovery repeated executions; normal Cppcheck 25/25 and production Release passed. Every matrix passed both smoke modes (27 workloads/81 cycles each), accounting checks, schema/arithmetic/self-comparison and 14 tool tests, exit 0. |
+| Fresh remote clone | `build-m23-fresh/source`, clean exact `cfab4ff`; new configure/dependency checkout/Debug build, 399/399 in 44.58 s; new production-only Release and both 27-workload/81-cycle smoke modes plus 14 tool tests, exit 0; smoke metadata confirms exact SHA and `source_dirty=false` |
+| Representative Linux characterization | [38204468584](https://github.com/MvsArjun/AtlasFS/actions/runs/38204468584), exact clean `cfab4ff`, Release; 39 validated reports/11,160 cycles, zero unexpected errors/timeouts, 960 injected overloads and 180 expected injected unknown outcomes; all instrumented accounting complete; exit 0 |
+| Final diff/docs/remote/clean tree | Candidate normal push verified by `git ls-remote`; clean tree, diff whitespace check, no tracked certificate/key files. Evidence delivery revalidated all 137 retained raw reports and 28 relative Markdown links; final remote/clean tree/CI are checked again before handoff. |
 
 The earlier failed M22 [run 38162648935](https://github.com/MvsArjun/AtlasFS/actions/runs/38162648935)
 remains historical evidence: a test incorrectly bounded handoff peak at three
@@ -293,19 +298,28 @@ OS cache, and coarse small-batch tails. Accounting completeness is validated.
 Shared hosted loopback results are not production capacity, physical network,
 exclusive hardware or physical device durability evidence.
 
+The M23 [retained dataset](../benchmarks/results/m23/README.md) preserves all 39
+reports and provenance. On its different shared-runner fingerprint (`45ffedee…`),
+1/2/4-worker median read throughput is 576.525/559.987/553.372 ops/s, queue p99
+0.001041/1.941204/5.721488 ms and end-to-end p99
+1.957979/3.797810/7.588951 ms. This is representative current-source
+characterization, not a cross-job performance comparison. Its ext4 mount reports
+`journal_async_commit,nobarrier,data=writeback`; physical power-loss claims are
+particularly unsupported. No speculative optimization was introduced.
+
 ## Release checklist
 
 | Requirement | Classification | Scope/remaining responsibility |
 | --- | --- | --- |
-| Correctness, bounded parsing and regression audit | Verified with limitations | Final full/repeated ledger required; trusted roots/one authority |
-| Published exact-source Debug/Release/static/sanitizer gates | Not verified | Pending final published CI and clone ledger |
+| Correctness, bounded parsing and regression audit | Verified with limitations | Full/repeated ledger passed; trusted roots/one authority |
+| Published exact-source Debug/Release/static/sanitizer gates | Verified | Actual candidate CI and remote-clone ledger above; final delivery checked separately |
 | TLS identity/role/target/epoch checks | Verified with limitations | Code checks tested; not Byzantine security |
 | Certificate issuance, ACLs, clocks, trust and CRL freshness/session draining | Operator responsibility | No automatic credential lifecycle or ACL enforcement |
 | Epoch inventory, quiescence and independent high-water checkpoint | Operator responsibility | No election, consensus or rollback-proof restored trusted state |
 | Consistent backup, restore and durable preprovisioned ancestors | Operator responsibility | Offline restore drill required for the intended environment |
 | Physical power-loss and production filesystem behavior | Not verified | Hosted CI/fault injection does not simulate real power loss |
 | FIFO, bounded dispatch and shutdown | Verified with limitations | Serialized handlers; active action not preempted; stop/join contract |
-| Representative benchmarks/schema/accounting | Not verified | Pending current-source reproduction; no capacity claim |
+| Representative benchmarks/schema/accounting | Verified with limitations | Current-source reproduction and raw reports retained; no capacity/non-regression claim |
 | Disk/retention/per-principal abuse controls | Operator responsibility | Record bounds only; no total quota or automatic history GC |
 | Production multi-host service/package/license/release artifacts | Not verified | Not delivered by this library/source candidate |
 | Formal release/tag | Not verified | Proposed candidate name only; no established publishing policy |
