@@ -6,8 +6,8 @@ The implementation is published and verified. The starting Milestone 21 revision
 is `323872f75f5650d56e89bf6f919573cccc4a113d`; scheduling/dispatch implementation
 is `020c8fab50ad9e3f1e266e2b2f8c3578efca38fd`, final runtime hardening is
 `115415fe1d0c447c2dcdabce98dbb17e284265fa`, and corrected handoff-bound testing is
-`3eb679b2cd7b980e86512c91a57c18be337832cc`. Subsequent delivery changes retain
-results/documentation only. No published history was rewritten.
+`3eb679b2cd7b980e86512c91a57c18be337832cc`. Subsequent Milestone 22 delivery
+changes retain results/documentation only. No published history was rewritten.
 
 FIFO fairness, bounded overload and independent connection progress are
 demonstrated, and correctness/security/recovery checks pass. The requested

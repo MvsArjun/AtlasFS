@@ -415,7 +415,7 @@ passed at the same optimized revision: 39 reports, 10,200 measured cycles,
 32.36 s summed measured-row time, zero unexpected errors and zero residual
 temporary bytes. Artifact `linux-benchmark-hosted-characterize` (ID 11692496391)
 contains all raw reports and exact environments/commands. Maximum process RSS
-was 19,668,992 bytes. [optimized-summary.csv](../benchmarks/results/m21/optimized-summary.csv)
+was 19,668,992 bytes. [optimized-summary.csv](https://github.com/MvsArjun/AtlasFS/blob/7779ea7c38e2128013e32068bd437eb785ff8915/benchmarks/results/m21/optimized-summary.csv)
 retains all 72 repeated workload groups, sample counts, wall times, percentiles,
 CPU/RSS, queue, byte, sync and peak-space values.
 

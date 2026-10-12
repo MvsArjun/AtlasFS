@@ -109,8 +109,13 @@ deliberately deferred.
 
 Milestone 23 audits the final planned single-coordinator architecture. The
 [release-readiness report](docs/release-readiness.md) records actual verification,
-publication provenance, compatibility and operator procedures. The proposed
-candidate is **0.1.0-rc.1 (library/source)**; no formal release or tag is published.
+publication provenance, compatibility and operator procedures. The release
+identity is **0.1.0-rc.1 (library/source)**, with annotated tag `v0.1.0-rc.1`.
+See the [changelog](CHANGELOG.md) and the
+[GitHub prerelease](https://github.com/MvsArjun/AtlasFS/releases/tag/v0.1.0-rc.1)
+for the publication record, exact tagged revision, final CI and asset checksums.
+CMake retains its numeric base version `0.1.0`. No license file is supplied;
+this candidate does not grant unrestricted redistribution rights.
 Passing hosted CI does not establish production capacity or physical power-loss
 durability. Exclusive durable roots, credential permissions, optional CRLs,
 external epoch checkpoints and quiesced upgrades remain operator responsibilities.
@@ -124,10 +129,11 @@ downgrade newly written roots to older binaries. See the report before deploymen
 
 ## Build and test
 
-Prerequisites: CMake 3.20+, a C++20 compiler, Git, and network access on the first
-configure (CMake fetches the pinned GoogleTest release). The filesystem and
+Prerequisites: CMake 3.20+, Ninja, a C++20 compiler, Git, Python 3 for benchmark
+tools, Cppcheck for static analysis, and network access on the first test-build
+configure (CMake fetches GoogleTest v1.15.2). The filesystem and
 networking implementation requires a POSIX environment and OpenSSL 3.0+ development
-headers/libraries. On Ubuntu: `sudo apt-get install g++ cmake ninja-build git libssl-dev openssl`.
+headers/libraries. On Ubuntu: `sudo apt-get install g++ cmake ninja-build git python3 cppcheck libssl-dev openssl`.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug

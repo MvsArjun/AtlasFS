@@ -2,11 +2,14 @@
 
 ## Recommendation and supported scope
 
-**Conditionally ready for an audited library/source candidate, proposed
-`0.1.0-rc.1`; not a general-purpose production storage release.** The final
-verification ledger below must be complete before this recommendation is used.
-No tag or formal GitHub release is created: the repository has no established
-tag, packaging or release policy. CMake's project version remains `0.1.0`.
+**Ready within the audited library/source scope for `0.1.0-rc.1`; not a
+general-purpose production storage release.** This is the historical Milestone
+23 audit and verification ledger. No tag or formal release was created during
+that audit. The subsequent owner-authorized handoff uses annotated tag
+`v0.1.0-rc.1` and a private GitHub prerelease, after verifying the exact final
+commit. Its [publication record](https://github.com/MvsArjun/AtlasFS/releases/tag/v0.1.0-rc.1)
+contains final-source CI, checksums and assets; see also the
+[changelog](../CHANGELOG.md). CMake's numeric project version remains `0.1.0`.
 
 AtlasFS supports one active coordinator/catalog authority, independently owned
 POSIX storage roots, synchronous local or loopback authenticated node RPCs,
@@ -49,6 +52,15 @@ changes only release evidence/documentation and retained benchmark reports;
 runtime and test trees are unchanged. Final delivery SHA/CI are checked again
 and reported in the publication handoff; baseline success is not substituted.
 
+The final M23 delivery was `7779ea7c38e2128013e32068bd437eb785ff8915`.
+[Its actual CI run 38205017981](https://github.com/MvsArjun/AtlasFS/actions/runs/38205017981)
+passed 399/399 in each normal, ASan/UBSan and TSan job, all 1,980 repeated
+integration executions, production Release, Cppcheck and both benchmark smoke
+modes with 14 tooling tests per job. An independent fresh remote clone passed
+399/399 in 44.01 seconds, production Release and both smoke modes. Runtime/test
+trees match the audited revision. A later release-metadata commit must pass its
+own exact-source gate; these historical runs are not a substitute.
+
 ## Confirmed defects and focused fixes
 
 | Finding | Correction and regression evidence |
@@ -74,8 +86,8 @@ revised by explicit recovery after an uncertain PREPARE; it is not abort consens
 
 ## Build and verification ledger
 
-Prerequisites: POSIX, C++20, CMake 3.20+, Ninja, Git, Threads and OpenSSL 3.0+
-development files. Tests fetch GoogleTest v1.15.2 (resolved commit
+Prerequisites: POSIX, C++20, CMake 3.20+, Ninja, Git, Python 3, Cppcheck, Threads
+and OpenSSL 3.0+ development files. Tests fetch GoogleTest v1.15.2 (resolved commit
 `b514bdc898e2951020cbdca1304b75f5950d1f59`) on first configure. Production builds
 with `BUILD_TESTING=OFF` avoid that dependency. Linux verification uses Ubuntu
 24.04/GCC 13; local MSYS uses GCC 15.3.0, CMake 4.4.4 and OpenSSL 3.6.5.
@@ -321,8 +333,8 @@ particularly unsupported. No speculative optimization was introduced.
 | FIFO, bounded dispatch and shutdown | Verified with limitations | Serialized handlers; active action not preempted; stop/join contract |
 | Representative benchmarks/schema/accounting | Verified with limitations | Current-source reproduction and raw reports retained; no capacity/non-regression claim |
 | Disk/retention/per-principal abuse controls | Operator responsibility | Record bounds only; no total quota or automatic history GC |
-| Production multi-host service/package/license/release artifacts | Not verified | Not delivered by this library/source candidate |
-| Formal release/tag | Not verified | Proposed candidate name only; no established publishing policy |
+| Production multi-host service/binary package/license | Not verified | Not delivered; source candidate only, no license granted |
+| Formal source release/tag | Not verified in historical audit | Subsequent owner-authorized private prerelease has a separate gate; exact-source verification and assets recorded in linked GitHub release |
 
 No gate is called Verified solely because its workflow exists. An unavailable
 required check is Blocked, and an unperformed deployment guarantee is Not
